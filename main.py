@@ -303,7 +303,9 @@ async def chat(req: ChatRequest):
             data = resp2.json()
 
         reply = "".join(b.get("text", "") for b in data.get("content", []) if b.get("type") == "text")
-        return {"reply": reply}
+if not reply:
+    print("DEBUG response:", data)
+return {"reply": reply}
 
 
 @app.get("/health")
