@@ -220,6 +220,21 @@ async def chat(req: ChatRequest):
         reply = "".join(b.get("text","") for b in d1.get("content",[]) if b.get("type")=="text")
         return {"reply": reply or "Sorry, no response generated."}
 
+@app.get("/test-odoo")
+async def test_odoo():
+    try:
+        async with httpx.AsyncClient(timeout=15) as c:
+            r = await c.post(f"{ODOO_URL}/web/session/authenticate", json={
+                "jsonrpc": "2.0", "method": "call", "id": 1,
+                "params": {
+                    "db": ODOO_DB,
+                    "login": ODOO_USERNAME,
+                    "password": ODOO_PASSWORD
+                }
+            })
+            return {"status": r.status_code, "response": r.json()}
+    except Exception as e:
+        return {"error": str(e)}
 @app.get("/health")
 async def health():
     return {"status": "ok"}
