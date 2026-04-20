@@ -160,9 +160,9 @@ async def run_tool(name, inp):
 @app.post("/chat")
 async def chat(req: ChatRequest):
     user_content = req.message
-if req.file_content and req.file_name:
-    user_content = f"[Attached file: {req.file_name}]\n{req.file_content}\n\nUser question: {req.message}"
-messages = req.history + [{"role": "user", "content": user_content}]
+    if req.file_content and req.file_name:
+        user_content = f"[Attached file: {req.file_name}]\n{req.file_content}\n\nUser question: {req.message}"
+    messages = req.history + [{"role": "user", "content": user_content}]
     headers = {
         "x-api-key": ANTHROPIC_KEY,
         "anthropic-version": "2023-06-01",
