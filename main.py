@@ -33,7 +33,7 @@ async def odoo_query(model, domain, fields, limit=2000, order="id desc"):
                 "jsonrpc": "2.0", "method": "call", "id": 2,
                 "params": {
                     "model": model, "method": "search_read",
-                    "args": [domain + [["company_id", "=", 1]]],
+                    "args": [domain],
                     "kwargs": {"fields": fields, "limit": limit, "order": order}
                 }
             }, cookies=cookies)
@@ -133,7 +133,6 @@ CRITICAL RULES for querying:
 - For aggregation queries (totals, sums), ALWAYS set limit to 500 to get ALL records
 - Invoice types: out_invoice = customer invoice, out_refund = credit note, in_invoice = vendor bill, in_refund = vendor credit note
 - Always filter invoices by state=posted unless asked otherwise
-- ALWAYS add company_id = 1 to ALL queries unless user specifies otherwise
 - When calculating tax totals, query BOTH out_invoice AND out_refund separately or together, and clearly show the breakdown
 - When showing invoice summaries, also break down by payment_state. Values: not_paid (Not Paid), in_payment (In Payment), paid (Paid), reversed (Reversed). Always include ALL payment states in the count.
 
