@@ -33,8 +33,8 @@ async def odoo_query(model, domain, fields, limit=2000, order="id desc"):
                 "jsonrpc": "2.0", "method": "call", "id": 2,
                 "params": {
                     "model": model, "method": "search_read",
-                    "args": [domain + [["company_id","=",1]]],
-                    "kwargs": {"fields": fields, "limit": limit, "order": order}
+                    "args": [domain],
+                    "kwargs": {"fields": fields, "limit": limit, "order": order, "context": {"allowed_company_ids": [1]}}
                 }
             }, cookies=cookies)
             data = r.json()
