@@ -239,6 +239,45 @@ async def chat(req: ChatRequest):
 
         reply = "".join(b.get("text", "") for b in d.get("content", []) if b.get("type") == "text")
         return {"reply": reply or "Sorry, no response generated."}
+@app.get("/invoice-stats")
+async def invoice_stats(year: int, month: int):
+    """Fixed invoice query - always accurate"""
+    import calendar
+    last_day = calendar.monthrange(year, month)[1]
+    date_from = f"{year}-{month:02d}-01"
+    date_to = f"{year}-{month:02d}-{last_day}"
+    
+    result = await odoo_query(
+        "account.move",
+        [
+            ["move_type", "=", "out_invoice"],
+            ["state", "=", "posted"],
+            ["invoice_date", ">=", date_from],
+            ["invoice_date", "<=", date_to]
+        ],
+        ["name", "amount_tax", "amount_total", "amount_untaxed", "payment_state"],
+        limit=2000
+    )
+    records = json.loads(result)
+    if isinstance(records, dict) and "error" in records:
+        return records
+    
+    by_state = {}
+    total_tax = 0
+    total_amount = 0
+    for r in records:
+        state = r.get("payment_state", "unknown")
+        by_state[state] = by_state.get(state, 0) + 1
+        total_tax += r.get("amount_tax", 0)
+        total_amount += r.get("amount_total", 0)
+    
+    return {
+        "period": f"{year}-{month:02d}",
+        "total_invoices": len(records),
+        "by_payment_state": by_state,
+        "total_tax": round(total_tax, 2),
+        "total_amount": round(total_amount, 2)
+    }
 
 # ---------- Health ----------
 
