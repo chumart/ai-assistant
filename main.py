@@ -20,7 +20,7 @@ class ChatRequest(BaseModel):
 
 # ---------- Universal Odoo query ----------
 
-async def odoo_query(model, domain, fields, limit=20, order="id desc"):
+async def odoo_query(model, domain, fields, limit=2000, order="id desc"):
     """One function to query ANY Odoo model"""
     try:
         async with httpx.AsyncClient(timeout=20, follow_redirects=True) as c:
@@ -135,7 +135,8 @@ When querying data:
 - If unsure about field names, use odoo_fields first to check
 
 Be concise, professional, and present data in a clear format.
-When showing financial data, always format numbers with commas and currency symbols."""
+When showing financial data, always format numbers with commas and currency symbols.
+When calculating totals (tax, revenue, etc.), always set limit to 2000 to ensure ALL records are included. Never use a small limit for aggregation queries."""
 
 async def run_tool(name, inp):
     if name == "odoo_search":
