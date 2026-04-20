@@ -120,7 +120,8 @@ CRITICAL RULES for querying:
 - For aggregation queries (totals, sums), ALWAYS set limit to 2000 to get ALL records
 - Invoice types: out_invoice = customer invoice, out_refund = credit note, in_invoice = vendor bill, in_refund = vendor credit note
 - Always filter invoices by state=posted unless asked otherwise
-- ALWAYS add company_id = 1 to ALL queries unless user specifies otherwise
+- For account.move, sale.order, purchase.order, account.payment, res.partner, crm.lead, repair.order, stock.picking: automatically filtered by company_id=1
+- For product.product, stock.quant and other inventory models: do NOT add company_id filter
 - When calculating tax totals, query BOTH out_invoice AND out_refund separately or together, and clearly show the breakdown
 - When showing invoice summaries, also break down by payment_state. Values: in_payment (In Payment), paid (Paid), reversed (Reversed). Always include ALL payment states in the count.
 
@@ -134,8 +135,17 @@ Be precise with numbers. Double check your math."""
 
 async def run_tool(name, inp):
     if name == "odoo_search":
+        model = inp["model"]
+        domain = inp.get("domain", [])
+        # Only add company_id filter for models that support it
+        models_with_company = [
+            "account.move", "sale.order", "purchase.order", "account.payment",
+            "res.partner", "crm.lead", "repair.order", "stock.picking"
+        ]
+        if model in models_with_company:
+            domain = domain + [["company_id", "=", 1]]
         return await odoo_query(
-            inp["model"], inp.get("domain", []), inp["fields"],
+            model, domain, inp["fields"],
             inp.get("limit", 2000), inp.get("order", "id desc"))
     if name == "odoo_fields":
         return await odoo_list_fields(inp["model"])
