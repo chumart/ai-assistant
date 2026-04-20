@@ -169,7 +169,7 @@ async def chat(req: ChatRequest):
         
         for attempt in range(4):  # max 4 rounds of tool use
             r = await c.post("https://api.anthropic.com/v1/messages", headers=headers, json={
-                "model": "claude-haiku-4-5-20251001",
+                "model": "claude-sonnet-4-5",
                 "max_tokens": 2048,
                 "system": SYSTEM,
                 "tools": TOOLS,
