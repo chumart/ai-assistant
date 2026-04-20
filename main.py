@@ -181,7 +181,7 @@ async def chat(req: ChatRequest):
     async with httpx.AsyncClient(timeout=60) as c:
         # First call
         r1 = await c.post("https://api.anthropic.com/v1/messages", headers=headers, json={
-            "model": "claude-sonnet-4-20250514",
+            "model": "claude-sonnet-4-5",
             "max_tokens": 1024,
             "system": SYSTEM,
             "tools": TOOLS,
@@ -207,7 +207,7 @@ async def chat(req: ChatRequest):
                     })
 
             r2 = await c.post("https://api.anthropic.com/v1/messages", headers=headers, json={
-                "model": "claude-sonnet-4-20250514",
+                "model": "claude-sonnet-4-5",
                 "max_tokens": 1024,
                 "system": SYSTEM,
                 "tools": TOOLS,
