@@ -133,6 +133,7 @@ CRITICAL RULES for querying:
 - For aggregation queries (totals, sums), ALWAYS set limit to 500 to get ALL records
 - Invoice types: out_invoice = customer invoice, out_refund = credit note, in_invoice = vendor bill, in_refund = vendor credit note
 - Always filter invoices by state=posted unless asked otherwise
+- ALWAYS add company_id = 1 to ALL queries unless user specifies otherwise
 - When calculating tax totals, query BOTH out_invoice AND out_refund separately or together, and clearly show the breakdown
 
 When showing financial data, format numbers with $ and commas.
