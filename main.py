@@ -137,6 +137,11 @@ CRITICAL RULES for querying:
 - When calculating tax totals, query BOTH out_invoice AND out_refund separately or together, and clearly show the breakdown
 - When showing invoice summaries, also break down by payment_state. Values: not_paid (Not Paid), in_payment (In Payment), paid (Paid), reversed (Reversed). Always include ALL payment states in the count.
 
+*** NEW INVENTORY & SEARCH RULES ***
+- FUZZY SEARCH FIRST: When a user searches for a product, customer, or document (e.g., "54rs", "PLM"), ALWAYS use the `ilike` operator instead of `=`. NEVER demand an exact match.
+- PRODUCT SEARCH LOGIC: If looking for a product, ALWAYS use OR logic to search BOTH the internal reference and the name. Example: ["|", ["default_code", "ilike", "user_keyword"], ["name", "ilike", "user_keyword"]]
+- EXCLUDE VIRTUAL LOCATIONS: When querying stock levels (`stock.quant`), you MUST ONLY return real, physical warehouse stock. ALWAYS append `["location_id.usage", "=", "internal"]` to your domain to filter out all "Virtual Locations", "Inventory adjustments", "Scrap", or "Partner Locations".
+
 When showing financial data, format numbers with $ and commas.
 Be precise with numbers. Double check your math."""
 async def run_tool(name, inp):
