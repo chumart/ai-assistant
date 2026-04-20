@@ -135,6 +135,7 @@ CRITICAL RULES for querying:
 - Always filter invoices by state=posted unless asked otherwise
 - ALWAYS add company_id = 1 to ALL queries unless user specifies otherwise
 - When calculating tax totals, query BOTH out_invoice AND out_refund separately or together, and clearly show the breakdown
+- When showing invoice summaries, also break down by payment_state. Values: not_paid (Not Paid), in_payment (In Payment), paid (Paid), reversed (Reversed). Always include ALL payment states in the count.
 
 When showing financial data, format numbers with $ and commas.
 Be precise with numbers. Double check your math."""
