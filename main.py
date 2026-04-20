@@ -108,13 +108,19 @@ async def get_sales(keyword=""):
 
 async def get_products(keyword=""):
     try:
-        domain = [["name","ilike",keyword]] if keyword else [["sale_ok","=",True]]
+        if keyword:
+            domain = ["|", "|", ["name","ilike",keyword], ["default_code","ilike",keyword], ["barcode","ilike",keyword]]
+        else:
+            domain = [["sale_ok","=",True]]
         rows = await odoo_call(None, "product.product", domain,
-            ["name","default_code","list_price","qty_available"])
+            ["name","default_code","list_price","qty_available","virtual_available","categ_id","barcode"])
         if not rows: return "No products found."
         return "\n".join(
-            f"• {r['name']} [{r.get('default_code') or 'N/A'}] | "
-            f"${r.get('list_price',0):,.2f} | Stock: {r.get('qty_available',0)}"
+            f"• {r['name']} | Ref: {r.get('default_code') or 'N/A'} | "
+            f"Price: ${r.get('list_price',0):,.2f} | "
+            f"On Hand: {r.get('qty_available',0)} | "
+            f"Forecasted: {r.get('virtual_available',0)} | "
+            f"Barcode: {r.get('barcode') or 'N/A'}"
             for r in rows)
     except Exception as e:
         return f"Error: {e}"
