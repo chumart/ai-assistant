@@ -1,9 +1,10 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import httpx
 import os
 import json
+import base64
 
 app = FastAPI()
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -17,6 +18,8 @@ ANTHROPIC_KEY = os.getenv("ANTHROPIC_API_KEY", "")
 class ChatRequest(BaseModel):
     message: str
     history: list = []
+    file_content: str = ""
+    file_name: str = ""
 
 # ---------- Universal Odoo query ----------
 
@@ -156,7 +159,10 @@ async def run_tool(name, inp):
 
 @app.post("/chat")
 async def chat(req: ChatRequest):
-    messages = req.history + [{"role": "user", "content": req.message}]
+    user_content = req.message
+if req.file_content and req.file_name:
+    user_content = f"[Attached file: {req.file_name}]\n{req.file_content}\n\nUser question: {req.message}"
+messages = req.history + [{"role": "user", "content": user_content}]
     headers = {
         "x-api-key": ANTHROPIC_KEY,
         "anthropic-version": "2023-06-01",
@@ -213,6 +219,45 @@ async def test_odoo():
     except Exception as e:
         return {"error": str(e)}
 
+@app.post("/extract-file")
+async def extract_file(file: UploadFile = File(...)):
+    try:
+        content = await file.read()
+        filename = file.filename.lower()
+        
+        if filename.endswith(('.txt', '.md', '.csv')):
+            return {"text": content.decode('utf-8', errors='ignore'), "name": file.filename}
+        
+        if filename.endswith('.pdf'):
+            media_type = "application/pdf"
+            doc_type = "document"
+        elif filename.endswith(('.png', '.jpg', '.jpeg', '.webp')):
+            ext = filename.split('.')[-1].replace('jpg', 'jpeg')
+            media_type = f"image/{ext}"
+            doc_type = "image"
+        else:
+            return {"text": content.decode('utf-8', errors='ignore'), "name": file.filename}
+        
+        b64 = base64.standard_b64encode(content).decode('utf-8')
+        async with httpx.AsyncClient(timeout=60) as c:
+            r = await c.post("https://api.anthropic.com/v1/messages",
+                headers={"x-api-key": ANTHROPIC_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json"},
+                json={
+                    "model": "claude-sonnet-4-5",
+                    "max_tokens": 2000,
+                    "messages": [{
+                        "role": "user",
+                        "content": [
+                            {"type": doc_type, "source": {"type": "base64", "media_type": media_type, "data": b64}},
+                            {"type": "text", "text": "Extract and return ALL text content from this file. Return the raw text only, no commentary."}
+                        ]
+                    }]
+                })
+            data = r.json()
+            text = "".join(b.get("text","") for b in data.get("content",[]) if b.get("type")=="text")
+            return {"text": text, "name": file.filename}
+    except Exception as e:
+        return {"error": str(e)}
 @app.get("/health")
 async def health():
     return {"status": "ok"}
