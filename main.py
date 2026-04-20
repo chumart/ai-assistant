@@ -107,6 +107,18 @@ TOOLS = [
             "properties": {"model": {"type": "string"}},
             "required": ["model"]
         }
+    }，
+    {
+        "name": "get_invoice_stats",
+        "description": "Get accurate invoice statistics for a specific month. Returns exact count, tax total, amount total, and payment state breakdown. Always use this tool when user asks about invoice counts, tax totals, or payment status for a specific month or period. This is more accurate than odoo_search for invoice statistics.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "year": {"type": "integer", "description": "Year, e.g. 2026"},
+                "month": {"type": "integer", "description": "Month number 1-12, e.g. 2 for February"}
+            },
+            "required": ["year", "month"]
+        }
     }
 ]
 
@@ -150,7 +162,13 @@ async def run_tool(name, inp):
             inp.get("limit", 2000), inp.get("order", "id desc"))
     if name == "odoo_fields":
         return await odoo_list_fields(inp["model"])
+    if name == "get_invoice_stats":
+        year = inp.get("year", 2026)
+        month = inp.get("month", 1)
+        result = await invoice_stats(year, month)
+        return json.dumps(result, ensure_ascii=False)
     return "Unknown tool"
+
 
 # ---------- File extraction ----------
 
