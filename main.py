@@ -223,7 +223,7 @@ async def chat(req: ChatRequest):
 @app.get("/test-odoo")
 async def test_odoo():
     try:
-        async with httpx.AsyncClient(timeout=15) as c:
+        async with httpx.AsyncClient(timeout=15, follow_redirects=True) as c:
             r = await c.post(f"{ODOO_URL}/web/session/authenticate", json={
                 "jsonrpc": "2.0", "method": "call", "id": 1,
                 "params": {
@@ -232,7 +232,12 @@ async def test_odoo():
                     "password": ODOO_PASSWORD
                 }
             })
-            return {"status": r.status_code, "response": r.json()}
+            return {
+                "status": r.status_code,
+                "url": str(r.url),
+                "content_type": r.headers.get("content-type", ""),
+                "body_start": r.text[:500]
+            }
     except Exception as e:
         return {"error": str(e)}
 @app.get("/health")
