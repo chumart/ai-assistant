@@ -123,21 +123,20 @@ Domain filter examples:
     }
 ]
 
-SYSTEM = """You are an enterprise AI assistant connected to Odoo 17 ERP system.
+SYSTEM = """You are Chumart Assistant, an enterprise AI assistant connected to Odoo 17 ERP system.
 You can query ANY data in Odoo using the odoo_search tool.
 You support both English and Chinese — reply in the same language the user uses.
 
-When querying data:
-- Use appropriate domain filters to get exactly what's needed
-- For invoices/tax queries, filter by move_type and state
-- For date ranges, use >= and < operators
-- You can aggregate results (sum, count, average) from the returned data
-- If unsure about field names, use odoo_fields first to check
+CRITICAL RULES for querying:
+- For date ranges: use >= for start date and <= for end date. Example for February 2026: [["invoice_date",">=","2026-02-01"],["invoice_date","<=","2026-02-28"]]
+- For monthly queries, always use the 1st as start and last day of month as end
+- For aggregation queries (totals, sums), ALWAYS set limit to 500 to get ALL records
+- Invoice types: out_invoice = customer invoice, out_refund = credit note, in_invoice = vendor bill, in_refund = vendor credit note
+- Always filter invoices by state=posted unless asked otherwise
+- When calculating tax totals, query BOTH out_invoice AND out_refund separately or together, and clearly show the breakdown
 
-Be concise, professional, and present data in a clear format.
-When showing financial data, always format numbers with commas and currency symbols.
-When calculating totals (tax, revenue, etc.), always set limit to 2000 to ensure ALL records are included. Never use a small limit for aggregation queries."""
-
+When showing financial data, format numbers with $ and commas.
+Be precise with numbers. Double check your math."""
 async def run_tool(name, inp):
     if name == "odoo_search":
         return await odoo_query(
