@@ -1404,7 +1404,28 @@ async def run_tool(name, inp):
         for po in orders:
             partner_id = po["partner_id"]
 
-            # Verify partner (reuse shared session)
+            # Auto-detect correct vendor from first product's supplierinfo
+            first_pid = validated_lines[0]["product_id"] if validated_lines else None
+            if first_pid:
+                # Get product template
+                prod_tmpl_r = await odoo_query("product.product",
+                    [["id","=",first_pid]], ["product_tmpl_id"], limit=1, cookies=cookies)
+                tmpl_data = json.loads(prod_tmpl_r)
+                if tmpl_data and tmpl_data[0].get("product_tmpl_id"):
+                    tmpl_id = tmpl_data[0]["product_tmpl_id"][0]
+                    # Look up actual vendor from supplierinfo
+                    sup_r = await odoo_query("product.supplierinfo",
+                        [["product_tmpl_id","=",tmpl_id]],
+                        ["partner_id","price"], limit=1, order="sequence asc", cookies=cookies)
+                    sup_data = json.loads(sup_r)
+                    if sup_data and sup_data[0].get("partner_id"):
+                        real_vendor_id = sup_data[0]["partner_id"][0]
+                        real_vendor_name = sup_data[0]["partner_id"][1]
+                        if real_vendor_id != partner_id:
+                            print(f"VENDOR FIX: AI passed {partner_id} ({po.get('partner_name')}), but supplierinfo says {real_vendor_id} ({real_vendor_name})")
+                            partner_id = real_vendor_id
+
+            # Verify partner exists
             partner_check = await odoo_query(
                 "res.partner", [["id","=",partner_id]],
                 ["id","name"], limit=1, cookies=cookies)
@@ -1413,8 +1434,9 @@ async def run_tool(name, inp):
                 errors.append({"vendor": po.get("partner_name"),
                                "error": f"Partner ID {partner_id} not found."})
                 continue
+            actual_vendor_name = partner_data[0]["name"]
 
-            # Create PO header using shared session
+            # Create PO header with verified vendor
             po_result = await odoo_create("purchase.order", {
                 "partner_id": partner_id,
                 "company_id": 1,
@@ -1504,7 +1526,7 @@ async def run_tool(name, inp):
             created.append({
                 "po_id": po_id,
                 "po_name": po_name,
-                "vendor": po.get("partner_name"),
+                "vendor": actual_vendor_name if 'actual_vendor_name' in dir() else po.get("partner_name"),
                 "lines_requested": len(po.get("lines", [])),
                 "lines_created": lines_created,
                 "line_errors": line_errors,
