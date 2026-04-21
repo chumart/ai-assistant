@@ -441,21 +441,35 @@ async def extract_file(file: UploadFile = File(...)):
         else:
             return {"text": content.decode('utf-8', errors='ignore'), "name": file.filename}
         b64 = base64.standard_b64encode(content).decode('utf-8')
-        async with httpx.AsyncClient(timeout=60) as c:
+
+        # Choose extraction prompt based on file type
+        if doc_type == "document":
+            extract_prompt = (
+                "This is a multi-page document. Extract ALL text content from EVERY page completely. "
+                "Include all product names, model numbers, specifications, dimensions, features, and descriptions. "
+                "Go through every single page from start to finish without skipping anything. "
+                "Return the raw text only, no commentary, no page labels."
+            )
+        else:
+            extract_prompt = "Extract and return ALL text content visible in this image. Return the raw text only, no commentary."
+
+        async with httpx.AsyncClient(timeout=120) as c:
             r = await c.post("https://api.anthropic.com/v1/messages",
                 headers={"x-api-key": ANTHROPIC_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json"},
                 json={
                     "model": "claude-sonnet-4-5",
-                    "max_tokens": 2000,
+                    "max_tokens": 8000,
                     "messages": [{
                         "role": "user",
                         "content": [
                             {"type": doc_type, "source": {"type": "base64", "media_type": media_type, "data": b64}},
-                            {"type": "text", "text": "Extract and return ALL text content from this file. Return the raw text only, no commentary."}
+                            {"type": "text", "text": extract_prompt}
                         ]
                     }]
                 })
             data = r.json()
+            if data.get("error"):
+                return {"error": data["error"].get("message", str(data["error"])), "name": file.filename}
             text = "".join(b.get("text", "") for b in data.get("content", []) if b.get("type") == "text")
             return {"text": text, "name": file.filename}
     except Exception as e:
@@ -467,7 +481,12 @@ async def extract_file(file: UploadFile = File(...)):
 async def chat(req: ChatRequest):
     user_content = req.message
     if req.file_content and req.file_name:
-        user_content = f"[Attached file: {req.file_name}]\n{req.file_content}\n\nUser question: {req.message}"
+        user_content = (
+            f"=== ATTACHED FILE: {req.file_name} ===\n"
+            f"{req.file_content}\n"
+            f"=== END OF FILE ===\n\n"
+            f"User question: {req.message}"
+        )
     messages = req.history + [{"role": "user", "content": user_content}]
     headers = {
         "x-api-key": ANTHROPIC_KEY,
@@ -479,7 +498,7 @@ async def chat(req: ChatRequest):
         for _ in range(5):
             r = await c.post("https://api.anthropic.com/v1/messages", headers=headers, json={
                 "model": "claude-sonnet-4-5",
-                "max_tokens": 2048,
+                "max_tokens": 4096,
                 "system": SYSTEM,
                 "tools": TOOLS,
                 "messages": current_messages
