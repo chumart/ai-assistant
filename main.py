@@ -1053,8 +1053,7 @@ async def run_tool(name, inp):
             for r in rows:
                 results.append(
                     f"📄 **{r['original_name']}**\n"
-                    f"   Category: {r['category']} | Chunks: {r['chunk_count']}\n"
-                    f"   Description: {r['description'] or 'N/A'}\n"
+                    f"   Category: {r['category']}\n"
                     f"   [📥 Download File](/docs/signed-url/{r['id']})"
                 )
             return "\n\n".join(results)
