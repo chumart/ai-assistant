@@ -634,33 +634,86 @@ TOOLS = [
     }
 ]
 
-def get_system_prompt():
+def get_system_prompt(role: str = "guest", user_name: str = "", user_id: int = 0):
     today = datetime.date.today().strftime("%Y年%m月%d日")
-    return f"""今天是{today}。You are Chumart Assistant, an enterprise AI assistant connected to Odoo 17 ERP and our product knowledge base.
-You support both English and Chinese - reply in the same language the user uses.
+    perms = ROLE_PERMISSIONS.get(role, ROLE_PERMISSIONS["guest"])
 
-KNOWLEDGE BASE RULES (MOST IMPORTANT):
-- For ANY product question, spec, price, installation, or sales question: ALWAYS call search_knowledge first
-- The knowledge base contains data from: chumartusa.com, polarmanusa.com, flamasterusa.com, chefasstusa.com
-- Never answer product questions from memory — always search first
-- For sales training questions, search the knowledge base for relevant product info and help craft sales talking points
-
-FINANCIAL REPORT RULES:
+    # Build permission-specific rules
+    finance_rules = ""
+    if perms["can_see_finance"]:
+        finance_rules = """
+FINANCIAL REPORT RULES (you have access):
 - Monthly tax -> get_monthly_tax
 - Quarterly tax -> get_quarterly_tax
 - Monthly sales / commission base -> get_monthly_sales
 - CA invoices missing tax -> get_missing_tax
+- Can query account.move, account.payment with full access"""
+    else:
+        finance_rules = """
+FINANCIAL RULES (NO ACCESS):
+- You do NOT have permission to view financial reports, tax data, invoices, or payment information
+- If asked about finance/tax/invoices, politely say you don't have access and suggest contacting the finance team
+- Do NOT call get_monthly_tax, get_quarterly_tax, get_monthly_sales, get_missing_tax"""
 
-ODOO RULES:
+    sales_rules = ""
+    if perms["can_see_all_sales"]:
+        sales_rules = """
+SALES RULES (full access):
+- Can view all sales orders and invoices for all salespeople"""
+    else:
+        own_filter = f'["invoice_user_id","=",{user_id}]' if user_id else '["invoice_user_id","=",false]'
+        sales_rules = f"""
+SALES RULES (own data only):
+- Current user: {user_name} (uid={user_id})
+- Can ONLY view own sales orders: always add filter ["user_id","=",{user_id}] to sale.order queries
+- Can ONLY view own invoices: always add filter {own_filter} to account.move queries
+- Cannot view other salespeople's data
+- Cannot view commission reports for others"""
+
+    cost_rules = ""
+    if not perms["can_see_cost"]:
+        cost_rules = """
+COST/MARGIN RULES (NO ACCESS):
+- NEVER show standard_price, cost, or margin fields
+- If asked about cost or margin, say this information is restricted
+- Only show sales price (list_price), not cost price (standard_price)"""
+    else:
+        cost_rules = "COST RULES: Can view all cost and margin data."
+
+    inventory_rules = ""
+    if perms["can_see_inventory"]:
+        inventory_rules = "INVENTORY: Can query stock.quant and view inventory levels."
+    else:
+        inventory_rules = "INVENTORY: No access to inventory data."
+
+    return f"""今天是{today}。You are Chumart Assistant, an enterprise AI assistant.
+You support both English and Chinese - reply in the same language the user uses.
+
+CURRENT USER: {user_name} | ROLE: {perms['label']} | UID: {user_id}
+
+KNOWLEDGE BASE RULES (MOST IMPORTANT):
+- For ANY product question, spec, price, installation, or sales question: ALWAYS call search_knowledge first
+- Never answer product questions from memory — always search first
+
+{finance_rules}
+
+{sales_rules}
+
+{cost_rules}
+
+{inventory_rules}
+
+GENERAL ODOO RULES:
 - Always include date filters when user mentions a time period
 - For account.move, sale.order, purchase.order, account.payment, res.partner, crm.lead, repair.order, stock.picking: filtered by company_id=1
 - For product.product, stock.quant: do NOT add company_id filter
 - For stock queries always add ["location_id.usage","=","internal"]
+- For product search use ilike on both name and default_code with OR logic
 
 When showing financial data: use $ with commas, be precise.
 When helping sales: be specific, cite model numbers, give concrete talking points.
-When showing sales reports or any tabular data: ALWAYS format as markdown tables using | col | col | syntax.
-After showing a summary table, tell the user they can click the green Export Excel button to download it."""
+When showing tabular data: ALWAYS format as markdown tables using | col | col | syntax."""
+
 
 async def run_tool(name, inp):
     if name == "odoo_search":
@@ -803,9 +856,23 @@ class ChatRequest(BaseModel):
     file_content: str = ""
     file_name: str = ""
     file_id: str = ""
+    role: str = "guest"
+    user_name: str = ""
+    user_id: int = 0
 
 @app.post("/chat")
 async def chat(req: ChatRequest):
+    perms = ROLE_PERMISSIONS.get(req.role, ROLE_PERMISSIONS["guest"])
+
+    # Filter tools based on permissions
+    allowed_tools = []
+    finance_tools = {"get_monthly_tax", "get_quarterly_tax", "get_monthly_sales", "get_missing_tax"}
+    for tool in TOOLS:
+        tname = tool["name"]
+        if tname in finance_tools and not perms["can_see_finance"]:
+            continue  # hide finance tools from non-finance roles
+        allowed_tools.append(tool)
+
     if req.file_id and req.file_id in FILE_CACHE:
         cached = FILE_CACHE[req.file_id]
         doc_type = "document" if cached["media_type"] == "application/pdf" else "image"
@@ -829,8 +896,8 @@ async def chat(req: ChatRequest):
             r = await c.post("https://api.anthropic.com/v1/messages", headers=headers, json={
                 "model": "claude-sonnet-4-5",
                 "max_tokens": 4096,
-                "system": get_system_prompt(),
-                "tools": TOOLS,
+                "system": get_system_prompt(req.role, req.user_name, req.user_id),
+                "tools": allowed_tools,
                 "messages": current_messages
             })
             d = r.json()
@@ -875,6 +942,160 @@ async def health():
     db_ok = conn is not None
     if conn: await conn.close()
     return {"status": "ok", "db": "connected" if db_ok else "disconnected"}
+
+# ─────────────────────────────────────────────
+# Auth — login with Odoo credentials + RBAC
+# ─────────────────────────────────────────────
+
+# Role permission matrix
+ROLE_PERMISSIONS = {
+    "admin": {
+        "label": "Administrator",
+        "can_see_finance":    True,
+        "can_see_all_sales":  True,
+        "can_see_cost":       True,
+        "can_see_inventory":  True,
+        "can_see_products":   True,
+        "can_export":         True,
+    },
+    "finance": {
+        "label": "Finance",
+        "can_see_finance":    True,
+        "can_see_all_sales":  True,
+        "can_see_cost":       True,
+        "can_see_inventory":  True,
+        "can_see_products":   True,
+        "can_export":         True,
+    },
+    "sales": {
+        "label": "Sales",
+        "can_see_finance":    False,
+        "can_see_all_sales":  False,   # only own orders
+        "can_see_cost":       False,
+        "can_see_inventory":  True,
+        "can_see_products":   True,    # price yes, cost no
+        "can_export":         False,
+    },
+    "warehouse": {
+        "label": "Warehouse",
+        "can_see_finance":    False,
+        "can_see_all_sales":  False,
+        "can_see_cost":       False,
+        "can_see_inventory":  True,
+        "can_see_products":   True,
+        "can_export":         False,
+    },
+    "guest": {
+        "label": "Guest",
+        "can_see_finance":    False,
+        "can_see_all_sales":  False,
+        "can_see_cost":       False,
+        "can_see_inventory":  True,
+        "can_see_products":   True,
+        "can_export":         False,
+    },
+}
+
+# Odoo group XML IDs → role mapping (checked in priority order)
+ODOO_GROUP_ROLE_MAP = [
+    # Admin / Settings
+    ("base.group_system",                  "admin"),
+    ("base.group_erp_manager",             "admin"),
+    # Finance / Accounting
+    ("account.group_account_manager",      "finance"),
+    ("account.group_account_user",         "finance"),
+    ("account.group_account_invoice",      "finance"),
+    # Sales
+    ("sales_team.group_sale_manager",      "sales"),
+    ("sales_team.group_sale_salesman",     "sales"),
+    ("base.group_sale_salesman",           "sales"),
+    # Warehouse / Inventory
+    ("stock.group_stock_manager",          "warehouse"),
+    ("stock.group_stock_user",             "warehouse"),
+    ("purchase.group_purchase_manager",    "warehouse"),
+]
+
+async def get_user_role(uid: int, cookies) -> str:
+    """Query Odoo groups for a logged-in user and return their highest role."""
+    try:
+        async with httpx.AsyncClient(timeout=15, follow_redirects=True) as c:
+            # Get user's group IDs
+            r = await c.post(f"{ODOO_URL}/web/dataset/call_kw", json={
+                "jsonrpc": "2.0", "method": "call", "id": 2,
+                "params": {
+                    "model": "res.users", "method": "read",
+                    "args": [[uid]],
+                    "kwargs": {"fields": ["groups_id"]}
+                }
+            }, cookies=cookies)
+            data = r.json()
+            result = data.get("result", [])
+            if not result:
+                return "guest"
+            group_ids = result[0].get("groups_id", [])
+
+            # Get group XML IDs
+            r2 = await c.post(f"{ODOO_URL}/web/dataset/call_kw", json={
+                "jsonrpc": "2.0", "method": "call", "id": 3,
+                "params": {
+                    "model": "ir.model.data", "method": "search_read",
+                    "args": [[["model", "=", "res.groups"], ["res_id", "in", group_ids]]],
+                    "kwargs": {"fields": ["module", "name", "res_id"], "limit": 100}
+                }
+            }, cookies=cookies)
+            data2 = r2.json()
+            xml_ids = set()
+            for rec in data2.get("result", []):
+                xml_ids.add(f"{rec['module']}.{rec['name']}")
+
+            # Match to role in priority order
+            for xml_id, role in ODOO_GROUP_ROLE_MAP:
+                if xml_id in xml_ids:
+                    return role
+
+            return "guest"
+    except Exception as e:
+        print(f"Role detection error: {e}")
+        return "guest"
+
+
+class LoginRequest(BaseModel):
+    username: str
+    password: str
+
+@app.post("/auth/login")
+async def login(req: LoginRequest):
+    """Verify user against Odoo, detect role from groups, return permissions."""
+    try:
+        async with httpx.AsyncClient(timeout=15, follow_redirects=True) as c:
+            r = await c.post(f"{ODOO_URL}/web/session/authenticate", json={
+                "jsonrpc": "2.0", "method": "call", "id": 1,
+                "params": {"db": ODOO_DB, "login": req.username, "password": req.password}
+            })
+            data = r.json()
+            result = data.get("result", {})
+
+            if not result or not result.get("uid"):
+                return {"success": False, "error": "Invalid username or password"}
+
+            uid = result.get("uid")
+            cookies = r.cookies
+
+            # Detect role
+            role = await get_user_role(uid, cookies)
+            permissions = ROLE_PERMISSIONS.get(role, ROLE_PERMISSIONS["guest"])
+
+            return {
+                "success":     True,
+                "uid":         uid,
+                "name":        result.get("name", req.username),
+                "username":    req.username,
+                "role":        role,
+                "role_label":  permissions["label"],
+                "permissions": permissions,
+            }
+    except Exception as e:
+        return {"success": False, "error": str(e)}
 
 # ─────────────────────────────────────────────
 # Excel Export
