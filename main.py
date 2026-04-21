@@ -527,6 +527,70 @@ async def get_kb_context(query: str) -> str:
     return "\n".join(parts) + "\n=== END KNOWLEDGE BASE ==="
 
 # ─────────────────────────────────────────────
+# Odoo Write operations
+# ─────────────────────────────────────────────
+
+async def odoo_create(model: str, vals: dict) -> dict:
+    """Create a record in Odoo. Returns {id} or {error}."""
+    try:
+        async with httpx.AsyncClient(timeout=20, follow_redirects=True) as c:
+            login_r = await c.post(f"{ODOO_URL}/web/session/authenticate", json={
+                "jsonrpc": "2.0", "method": "call", "id": 1,
+                "params": {"db": ODOO_DB, "login": ODOO_USERNAME, "password": ODOO_PASSWORD}
+            })
+            cookies = login_r.cookies
+            r = await c.post(f"{ODOO_URL}/web/dataset/call_kw", json={
+                "jsonrpc": "2.0", "method": "call", "id": 2,
+                "params": {"model": model, "method": "create", "args": [vals], "kwargs": {}}
+            }, cookies=cookies)
+            data = r.json()
+            if data.get("error"):
+                return {"error": data["error"].get("data", {}).get("message", str(data["error"]))}
+            return {"id": data.get("result"), "success": True}
+    except Exception as e:
+        return {"error": str(e)}
+
+async def odoo_write_record(model: str, record_id: int, vals: dict) -> dict:
+    """Update a record in Odoo."""
+    try:
+        async with httpx.AsyncClient(timeout=20, follow_redirects=True) as c:
+            login_r = await c.post(f"{ODOO_URL}/web/session/authenticate", json={
+                "jsonrpc": "2.0", "method": "call", "id": 1,
+                "params": {"db": ODOO_DB, "login": ODOO_USERNAME, "password": ODOO_PASSWORD}
+            })
+            cookies = login_r.cookies
+            r = await c.post(f"{ODOO_URL}/web/dataset/call_kw", json={
+                "jsonrpc": "2.0", "method": "call", "id": 2,
+                "params": {"model": model, "method": "write", "args": [[record_id], vals], "kwargs": {}}
+            }, cookies=cookies)
+            data = r.json()
+            if data.get("error"):
+                return {"error": data["error"].get("data", {}).get("message", str(data["error"]))}
+            return {"success": True}
+    except Exception as e:
+        return {"error": str(e)}
+
+async def odoo_call_method(model: str, record_id: int, method: str) -> dict:
+    """Call an action method on a record (e.g. button_confirm)."""
+    try:
+        async with httpx.AsyncClient(timeout=20, follow_redirects=True) as c:
+            login_r = await c.post(f"{ODOO_URL}/web/session/authenticate", json={
+                "jsonrpc": "2.0", "method": "call", "id": 1,
+                "params": {"db": ODOO_DB, "login": ODOO_USERNAME, "password": ODOO_PASSWORD}
+            })
+            cookies = login_r.cookies
+            r = await c.post(f"{ODOO_URL}/web/dataset/call_kw", json={
+                "jsonrpc": "2.0", "method": "call", "id": 2,
+                "params": {"model": model, "method": method, "args": [[record_id]], "kwargs": {}}
+            }, cookies=cookies)
+            data = r.json()
+            if data.get("error"):
+                return {"error": data["error"].get("data", {}).get("message", str(data["error"]))}
+            return {"success": True}
+    except Exception as e:
+        return {"error": str(e)}
+
+# ─────────────────────────────────────────────
 # Odoo helpers (unchanged)
 # ─────────────────────────────────────────────
 
@@ -841,6 +905,113 @@ TOOLS = [
         "name": "search_documents",
         "description": "Search for specific internal documents by name or category. Use when user asks to find or download a specific file like a service manual, employee handbook, or procedure document. Returns document name, category, and download link.",
         "input_schema": {"type":"object","properties":{"query":{"type":"string","description":"Document name or keywords"},"category":{"type":"string","description":"Optional: service_manual, employee_handbook, after_sales, warranty, general"}},"required":["query"]}
+    },
+    {
+        "name": "odoo_create_record",
+        "description": "Create a new record in Odoo after user confirms. Use for: purchase.order (PO), sale.order (SO), res.partner (contact). Always search first to verify product/partner IDs, show a confirmation summary, and only call this after user explicitly says 'confirm' or '确认'. For purchase.order: vals must include partner_id. Order lines are added separately via odoo_add_order_line.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "model": {"type": "string", "description": "Odoo model: purchase.order, sale.order, res.partner etc"},
+                "vals": {"type": "object", "description": "Field values to set on the new record"}
+            },
+            "required": ["model", "vals"]
+        }
+    },
+    {
+        "name": "odoo_add_order_line",
+        "description": "Add a product line to an existing purchase.order or sale.order. Call after odoo_create_record to add products. Requires order_id, product_id, quantity, and price_unit.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "order_type": {"type": "string", "description": "purchase or sale"},
+                "order_id": {"type": "integer", "description": "The ID of the order"},
+                "product_id": {"type": "integer", "description": "Product ID from Odoo"},
+                "quantity": {"type": "number", "description": "Quantity to order"},
+                "price_unit": {"type": "number", "description": "Unit price (optional, will use product default if 0)"}
+            },
+            "required": ["order_type", "order_id", "product_id", "quantity"]
+        }
+    },
+    {
+        "name": "odoo_confirm_order",
+        "description": "Confirm a draft purchase or sale order (changes state from draft to confirmed). Only call after user explicitly requests to confirm/submit the order.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "order_type": {"type": "string", "description": "purchase or sale"},
+                "order_id": {"type": "integer", "description": "The order ID to confirm"}
+            },
+            "required": ["order_type", "order_id"]
+        }
+    },
+    {
+        "name": "odoo_update_record",
+        "description": "Update fields on an existing Odoo record. Use for modifying existing orders, contacts, etc. Requires explicit user confirmation before calling.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "model": {"type": "string"},
+                "record_id": {"type": "integer"},
+                "vals": {"type": "object", "description": "Fields to update"}
+            },
+            "required": ["model", "record_id", "vals"]
+        }
+    },
+    {
+        "name": "odoo_search_products_by_sku",
+        "description": "Search multiple products by SKU (default_code) in one batch call. Returns product ID, name, SKU, price for each. Use when user provides a list of SKUs to build purchase orders.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "skus": {"type": "array", "items": {"type": "string"}, "description": "List of SKU codes"}
+            },
+            "required": ["skus"]
+        }
+    },
+    {
+        "name": "odoo_get_product_vendors",
+        "description": "Get all vendors for a list of products from product.supplierinfo. Returns each product with ALL its vendors (name, price, min_qty). If a product has multiple vendors, AI must ask user to choose. Use before creating any purchase order.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "product_ids": {"type": "array", "items": {"type": "integer"}, "description": "List of product IDs"}
+            },
+            "required": ["product_ids"]
+        }
+    },
+    {
+        "name": "odoo_create_bulk_po",
+        "description": "Create multiple purchase orders at once, one per vendor. Only call after user has confirmed the full plan. Each PO has one vendor and multiple product lines.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "purchase_orders": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "partner_id": {"type": "integer", "description": "Vendor partner ID"},
+                            "partner_name": {"type": "string"},
+                            "lines": {
+                                "type": "array",
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "product_id": {"type": "integer"},
+                                        "product_name": {"type": "string"},
+                                        "quantity": {"type": "number"},
+                                        "price_unit": {"type": "number"}
+                                    }
+                                }
+                            }
+                        }
+                    },
+                    "description": "List of POs to create, one per vendor"
+                }
+            },
+            "required": ["purchase_orders"]
+        }
     }
 ]
 
@@ -964,6 +1135,46 @@ When helping sales: be specific, cite model numbers, give concrete talking point
 Only use markdown tables when data is genuinely tabular (multi-row comparisons, reports, lists with multiple columns). Do NOT use tables for single items, simple answers, or narrative responses.
 CALCULATION RULES: When summing financial data from tool results, always use the exact numbers returned by the tool. Never recalculate totals yourself — use the pre-calculated values from the data (commission_base.net_sales_excl_tax etc). If showing a summary, copy the numbers directly from the tool response.
 
+WRITE OPERATION RULES:
+- Roles that CAN write to Odoo: admin, purchase
+- NEVER execute write operations without explicit confirmation ("confirm", "确认", "yes", "go ahead")
+- After creating, always show Odoo direct link from tool result
+- If user role lacks can_write_odoo, politely decline
+
+BULK PURCHASE ORDER WORKFLOW (when user gives a list of SKUs):
+Follow these steps in order:
+
+STEP 1 — Search all products at once:
+  Call odoo_search_products_by_sku with all SKUs in one call.
+  If any SKU not found, tell user immediately and ask how to proceed.
+
+STEP 2 — Get all vendors:
+  Call odoo_get_product_vendors with all found product IDs in one call.
+  Check each product:
+  - no_vendor=true → tell user this product has no vendor configured, skip or ask
+  - has_multiple_vendors=true → LIST all vendors with their prices, ask user to choose ONE for that product
+  - Only one vendor → auto-assign, no need to ask
+
+STEP 3 — Show grouped PO plan:
+  Group products by their chosen vendor. Show a clear table:
+  "📋 PO Plan — X orders will be created:
+
+  **PO #1 → [Vendor A]**
+  | SKU | Product | Qty | Unit Price |
+  |-----|---------|-----|------------|
+  | ... | ...     | ... | ...        |
+
+  **PO #2 → [Vendor B]**
+  | SKU | Product | Qty | Unit Price |
+  ...
+
+  Total: X POs, Y line items
+  Reply '确认' to create all, or tell me what to change."
+
+STEP 4 — Execute only after confirmation:
+  Call odoo_create_bulk_po with the full plan.
+  Report results: PO numbers + Odoo links for each created PO.
+
 SCOPE OF KNOWLEDGE (answer freely):
 - Our own products: Chumart, Polarman, Flamaster, ChefAsst — specs, pricing, installation, maintenance
 - Competitor/industry products: True, Turbo Air, Beverage-Air, Hoshizaki, Manitowoc, Continental, Victory, Traulsen, Arctic Air, and any other commercial refrigeration or foodservice equipment brands — answer product questions, maintenance, repair, troubleshooting, comparisons
@@ -1006,6 +1217,189 @@ async def run_tool(name, inp):
                 else:
                     parts.append(f"[{source} | {r['page_title']}]\n{r['chunk_text']}")
         return "\n\n---\n\n".join(parts) if parts else "No sufficiently relevant results found."
+    if name == "odoo_create_record":
+        result = await odoo_create(inp["model"], inp["vals"])
+        if result.get("error"):
+            return json.dumps({"error": result["error"]})
+        new_id = result["id"]
+        odoo_url_path = f"{ODOO_URL}/web#model={inp['model']}&id={new_id}"
+        return json.dumps({"success": True, "id": new_id, "odoo_link": odoo_url_path,
+                           "message": f"Created successfully with ID {new_id}"})
+
+    if name == "odoo_add_order_line":
+        line_model = "purchase.order.line" if inp["order_type"] == "purchase" else "sale.order.line"
+        order_field = "order_id"
+        vals = {
+            order_field: inp["order_id"],
+            "product_id": inp["product_id"],
+            "product_qty" if inp["order_type"] == "purchase" else "product_uom_qty": inp["quantity"],
+        }
+        if inp.get("price_unit"):
+            vals["price_unit"] = inp["price_unit"]
+        result = await odoo_create(line_model, vals)
+        if result.get("error"):
+            return json.dumps({"error": result["error"]})
+        return json.dumps({"success": True, "line_id": result["id"],
+                           "message": f"Product line added successfully"})
+
+    if name == "odoo_confirm_order":
+        model = "purchase.order" if inp["order_type"] == "purchase" else "sale.order"
+        method = "button_confirm"
+        result = await odoo_call_method(model, inp["order_id"], method)
+        if result.get("error"):
+            return json.dumps({"error": result["error"]})
+        odoo_link = f"{ODOO_URL}/web#model={model}&id={inp['order_id']}"
+        return json.dumps({"success": True, "message": "Order confirmed successfully", "odoo_link": odoo_link})
+
+    if name == "odoo_update_record":
+        result = await odoo_write_record(inp["model"], inp["record_id"], inp["vals"])
+        if result.get("error"):
+            return json.dumps({"error": result["error"]})
+        return json.dumps({"success": True, "message": "Record updated successfully"})
+
+    if name == "odoo_search_products_by_sku":
+        skus = inp.get("skus", [])
+        results = []
+        not_found = []
+        for sku in skus:
+            r = await odoo_query(
+                "product.product",
+                [["default_code", "ilike", sku], ["active", "=", True]],
+                ["id", "name", "default_code", "list_price", "uom_id"],
+                limit=3, order="id asc"
+            )
+            prods = json.loads(r)
+            if isinstance(prods, list) and prods:
+                # Prefer exact match
+                exact = [p for p in prods if (p.get("default_code") or "").upper() == sku.upper()]
+                p = exact[0] if exact else prods[0]
+                results.append({
+                    "sku_searched": sku,
+                    "found": True,
+                    "product_id": p["id"],
+                    "name": p["name"],
+                    "default_code": p.get("default_code", ""),
+                    "list_price": p.get("list_price", 0),
+                    "uom": p["uom_id"][1] if p.get("uom_id") else "Unit"
+                })
+            else:
+                not_found.append(sku)
+                results.append({"sku_searched": sku, "found": False})
+        return json.dumps({"results": results, "not_found": not_found}, ensure_ascii=False)
+
+    if name == "odoo_get_product_vendors":
+        product_ids = inp.get("product_ids", [])
+        if not product_ids:
+            return json.dumps({"error": "No product IDs provided"})
+        r = await odoo_query(
+            "product.supplierinfo",
+            [["product_id", "in", product_ids]],
+            ["product_id", "product_tmpl_id", "partner_id", "price", "min_qty", "currency_id"],
+            limit=500, order="sequence asc"
+        )
+        rows = json.loads(r)
+        # Group by product_id
+        by_product = {}
+        for row in rows:
+            pid = row["product_id"][0] if row.get("product_id") else None
+            # Also try template-level match
+            if pid is None:
+                continue
+            if pid not in by_product:
+                by_product[pid] = []
+            by_product[pid].append({
+                "vendor_id": row["partner_id"][0],
+                "vendor_name": row["partner_id"][1],
+                "price": row.get("price", 0),
+                "min_qty": row.get("min_qty", 0),
+                "currency": row["currency_id"][1] if row.get("currency_id") else "USD"
+            })
+        # For products not found in supplierinfo, try via product_tmpl_id
+        missing_ids = [pid for pid in product_ids if pid not in by_product]
+        if missing_ids:
+            # Get template IDs for missing products
+            tmpl_r = await odoo_query(
+                "product.product",
+                [["id", "in", missing_ids]],
+                ["id", "product_tmpl_id"], limit=100
+            )
+            tmpl_rows = json.loads(tmpl_r)
+            tmpl_map = {r["id"]: r["product_tmpl_id"][0] for r in tmpl_rows if r.get("product_tmpl_id")}
+            if tmpl_map:
+                tmpl_ids = list(set(tmpl_map.values()))
+                tmpl_sup_r = await odoo_query(
+                    "product.supplierinfo",
+                    [["product_tmpl_id", "in", tmpl_ids], ["product_id", "=", False]],
+                    ["product_tmpl_id", "partner_id", "price", "min_qty", "currency_id"],
+                    limit=200
+                )
+                tmpl_sup_rows = json.loads(tmpl_sup_r)
+                for pid, tmpl_id in tmpl_map.items():
+                    vendors = [
+                        {
+                            "vendor_id": r["partner_id"][0],
+                            "vendor_name": r["partner_id"][1],
+                            "price": r.get("price", 0),
+                            "min_qty": r.get("min_qty", 0),
+                            "currency": r["currency_id"][1] if r.get("currency_id") else "USD"
+                        }
+                        for r in tmpl_sup_rows if r["product_tmpl_id"][0] == tmpl_id
+                    ]
+                    if vendors:
+                        by_product[pid] = vendors
+        result = []
+        for pid in product_ids:
+            vendors = by_product.get(pid, [])
+            result.append({
+                "product_id": pid,
+                "vendor_count": len(vendors),
+                "has_multiple_vendors": len(vendors) > 1,
+                "vendors": vendors,
+                "needs_vendor_selection": len(vendors) > 1,
+                "no_vendor": len(vendors) == 0
+            })
+        return json.dumps(result, ensure_ascii=False)
+
+    if name == "odoo_create_bulk_po":
+        orders = inp.get("purchase_orders", [])
+        created = []
+        errors = []
+        for po in orders:
+            # Create PO header
+            po_result = await odoo_create("purchase.order", {
+                "partner_id": po["partner_id"],
+                "company_id": 1
+            })
+            if po_result.get("error"):
+                errors.append({"vendor": po.get("partner_name"), "error": po_result["error"]})
+                continue
+            po_id = po_result["id"]
+            # Add lines
+            line_errors = []
+            for line in po.get("lines", []):
+                line_vals = {
+                    "order_id": po_id,
+                    "product_id": line["product_id"],
+                    "product_qty": line["quantity"],
+                    "price_unit": line.get("price_unit", 0),
+                    "name": line.get("product_name", ""),
+                }
+                line_result = await odoo_create("purchase.order.line", line_vals)
+                if line_result.get("error"):
+                    line_errors.append(line.get("product_name", str(line["product_id"])))
+            created.append({
+                "po_id": po_id,
+                "vendor": po.get("partner_name"),
+                "line_count": len(po.get("lines", [])),
+                "line_errors": line_errors,
+                "odoo_link": f"{ODOO_URL}/web#model=purchase.order&id={po_id}"
+            })
+        return json.dumps({
+            "created": created,
+            "errors": errors,
+            "summary": f"Created {len(created)} PO(s), {len(errors)} failed"
+        }, ensure_ascii=False)
+
     if name == "search_documents":
         conn = await get_db_conn()
         if not conn:
@@ -1436,9 +1830,12 @@ async def chat(req: ChatRequest, background_tasks: BackgroundTasks):
     # Filter tools based on permissions
     allowed_tools = []
     finance_tools = {"get_monthly_tax", "get_quarterly_tax", "get_monthly_sales", "get_missing_tax"}
+    write_tools = {"odoo_create_record", "odoo_add_order_line", "odoo_confirm_order", "odoo_update_record"}
     for tool in TOOLS:
         tname = tool["name"]
-        if tname in finance_tools and not perms["can_see_finance"]:
+        if tname in finance_tools and not perms.get("can_see_finance"):
+            continue
+        if tname in write_tools and not perms.get("can_write_odoo"):
             continue
         allowed_tools.append(tool)
 
@@ -1762,6 +2159,7 @@ ROLE_PERMISSIONS = {
         "can_see_inventory":  True,
         "can_see_products":   True,
         "can_export":         True,
+        "can_write_odoo":     True,
     },
     "finance": {
         "label": "Finance",
@@ -1771,6 +2169,17 @@ ROLE_PERMISSIONS = {
         "can_see_inventory":  True,
         "can_see_products":   True,
         "can_export":         True,
+        "can_write_odoo":     False,
+    },
+    "purchase": {
+        "label": "Purchase",
+        "can_see_finance":    False,
+        "can_see_all_sales":  True,
+        "can_see_cost":       True,
+        "can_see_inventory":  True,
+        "can_see_products":   True,
+        "can_export":         True,
+        "can_write_odoo":     True,
     },
     "sales": {
         "label": "Sales",
