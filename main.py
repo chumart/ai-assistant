@@ -150,6 +150,9 @@ async def init_db():
 
 @app.on_event("startup")
 async def startup():
+    print("=" * 60)
+    print("CHUMART AI BACKEND — BUILD: vendor-fix-v2 (2026-04-21)")
+    print("=" * 60)
     await init_db()
 
 # ─────────────────────────────────────────────
@@ -559,6 +562,107 @@ async def odoo_create(model: str, vals: dict, cookies=None) -> dict:
             return {"id": data.get("result"), "success": True}
     except Exception as e:
         return {"error": str(e)}
+
+
+async def resolve_po_vendor(suggested_partner_id, line_product_ids: list, cookies=None):
+    """
+    Verify & auto-fix the vendor for a purchase order.
+
+    Returns: (final_partner_id, final_vendor_name, fix_note)
+      - fix_note is None if no fix was needed, else a human-readable string.
+
+    Logic:
+      1. Check if suggested partner is a real supplier (supplier_rank > 0).
+      2. Query supplierinfo for ALL products in the PO.
+      3. Keep AI's choice only if valid supplier AND actually supplies these products.
+      4. Otherwise pick the vendor covering the MOST products.
+    """
+    final_partner_id = suggested_partner_id
+    final_vendor_name = ""
+    fix_note = None
+
+    if not line_product_ids:
+        print(f"RESOLVE_VENDOR: no product_ids passed, keeping suggested partner_id={suggested_partner_id}")
+        return final_partner_id, final_vendor_name, fix_note
+
+    # (a) Is the suggested partner actually a supplier?
+    is_valid_supplier = False
+    if suggested_partner_id:
+        chk = await odoo_query("res.partner",
+            [["id","=",suggested_partner_id]],
+            ["id","name","supplier_rank"], limit=1, cookies=cookies)
+        chk_data = json.loads(chk)
+        if isinstance(chk_data, list) and chk_data:
+            final_vendor_name = chk_data[0].get("name", "")
+            is_valid_supplier = (chk_data[0].get("supplier_rank", 0) or 0) > 0
+
+    # (b) Map products → templates
+    prod_r = await odoo_query("product.product",
+        [["id","in",line_product_ids]],
+        ["id","product_tmpl_id"], limit=500, cookies=cookies)
+    prod_rows = json.loads(prod_r)
+    if not isinstance(prod_rows, list):
+        print(f"RESOLVE_VENDOR: product query failed: {prod_rows}")
+        return final_partner_id, final_vendor_name, fix_note
+    tmpl_ids = list({p["product_tmpl_id"][0] for p in prod_rows
+                     if p.get("product_tmpl_id")})
+    if not tmpl_ids:
+        print(f"RESOLVE_VENDOR: no templates resolved from products {line_product_ids}")
+        return final_partner_id, final_vendor_name, fix_note
+
+    # (c) Query supplierinfo for ALL products in this PO
+    sup_r = await odoo_query("product.supplierinfo",
+        [["product_tmpl_id","in",tmpl_ids]],
+        ["product_tmpl_id","partner_id"], limit=1000,
+        order="sequence asc", cookies=cookies)
+    sup_rows = json.loads(sup_r)
+    if not isinstance(sup_rows, list):
+        print(f"RESOLVE_VENDOR: supplierinfo query failed: {sup_rows}")
+        return final_partner_id, final_vendor_name, fix_note
+
+    # Count unique templates each vendor supplies
+    vendor_info = {}  # vid -> {name, tmpls: set()}
+    for s in sup_rows:
+        if not s.get("partner_id"): continue
+        vid = s["partner_id"][0]
+        vname = s["partner_id"][1]
+        tid = s["product_tmpl_id"][0] if s.get("product_tmpl_id") else None
+        if tid is None: continue
+        if vid not in vendor_info:
+            vendor_info[vid] = {"name": vname, "tmpls": set()}
+        vendor_info[vid]["tmpls"].add(tid)
+
+    print(f"RESOLVE_VENDOR: {len(tmpl_ids)} templates, "
+          f"{len(vendor_info)} candidate vendors: "
+          f"{[(v['name'], len(v['tmpls'])) for v in vendor_info.values()]}")
+
+    if not vendor_info:
+        print(f"RESOLVE_VENDOR: no supplierinfo found for tmpls {tmpl_ids}, "
+              f"keeping suggested partner_id={suggested_partner_id}")
+        return final_partner_id, final_vendor_name, fix_note
+
+    # Keep AI's choice ONLY if: valid supplier AND actually supplies these products
+    keep_suggested = (is_valid_supplier
+                      and suggested_partner_id in vendor_info
+                      and len(vendor_info[suggested_partner_id]["tmpls"]) > 0)
+    if keep_suggested:
+        final_vendor_name = vendor_info[suggested_partner_id]["name"]
+        print(f"RESOLVE_VENDOR: keeping AI's choice → {final_vendor_name} "
+              f"(id={suggested_partner_id}, "
+              f"covers {len(vendor_info[suggested_partner_id]['tmpls'])}/{len(tmpl_ids)})")
+        return final_partner_id, final_vendor_name, fix_note
+
+    # Pick vendor with greatest coverage
+    best_vid = max(vendor_info.keys(),
+        key=lambda v: len(vendor_info[v]["tmpls"]))
+    best = vendor_info[best_vid]
+    fix_note = (f"AI suggested '{final_vendor_name}' "
+                f"(id={suggested_partner_id}, "
+                f"supplier_rank={'>0' if is_valid_supplier else '=0'}), "
+                f"replaced with '{best['name']}' (id={best_vid}, "
+                f"covers {len(best['tmpls'])}/{len(tmpl_ids)} products)")
+    print(f"VENDOR FIX: {fix_note}")
+    return best_vid, best["name"], fix_note
 
 async def odoo_write_record(model: str, record_id: int, vals: dict) -> dict:
     """Update a record in Odoo."""
@@ -1199,6 +1303,10 @@ SCOPE OF KNOWLEDGE (answer freely):
 
 
 async def run_tool(name, inp):
+    try:
+        print(f"[TOOL] {name} input={json.dumps(inp, ensure_ascii=False, default=str)[:500]}")
+    except Exception:
+        print(f"[TOOL] {name}")
     if name == "odoo_search":
         model = inp["model"]
         domain = inp.get("domain", [])
@@ -1232,6 +1340,15 @@ async def run_tool(name, inp):
                     parts.append(f"[{source} | {r['page_title']}]\n{r['chunk_text']}")
         return "\n\n---\n\n".join(parts) if parts else "No sufficiently relevant results found."
     if name == "odoo_create_record":
+        model_name = inp.get("model", "")
+        print(f"TOOL CALL: odoo_create_record model={model_name} vals_keys={list(inp.get('vals', {}).keys())}")
+        # Block single-path PO creation — force the AI to use bulk path with vendor validation
+        if model_name == "purchase.order":
+            msg = ("Do NOT use odoo_create_record for purchase.order. "
+                   "Use odoo_create_bulk_po instead — it validates the vendor against "
+                   "product.supplierinfo to prevent writing the wrong partner_id.")
+            print(f"BLOCKED: {msg}")
+            return json.dumps({"error": msg})
         result = await odoo_create(inp["model"], inp["vals"])
         if result.get("error"):
             return json.dumps({"error": result["error"]})
@@ -1434,73 +1551,13 @@ async def run_tool(name, inp):
             partner_id = po["partner_id"]
             po_lines = po.get("lines", [])
             line_pids = [l["product_id"] for l in po_lines if l.get("product_id")]
-            final_vendor_name = po.get("partner_name", "")
-            vendor_fix_note = None
 
-            # ── Robust vendor resolution ──────────────────────────────────
-            # 1. Verify suggested partner_id is a real supplier (supplier_rank > 0)
-            # 2. Cross-check with supplierinfo of ALL products in this PO
-            # 3. Pick the vendor that covers the MOST products (handles multi-vendor POs)
-            if line_pids:
-                # (a) Is the suggested partner actually a supplier?
-                is_valid_supplier = False
-                if partner_id:
-                    chk = await odoo_query("res.partner",
-                        [["id","=",partner_id]],
-                        ["id","name","supplier_rank"], limit=1, cookies=cookies)
-                    chk_data = json.loads(chk)
-                    if chk_data:
-                        final_vendor_name = chk_data[0].get("name", final_vendor_name)
-                        is_valid_supplier = (chk_data[0].get("supplier_rank", 0) or 0) > 0
-
-                # (b) Map products → templates
-                prod_r = await odoo_query("product.product",
-                    [["id","in",line_pids]],
-                    ["id","product_tmpl_id"], limit=500, cookies=cookies)
-                prod_rows = json.loads(prod_r)
-                tmpl_ids = list({p["product_tmpl_id"][0] for p in prod_rows
-                                 if p.get("product_tmpl_id")})
-
-                # (c) Query supplierinfo for ALL products in this PO
-                if tmpl_ids:
-                    sup_r = await odoo_query("product.supplierinfo",
-                        [["product_tmpl_id","in",tmpl_ids]],
-                        ["product_tmpl_id","partner_id"], limit=1000,
-                        order="sequence asc", cookies=cookies)
-                    sup_rows = json.loads(sup_r)
-
-                    # Count unique templates each vendor supplies
-                    vendor_info = {}  # vid -> {name, tmpls: set()}
-                    for s in sup_rows if isinstance(sup_rows, list) else []:
-                        if not s.get("partner_id"): continue
-                        vid = s["partner_id"][0]
-                        vname = s["partner_id"][1]
-                        tid = s["product_tmpl_id"][0] if s.get("product_tmpl_id") else None
-                        if tid is None: continue
-                        if vid not in vendor_info:
-                            vendor_info[vid] = {"name": vname, "tmpls": set()}
-                        vendor_info[vid]["tmpls"].add(tid)
-
-                    if vendor_info:
-                        # Keep AI's choice ONLY if: valid supplier AND actually supplies these products
-                        keep_suggested = (is_valid_supplier
-                                          and partner_id in vendor_info
-                                          and len(vendor_info[partner_id]["tmpls"]) > 0)
-                        if not keep_suggested:
-                            # Pick vendor with greatest coverage
-                            best_vid = max(vendor_info.keys(),
-                                key=lambda v: len(vendor_info[v]["tmpls"]))
-                            best = vendor_info[best_vid]
-                            vendor_fix_note = (f"AI suggested '{final_vendor_name}' "
-                                f"(id={partner_id}, supplier_rank={'>0' if is_valid_supplier else '=0'}), "
-                                f"replaced with '{best['name']}' (id={best_vid}, "
-                                f"covers {len(best['tmpls'])}/{len(tmpl_ids)} products)")
-                            print(f"VENDOR FIX: {vendor_fix_note}")
-                            partner_id = best_vid
-                            final_vendor_name = best["name"]
-                        else:
-                            # Keeping AI's suggestion - but update name from DB for accuracy
-                            final_vendor_name = vendor_info[partner_id]["name"]
+            # Robust vendor resolution (handles AI passing wrong partner_id)
+            partner_id, final_vendor_name, vendor_fix_note = await resolve_po_vendor(
+                partner_id, line_pids, cookies=cookies
+            )
+            if not final_vendor_name:
+                final_vendor_name = po.get("partner_name", "")
 
             # Verify partner exists
             partner_check = await odoo_query(
