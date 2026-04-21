@@ -9,6 +9,7 @@ import calendar
 import uuid
 import re
 import asyncio
+import datetime
 from urllib.parse import urljoin, urlparse
 from typing import Optional
 
@@ -562,7 +563,9 @@ TOOLS = [
     }
 ]
 
-SYSTEM = """You are Chumart Assistant, an enterprise AI assistant connected to Odoo 17 ERP and our product knowledge base.
+def get_system_prompt():
+    today = datetime.date.today().strftime("%Y年%m月%d日")
+    return f"""今天是{today}。You are Chumart Assistant, an enterprise AI assistant connected to Odoo 17 ERP and our product knowledge base.
 You support both English and Chinese - reply in the same language the user uses.
 
 KNOWLEDGE BASE RULES (MOST IMPORTANT):
@@ -573,7 +576,7 @@ KNOWLEDGE BASE RULES (MOST IMPORTANT):
 
 FINANCIAL REPORT RULES:
 - Monthly tax -> get_monthly_tax
-- Quarterly tax -> get_quarterly_tax  
+- Quarterly tax -> get_quarterly_tax
 - Monthly sales / commission base -> get_monthly_sales
 - CA invoices missing tax -> get_missing_tax
 
@@ -753,7 +756,7 @@ async def chat(req: ChatRequest):
             r = await c.post("https://api.anthropic.com/v1/messages", headers=headers, json={
                 "model": "claude-sonnet-4-5",
                 "max_tokens": 4096,
-                "system": SYSTEM,
+                "system": get_system_prompt(),
                 "tools": TOOLS,
                 "messages": current_messages
             })
