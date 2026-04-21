@@ -1158,13 +1158,38 @@ def get_system_prompt(role: str = "guest", user_name: str = "", user_id: int = 0
     # Build permission-specific rules
     finance_rules = ""
     if perms["can_see_finance"]:
-        finance_rules = """
+        finance_rules = f"""
 FINANCIAL REPORT RULES (you have access):
 - Monthly tax -> get_monthly_tax
 - Quarterly tax -> get_quarterly_tax
 - Monthly sales / commission base -> get_monthly_sales
 - CA invoices missing tax -> get_missing_tax
-- Can query account.move, account.payment with full access"""
+- Can query account.move, account.payment with full access
+
+COMMISSION REPORT RULES (IMPORTANT — follow this exactly):
+When user mentions "commission", "提成", "销售提成", "佣金", or any combination like "X月commission", "commission统计":
+1. Extract year and month from the request (e.g. "26年3月" = 2026-03, "3月" = current year March)
+2. Call get_monthly_sales with the correct year and month
+3. Present results in TWO parts:
+
+PART A — Summary table (by salesperson):
+| 销售员 | 发票数 | 退款数 | 发票金额 | 退款金额 | 净销售额(税前) |
+Use the by_salesperson data from the tool result. Show ALL salespeople. Add a total row at the bottom.
+Use $ with commas for all amounts. Copy numbers directly from tool response — never recalculate.
+
+PART B — Commission base totals:
+Show commission_base values: net_sales_excl_tax, net_tax, net_sales_incl_tax, invoice_count, credit_note_count.
+
+PART C — Excel export button:
+Always end with this exact markdown link for Excel download:
+[📥 Export Excel](BACKEND_URL/export/commission?year=YYYY&month=MM)
+Replace BACKEND_URL with: {os.getenv('RAILWAY_PUBLIC_DOMAIN', 'https://chumart-ai.up.railway.app')}
+Replace YYYY and MM with the actual year and month numbers.
+
+Example: user says "3月commission" in 2026 → call get_monthly_sales(year=2026, month=3) → show table → show [📥 Export Excel](https://chumart-ai.up.railway.app/export/commission?year=2026&month=3)
+
+The Excel export follows the SALE COMMISSION NEW template with fields:
+Invoice Partner Display Name, Invoice/Bill Date, Number, Origin, Untaxed Amount Signed, Reference, Source, Payment Method, Tags, Salesperson, Payment Status"""
     else:
         finance_rules = """
 FINANCIAL RULES (NO ACCESS):
