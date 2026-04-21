@@ -1320,17 +1320,46 @@ async def run_tool(name, inp):
                 prod_to_tmpl[p["id"]] = p["product_tmpl_id"][0]
         tmpl_ids = list(set(prod_to_tmpl.values()))
 
-        # Step 2: Query supplierinfo by template ID (most reliable)
-        # Also query by product_id for variant-level overrides
+        # Step 2: Query supplierinfo — try both template and product level
         sup_rows = []
         if tmpl_ids:
+            # Query by template (most common in Odoo)
             r1 = await odoo_query(
                 "product.supplierinfo",
                 [["product_tmpl_id", "in", tmpl_ids]],
-                ["product_id", "product_tmpl_id", "partner_id", "price", "min_qty", "currency_id"],
+                ["product_id", "product_tmpl_id", "partner_id", "price", "min_qty", "currency_id", "company_id"],
                 limit=1000, order="sequence asc"
             )
             sup_rows = json.loads(r1)
+            if isinstance(sup_rows, dict) and "error" in sup_rows:
+                sup_rows = []
+        # If nothing found by template, try by product_id directly
+        if not sup_rows and product_ids:
+            r2 = await odoo_query(
+                "product.supplierinfo",
+                [["product_id", "in", product_ids]],
+                ["product_id", "product_tmpl_id", "partner_id", "price", "min_qty", "currency_id", "company_id"],
+                limit=1000, order="sequence asc"
+            )
+            sup_rows = json.loads(r2)
+            if isinstance(sup_rows, dict) and "error" in sup_rows:
+                sup_rows = []
+        # If still nothing, try without any product filter (get ALL supplierinfo and match manually)
+        if not sup_rows and tmpl_ids:
+            # Broader search: get all supplierinfo records
+            all_r = await odoo_query(
+                "product.supplierinfo",
+                [],
+                ["product_id", "product_tmpl_id", "partner_id", "price"],
+                limit=5000, order="sequence asc"
+            )
+            all_sup = json.loads(all_r)
+            if isinstance(all_sup, list):
+                tmpl_set = set(tmpl_ids)
+                pid_set = set(product_ids)
+                sup_rows = [r for r in all_sup
+                    if (r.get("product_tmpl_id") and r["product_tmpl_id"][0] in tmpl_set)
+                    or (r.get("product_id") and r["product_id"][0] in pid_set)]
 
         # Step 3: Group vendors by product_id
         # For template-level records, assign to all products with that template
