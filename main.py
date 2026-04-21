@@ -2112,6 +2112,51 @@ async def chat(req: ChatRequest, background_tasks: BackgroundTasks):
     return {"reply": reply}
 
 # ─────────────────────────────────────────────
+# Debug endpoints (test tool outputs directly)
+# ─────────────────────────────────────────────
+
+@app.get("/debug/search-sku/{sku}")
+async def debug_search_sku(sku: str):
+    """Test: search a single SKU and see raw result."""
+    r = await odoo_query(
+        "product.product",
+        [["default_code", "ilike", sku], ["active", "=", True]],
+        ["id", "name", "default_code", "list_price", "uom_id", "product_tmpl_id"],
+        limit=5
+    )
+    return {"sku": sku, "results": json.loads(r)}
+
+@app.get("/debug/vendor/{product_id}")
+async def debug_vendor(product_id: int):
+    """Test: get vendors for a product_id."""
+    # Get template
+    prod_r = await odoo_query("product.product", [["id","=",product_id]], ["id","product_tmpl_id","name"], limit=1)
+    prod = json.loads(prod_r)
+    if not prod:
+        return {"error": "product not found", "product_id": product_id}
+    tmpl_id = prod[0]["product_tmpl_id"][0] if prod[0].get("product_tmpl_id") else None
+
+    # Query supplierinfo by template
+    sup1 = await odoo_query("product.supplierinfo",
+        [["product_tmpl_id","=",tmpl_id]] if tmpl_id else [["product_id","=",product_id]],
+        ["product_id","product_tmpl_id","partner_id","price","min_qty","company_id"],
+        limit=20
+    )
+    # Also try by product_id
+    sup2 = await odoo_query("product.supplierinfo",
+        [["product_id","=",product_id]],
+        ["product_id","product_tmpl_id","partner_id","price","min_qty","company_id"],
+        limit=20
+    )
+    return {
+        "product_id": product_id,
+        "product_name": prod[0]["name"],
+        "product_tmpl_id": tmpl_id,
+        "supplierinfo_by_template": json.loads(sup1),
+        "supplierinfo_by_product": json.loads(sup2),
+    }
+
+# ─────────────────────────────────────────────
 # Session & Memory API
 # ─────────────────────────────────────────────
 
