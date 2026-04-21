@@ -102,73 +102,41 @@ async def startup():
 # Embedding
 # ─────────────────────────────────────────────
 
-async def get_embedding(text: str) -> Optional[list]:
-    """Call Anthropic-compatible embedding — uses voyage-3 via Anthropic."""
-    try:
-        async with httpx.AsyncClient(timeout=30) as c:
-            r = await c.post(
-                "https://api.anthropic.com/v1/messages",
-                headers={
-                    "x-api-key": ANTHROPIC_KEY,
-                    "anthropic-version": "2023-06-01",
-                    "content-type": "application/json"
-                },
-                json={
-                    "model": "claude-haiku-4-5-20251001",
-                    "max_tokens": 20,
-                    "messages": [{"role": "user", "content": f"embedding_request: {text[:500]}"}],
-                    "system": "Reply only with: OK"
-                }
-            )
-        # Anthropic doesn't have a direct embedding endpoint yet in this setup,
-        # so we use OpenAI-compatible via a simple hash-based fallback
-        # In production replace with actual embedding API
-        return await _real_embedding(text)
-    except Exception as e:
-        print(f"Embedding error: {e}")
-        return None
+# ─────────────────────────────────────────────
+# Embedding
+# ─────────────────────────────────────────────
 
-async def _real_embedding(text: str) -> Optional[list]:
-    """Use OpenAI embeddings (text-embedding-3-small = 1536 dims, cheap)."""
+async def get_embedding(text: str) -> Optional[list]:
+    """Get text embedding via OpenAI text-embedding-3-small (1536 dims)."""
     openai_key = os.getenv("OPENAI_API_KEY", "")
     if not openai_key:
-        # Fallback: use Voyage via direct HTTP if no OpenAI key
-        return await _voyage_embedding(text)
+        print("ERROR: OPENAI_API_KEY not set — cannot generate embeddings")
+        return None
     try:
         async with httpx.AsyncClient(timeout=20) as c:
             r = await c.post(
                 "https://api.openai.com/v1/embeddings",
-                headers={"Authorization": f"Bearer {openai_key}", "content-type": "application/json"},
-                json={"model": "text-embedding-3-small", "input": text[:8000]}
+                headers={
+                    "Authorization": f"Bearer {openai_key}",
+                    "Content-Type": "application/json"
+                },
+                json={
+                    "model": "text-embedding-3-small",
+                    "input": text[:8000]
+                }
             )
             data = r.json()
+            if "error" in data:
+                print(f"OpenAI embedding API error: {data['error'].get('message', data['error'])}")
+                return None
+            if "data" not in data or not data["data"]:
+                print(f"OpenAI embedding unexpected response: {data}")
+                return None
             return data["data"][0]["embedding"]
     except Exception as e:
-        print(f"OpenAI embedding error: {e}")
+        print(f"OpenAI embedding exception: {e}")
         return None
 
-async def _voyage_embedding(text: str) -> Optional[list]:
-    """Voyage AI embeddings (Anthropic-recommended, voyage-3-lite = 512 dims)."""
-    voyage_key = os.getenv("VOYAGE_API_KEY", "")
-    if not voyage_key:
-        print("No embedding API key found (OPENAI_API_KEY or VOYAGE_API_KEY)")
-        return None
-    try:
-        async with httpx.AsyncClient(timeout=20) as c:
-            r = await c.post(
-                "https://api.voyageai.com/v1/embeddings",
-                headers={"Authorization": f"Bearer {voyage_key}", "content-type": "application/json"},
-                json={"model": "voyage-3-lite", "input": [text[:8000]]}
-            )
-            data = r.json()
-            emb = data["data"][0]["embedding"]
-            # Pad to 1536 if needed
-            if len(emb) < 1536:
-                emb = emb + [0.0] * (1536 - len(emb))
-            return emb
-    except Exception as e:
-        print(f"Voyage embedding error: {e}")
-        return None
 
 # ─────────────────────────────────────────────
 # Web crawler
@@ -414,7 +382,10 @@ async def fetch_moves(move_type, date_from, date_to):
         [["move_type","=",move_type],["state","=","posted"],
          ["invoice_date",">=",date_from],["invoice_date","<=",date_to],
          ["company_id","=",1],["payment_state","in",VALID_STATES]],
-        ["name","partner_id","invoice_date","amount_untaxed","amount_tax","amount_total","payment_state"],
+        ["name", "invoice_partner_display_name", "partner_id", "invoice_user_id",
+         "invoice_date", "invoice_origin", "amount_untaxed", "amount_untaxed_signed",
+         "amount_tax", "amount_total", "payment_state",
+         "ref", "source_id", "x_payment_method", "tag_ids"],
         limit=2000
     )
     records = json.loads(result)
@@ -487,21 +458,93 @@ async def monthly_sales(year: int, month: int):
     invoices, err1 = await fetch_moves("out_invoice", date_from, date_to)
     credits,  err2 = await fetch_moves("out_refund",  date_from, date_to)
     if err1 or err2: return {"error": err1 or err2}
-    inv = summarize_moves(invoices); crd = summarize_moves(credits)
-    return {"period":f"{year}-{month:02d}","report_type":"Monthly Sales Report (Commission Base)",
-            "note":"Includes paid, in_payment, reversed only",
-            "invoices":{**inv,"detail":[{"name":r["name"],"customer":r["partner_id"][1] if r.get("partner_id") else "N/A",
-                "date":r.get("invoice_date",""),"amount_untaxed":r.get("amount_untaxed",0),
-                "amount_tax":r.get("amount_tax",0),"amount_total":r.get("amount_total",0),
-                "payment_state":r.get("payment_state","")} for r in sorted(invoices,key=lambda x:x.get("name",""))]},
-            "credit_notes":{**crd,"detail":[{"name":r["name"],"customer":r["partner_id"][1] if r.get("partner_id") else "N/A",
-                "date":r.get("invoice_date",""),"amount_untaxed":r.get("amount_untaxed",0),
-                "amount_tax":r.get("amount_tax",0),"amount_total":r.get("amount_total",0),
-                "payment_state":r.get("payment_state","")} for r in sorted(credits,key=lambda x:x.get("name",""))]},
-            "commission_base":{"net_sales_excl_tax":round(inv["total_untaxed"]-crd["total_untaxed"],2),
-                "net_sales_incl_tax":round(inv["total_amount"]-crd["total_amount"],2),
-                "net_tax":round(inv["total_tax"]-crd["total_tax"],2),
-                "invoice_count":inv["count"],"credit_note_count":crd["count"]}}
+
+    def get_salesperson(r):
+        user = r.get("invoice_user_id")
+        if user and isinstance(user, (list, tuple)) and len(user) > 1:
+            return user[1]
+        return "Unassigned"
+
+    def format_row(r):
+        """Format one invoice/credit note row matching Odoo SALE COMMISSION NEW template."""
+        source = r.get("source_id")
+        tags   = r.get("tag_ids", [])
+        return {
+            "Invoice Partner Display Name": r.get("invoice_partner_display_name") or (r["partner_id"][1] if r.get("partner_id") else ""),
+            "Invoice/Bill Date":            r.get("invoice_date", ""),
+            "Number":                       r.get("name", ""),
+            "Origin":                       r.get("invoice_origin", ""),
+            "Untaxed Amount Signed":        r.get("amount_untaxed_signed", r.get("amount_untaxed", 0)),
+            "Reference":                    r.get("ref", ""),
+            "Source":                       source[1] if source and isinstance(source, (list,tuple)) and len(source)>1 else "",
+            "Payment Method":               r.get("x_payment_method", ""),
+            "Tags":                         ", ".join(str(t) for t in tags) if tags else "",
+            "Salesperson":                  get_salesperson(r),
+            "Payment Status":               r.get("payment_state", ""),
+        }
+
+    # Group by salesperson for summary
+    def group_by_salesperson(records):
+        by_person = {}
+        for r in records:
+            name = get_salesperson(r)
+            if name not in by_person:
+                by_person[name] = {"salesperson": name, "count": 0,
+                                   "amount_untaxed": 0, "amount_tax": 0, "amount_total": 0}
+            by_person[name]["count"]          += 1
+            by_person[name]["amount_untaxed"] += r.get("amount_untaxed", 0)
+            by_person[name]["amount_tax"]     += r.get("amount_tax", 0)
+            by_person[name]["amount_total"]   += r.get("amount_total", 0)
+        for p in by_person.values():
+            p["amount_untaxed"] = round(p["amount_untaxed"], 2)
+            p["amount_tax"]     = round(p["amount_tax"], 2)
+            p["amount_total"]   = round(p["amount_total"], 2)
+        return sorted(by_person.values(), key=lambda x: x["amount_untaxed"], reverse=True)
+
+    inv_by_person = group_by_salesperson(invoices)
+    crd_by_person = group_by_salesperson(credits)
+
+    inv_dict = {p["salesperson"]: p for p in inv_by_person}
+    crd_dict = {p["salesperson"]: p for p in crd_by_person}
+    all_names = sorted(set(inv_dict) | set(crd_dict))
+    net_by_person = []
+    for name in all_names:
+        inv_p = inv_dict.get(name, {"count":0,"amount_untaxed":0,"amount_tax":0,"amount_total":0})
+        crd_p = crd_dict.get(name, {"count":0,"amount_untaxed":0,"amount_tax":0,"amount_total":0})
+        net_by_person.append({
+            "salesperson":        name,
+            "invoice_count":      inv_p["count"],
+            "credit_note_count":  crd_p["count"],
+            "net_amount_untaxed": round(inv_p["amount_untaxed"] - crd_p["amount_untaxed"], 2),
+            "net_amount_tax":     round(inv_p["amount_tax"]     - crd_p["amount_tax"],     2),
+            "net_amount_total":   round(inv_p["amount_total"]   - crd_p["amount_total"],   2),
+        })
+    net_by_person.sort(key=lambda x: x["net_amount_untaxed"], reverse=True)
+
+    inv_total = summarize_moves(invoices)
+    crd_total = summarize_moves(credits)
+
+    # All rows formatted per Odoo template (invoices + credit notes combined, sorted by salesperson then date)
+    all_rows = (
+        [format_row(r) for r in invoices] +
+        [format_row(r) for r in credits]
+    )
+    all_rows.sort(key=lambda x: (x["Salesperson"], x["Invoice/Bill Date"]))
+
+    return {
+        "period":      f"{year}-{month:02d}",
+        "report_type": "Monthly Sales Report (Commission Base)",
+        "note":        "Includes paid, in_payment, reversed. Format matches Odoo SALE COMMISSION NEW template.",
+        "by_salesperson": net_by_person,
+        "commission_base": {
+            "net_sales_excl_tax": round(inv_total["total_untaxed"] - crd_total["total_untaxed"], 2),
+            "net_sales_incl_tax": round(inv_total["total_amount"]  - crd_total["total_amount"],  2),
+            "net_tax":            round(inv_total["total_tax"]     - crd_total["total_tax"],     2),
+            "invoice_count":      inv_total["count"],
+            "credit_note_count":  crd_total["count"],
+        },
+        "detail_rows": all_rows,
+    }
 
 @app.get("/report/missing-tax")
 async def missing_tax(year: int, month: int):
@@ -548,7 +591,7 @@ TOOLS = [
     },
     {
         "name": "get_monthly_sales",
-        "description": "Get monthly sales report for commission calculation.",
+        "description": "Get monthly sales report grouped by salesperson for commission calculation. Returns each salesperson's invoice count, credit note count, and net sales amount. Always use for sales/commission queries.",
         "input_schema": {"type":"object","properties":{"year":{"type":"integer"},"month":{"type":"integer"}},"required":["year","month"]}
     },
     {
@@ -587,7 +630,9 @@ ODOO RULES:
 - For stock queries always add ["location_id.usage","=","internal"]
 
 When showing financial data: use $ with commas, be precise.
-When helping sales: be specific, cite model numbers, give concrete talking points."""
+When helping sales: be specific, cite model numbers, give concrete talking points.
+When showing sales reports or any tabular data: ALWAYS format as markdown tables using | col | col | syntax.
+After showing a summary table, tell the user they can click the green Export Excel button to download it."""
 
 async def run_tool(name, inp):
     if name == "odoo_search":
