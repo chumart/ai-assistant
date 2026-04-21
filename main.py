@@ -1548,9 +1548,12 @@ async def upload_doc(
     file: UploadFile = File(...),
     category: str = "general",
     description: str = "",
-    admin_key: str = ""
+    admin_key: str = "",
+    key: str = ""  # alternate param name
 ):
-    if admin_key != os.getenv("ADMIN_KEY", "chumart2024"):
+    # Accept admin_key from query param, form, or 'key' param
+    effective_key = admin_key or key
+    if effective_key != os.getenv("ADMIN_KEY", "chumart2024"):
         return {"error": "Invalid admin key"}
     if not R2_ACCOUNT_ID or not R2_ACCESS_KEY:
         return {"error": "R2 not configured. Add R2_ACCOUNT_ID, R2_ACCESS_KEY, R2_SECRET_KEY, R2_BUCKET, R2_PUBLIC_URL to Railway variables."}
