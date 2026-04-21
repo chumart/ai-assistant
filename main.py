@@ -394,12 +394,12 @@ async def fetch_moves(move_type, date_from, date_to):
     return records, None
 
 async def fetch_credits(date_from, date_to):
-    """Fetch credit notes WITHOUT payment_state filter — all posted refunds count."""
+    """Fetch credit notes with same payment_state filter as invoices (Commission Deduct logic)."""
     result = await odoo_query(
         "account.move",
         [["move_type","=","out_refund"],["state","=","posted"],
          ["invoice_date",">=",date_from],["invoice_date","<=",date_to],
-         ["company_id","=",1]],
+         ["company_id","=",1],["payment_state","in",VALID_STATES]],
         ["name", "invoice_partner_display_name", "partner_id", "invoice_user_id",
          "invoice_date", "invoice_origin", "amount_untaxed", "amount_untaxed_signed",
          "amount_tax", "amount_total", "payment_state",
