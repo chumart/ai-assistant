@@ -604,14 +604,15 @@ async def odoo_call_method(model: str, record_id: int, method: str) -> dict:
 # Odoo helpers (unchanged)
 # ─────────────────────────────────────────────
 
-async def odoo_query(model, domain, fields, limit=2000, order="id desc"):
+async def odoo_query(model, domain, fields, limit=2000, order="id desc", cookies=None):
     try:
         async with httpx.AsyncClient(timeout=20, follow_redirects=True) as c:
-            login_r = await c.post(f"{ODOO_URL}/web/session/authenticate", json={
-                "jsonrpc": "2.0", "method": "call", "id": 1,
-                "params": {"db": ODOO_DB, "login": ODOO_USERNAME, "password": ODOO_PASSWORD}
-            })
-            cookies = login_r.cookies
+            if not cookies:
+                login_r = await c.post(f"{ODOO_URL}/web/session/authenticate", json={
+                    "jsonrpc": "2.0", "method": "call", "id": 1,
+                    "params": {"db": ODOO_DB, "login": ODOO_USERNAME, "password": ODOO_PASSWORD}
+                })
+                cookies = dict(login_r.cookies)
             r = await c.post(f"{ODOO_URL}/web/dataset/call_kw", json={
                 "jsonrpc": "2.0", "method": "call", "id": 2,
                 "params": {
@@ -1156,6 +1157,7 @@ Follow these steps in order:
 
 STEP 1 — Search all products at once:
   Call odoo_search_products_by_sku with all SKUs in one call.
+  IMPORTANT: Always use the product_id returned from odoo_search_products_by_sku — never use product_tmpl_id or any other ID.
   If any SKU not found, tell user immediately and ask how to proceed.
 
 STEP 2 — Get all vendors:
@@ -1391,7 +1393,7 @@ async def run_tool(name, inp):
         if all_product_ids:
             prod_r = await odoo_query("product.product",
                 [["id","in",all_product_ids]],
-                ["id","name","uom_po_id","uom_id"], limit=500)
+                ["id","name","uom_po_id","uom_id"], limit=500, cookies=cookies)
             for p in json.loads(prod_r):
                 uom = p.get("uom_po_id") or p.get("uom_id")
                 prod_info[p["id"]] = {
@@ -1402,10 +1404,10 @@ async def run_tool(name, inp):
         for po in orders:
             partner_id = po["partner_id"]
 
-            # Verify partner
+            # Verify partner (reuse shared session)
             partner_check = await odoo_query(
                 "res.partner", [["id","=",partner_id]],
-                ["id","name"], limit=1)
+                ["id","name"], limit=1, cookies=cookies)
             partner_data = json.loads(partner_check)
             if not partner_data:
                 errors.append({"vendor": po.get("partner_name"),
@@ -1424,7 +1426,7 @@ async def run_tool(name, inp):
             po_id = po_result["id"]
 
             # Fetch the actual PO name from Odoo
-            po_name_r = await odoo_query("purchase.order", [["id","=",po_id]], ["name"], limit=1)
+            po_name_r = await odoo_query("purchase.order", [["id","=",po_id]], ["name"], limit=1, cookies=cookies)
             po_name_data = json.loads(po_name_r)
             po_name = po_name_data[0]["name"] if po_name_data else f"ID:{po_id}"
 
@@ -1433,6 +1435,33 @@ async def run_tool(name, inp):
             lines_created = 0
             for line in po.get("lines", []):
                 pid = line["product_id"]
+
+                # Validate: if pid not in prod_info, it might be a template ID — find real product ID
+                if pid not in prod_info:
+                    # Try as product.product directly
+                    chk = await odoo_query("product.product", [["id","=",pid]], ["id","name"], limit=1, cookies=cookies)
+                    chk_data = json.loads(chk)
+                    if not chk_data:
+                        # Try as product.template ID — get first variant
+                        tmpl_chk = await odoo_query("product.product",
+                            [["product_tmpl_id","=",pid],["active","=",True]],
+                            ["id","name","uom_po_id","uom_id"], limit=1, cookies=cookies)
+                        tmpl_data = json.loads(tmpl_chk)
+                        if tmpl_data:
+                            real_pid = tmpl_data[0]["id"]
+                            uom = tmpl_data[0].get("uom_po_id") or tmpl_data[0].get("uom_id")
+                            prod_info[real_pid] = {
+                                "name": tmpl_data[0]["name"],
+                                "uom_id": uom[0] if uom else None
+                            }
+                            pid = real_pid
+                        else:
+                            line_errors.append(f"{line.get('product_name','SKU?')}: product ID {line['product_id']} not found")
+                            continue
+                    else:
+                        p = chk_data[0]
+                        prod_info[pid] = {"name": p["name"], "uom_id": None}
+
                 pinfo = prod_info.get(pid, {})
                 prod_name = line.get("product_name") or pinfo.get("name", "")
                 uom_id = pinfo.get("uom_id")
