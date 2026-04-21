@@ -1173,7 +1173,9 @@ STEP 3 — Show grouped PO plan:
 
 STEP 4 — Execute only after confirmation:
   Call odoo_create_bulk_po with the full plan.
-  Report results: PO numbers + Odoo links for each created PO.
+  IMPORTANT: partner_id in purchase_orders must be the res.partner ID from vendor info (from odoo_get_product_vendors vendor_id field), NOT a user ID or product ID.
+  Report results: PO names (e.g. P00442) + Odoo links for each created PO.
+  If any line_errors exist, tell user which products failed and why.
 
 SCOPE OF KNOWLEDGE (answer freely):
 - Our own products: Chumart, Polarman, Flamaster, ChefAsst — specs, pricing, installation, maintenance
@@ -1364,40 +1366,91 @@ async def run_tool(name, inp):
         orders = inp.get("purchase_orders", [])
         created = []
         errors = []
+        import datetime
+        date_planned = (datetime.datetime.now() + datetime.timedelta(days=7)).strftime("%Y-%m-%d %H:%M:%S")
+
         for po in orders:
+            partner_id = po["partner_id"]
+
+            # Verify partner_id is a valid res.partner (supplier)
+            partner_check = await odoo_query(
+                "res.partner", [["id","=",partner_id]],
+                ["id","name","supplier_rank"], limit=1)
+            partner_data = json.loads(partner_check)
+            if not partner_data:
+                errors.append({"vendor": po.get("partner_name"),
+                               "error": f"Partner ID {partner_id} not found in Odoo. Use vendor_id from odoo_get_product_vendors."})
+                continue
+
             # Create PO header
             po_result = await odoo_create("purchase.order", {
-                "partner_id": po["partner_id"],
-                "company_id": 1
+                "partner_id": partner_id,
+                "company_id": 1,
+                "date_order": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             })
             if po_result.get("error"):
                 errors.append({"vendor": po.get("partner_name"), "error": po_result["error"]})
                 continue
             po_id = po_result["id"]
-            # Add lines
+
+            # Fetch the actual PO name from Odoo
+            po_name_r = await odoo_query("purchase.order", [["id","=",po_id]], ["name"], limit=1)
+            po_name_data = json.loads(po_name_r)
+            po_name = po_name_data[0]["name"] if po_name_data else f"ID:{po_id}"
+
+            # Add lines with all required fields
             line_errors = []
+            lines_created = 0
             for line in po.get("lines", []):
+                # Get product details including UOM, name, standard price
+                prod_r = await odoo_query("product.product",
+                    [["id","=",line["product_id"]]],
+                    ["uom_po_id","uom_id","name","description_pickingin"], limit=1)
+                prod_data = json.loads(prod_r)
+                uom_id = None
+                prod_name = line.get("product_name", "")
+                if prod_data:
+                    p = prod_data[0]
+                    uom_id = (p.get("uom_po_id") or p.get("uom_id") or [None, None])[0]
+                    if not prod_name:
+                        prod_name = p.get("name", "")
+
+                price = line.get("price_unit", 0)
+
                 line_vals = {
                     "order_id": po_id,
                     "product_id": line["product_id"],
                     "product_qty": line["quantity"],
-                    "price_unit": line.get("price_unit", 0),
-                    "name": line.get("product_name", ""),
+                    "price_unit": price,
+                    "name": prod_name,
+                    "date_planned": date_planned,
                 }
+                if uom_id:
+                    line_vals["product_uom"] = uom_id
+
                 line_result = await odoo_create("purchase.order.line", line_vals)
                 if line_result.get("error"):
-                    line_errors.append(line.get("product_name", str(line["product_id"])))
+                    # Retry without product_uom if that was the issue
+                    line_vals.pop("product_uom", None)
+                    line_result = await odoo_create("purchase.order.line", line_vals)
+                    if line_result.get("error"):
+                        line_errors.append(f"{prod_name}: {line_result['error']}")
+                        continue
+                lines_created += 1
+
             created.append({
                 "po_id": po_id,
+                "po_name": po_name,
                 "vendor": po.get("partner_name"),
-                "line_count": len(po.get("lines", [])),
+                "lines_requested": len(po.get("lines", [])),
+                "lines_created": lines_created,
                 "line_errors": line_errors,
-                "odoo_link": f"{ODOO_URL}/web#model=purchase.order&id={po_id}"
+                "odoo_link": f"{ODOO_URL}/web#model=purchase.order&id={po_id}&view_type=form"
             })
         return json.dumps({
             "created": created,
             "errors": errors,
-            "summary": f"Created {len(created)} PO(s), {len(errors)} failed"
+            "summary": f"Created {len(created)} PO(s) with {sum(p['lines_created'] for p in created)} lines total. {len(errors)} PO(s) failed."
         }, ensure_ascii=False)
 
     if name == "search_documents":
