@@ -393,6 +393,24 @@ async def fetch_moves(move_type, date_from, date_to):
         return [], records["error"]
     return records, None
 
+async def fetch_credits(date_from, date_to):
+    """Fetch credit notes WITHOUT payment_state filter — all posted refunds count."""
+    result = await odoo_query(
+        "account.move",
+        [["move_type","=","out_refund"],["state","=","posted"],
+         ["invoice_date",">=",date_from],["invoice_date","<=",date_to],
+         ["company_id","=",1]],
+        ["name", "invoice_partner_display_name", "partner_id", "invoice_user_id",
+         "invoice_date", "invoice_origin", "amount_untaxed", "amount_untaxed_signed",
+         "amount_tax", "amount_total", "payment_state",
+         "ref", "source_id", "x_payment_method", "tag_ids"],
+        limit=2000
+    )
+    records = json.loads(result)
+    if isinstance(records, dict) and "error" in records:
+        return [], records["error"]
+    return records, None
+
 def summarize_moves(records):
     by_state = {"paid":0,"in_payment":0,"reversed":0}
     total_untaxed = total_tax = total_amount = 0
@@ -411,7 +429,7 @@ async def monthly_tax(year: int, month: int):
     date_from = f"{year}-{month:02d}-01"
     date_to   = f"{year}-{month:02d}-{last_day}"
     invoices, err1 = await fetch_moves("out_invoice", date_from, date_to)
-    credits,  err2 = await fetch_moves("out_refund",  date_from, date_to)
+    credits,  err2 = await fetch_credits(date_from, date_to)
     if err1 or err2: return {"error": err1 or err2}
     inv = summarize_moves(invoices)
     crd = summarize_moves(credits)
@@ -430,7 +448,7 @@ async def quarterly_tax(year: int, quarter: int):
     date_from   = f"{year}-{start_month:02d}-01"
     date_to     = f"{year}-{end_month:02d}-{last_day}"
     invoices, err1 = await fetch_moves("out_invoice", date_from, date_to)
-    credits,  err2 = await fetch_moves("out_refund",  date_from, date_to)
+    credits,  err2 = await fetch_credits(date_from, date_to)
     if err1 or err2: return {"error": err1 or err2}
     inv = summarize_moves(invoices)
     crd = summarize_moves(credits)
@@ -438,7 +456,7 @@ async def quarterly_tax(year: int, quarter: int):
     for m in range(start_month, end_month+1):
         ld = calendar.monthrange(year,m)[1]
         inv_m,_ = await fetch_moves("out_invoice",f"{year}-{m:02d}-01",f"{year}-{m:02d}-{ld}")
-        crd_m,_ = await fetch_moves("out_refund", f"{year}-{m:02d}-01",f"{year}-{m:02d}-{ld}")
+        crd_m,_ = await fetch_credits(f"{year}-{m:02d}-01",f"{year}-{m:02d}-{ld}")
         inv_s = summarize_moves(inv_m); crd_s = summarize_moves(crd_m)
         monthly.append({"month":f"{year}-{m:02d}","invoice_tax":inv_s["total_tax"],
                         "credit_note_tax":crd_s["total_tax"],"net_tax":round(inv_s["total_tax"]-crd_s["total_tax"],2),
@@ -456,7 +474,7 @@ async def monthly_sales(year: int, month: int):
     date_from = f"{year}-{month:02d}-01"
     date_to   = f"{year}-{month:02d}-{last_day}"
     invoices, err1 = await fetch_moves("out_invoice", date_from, date_to)
-    credits,  err2 = await fetch_moves("out_refund",  date_from, date_to)
+    credits,  err2 = await fetch_credits(date_from, date_to)
     if err1 or err2: return {"error": err1 or err2}
 
     def get_salesperson(r):
