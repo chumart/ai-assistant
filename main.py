@@ -417,9 +417,14 @@ def summarize_moves(records):
     for r in records:
         state = r.get("payment_state","")
         if state in by_state: by_state[state] += 1
-        total_untaxed += r.get("amount_untaxed",0)
-        total_tax     += r.get("amount_tax",0)
-        total_amount  += r.get("amount_total",0)
+        # Use amount_untaxed_signed so credit notes count as negative automatically
+        untaxed_signed = r.get("amount_untaxed_signed")
+        if untaxed_signed is not None:
+            total_untaxed += untaxed_signed
+        else:
+            total_untaxed += r.get("amount_untaxed", 0)
+        total_tax    += r.get("amount_tax", 0)
+        total_amount += r.get("amount_total", 0)
     return {"count":len(records),"by_payment_state":by_state,
             "total_untaxed":round(total_untaxed,2),"total_tax":round(total_tax,2),"total_amount":round(total_amount,2)}
 
@@ -509,8 +514,9 @@ async def monthly_sales(year: int, month: int):
             if name not in by_person:
                 by_person[name] = {"salesperson": name, "count": 0,
                                    "amount_untaxed": 0, "amount_tax": 0, "amount_total": 0}
-            by_person[name]["count"]          += 1
-            by_person[name]["amount_untaxed"] += r.get("amount_untaxed", 0)
+            by_person[name]["count"] += 1
+            untaxed_signed = r.get("amount_untaxed_signed")
+            by_person[name]["amount_untaxed"] += untaxed_signed if untaxed_signed is not None else r.get("amount_untaxed", 0)
             by_person[name]["amount_tax"]     += r.get("amount_tax", 0)
             by_person[name]["amount_total"]   += r.get("amount_total", 0)
         for p in by_person.values():
@@ -529,13 +535,16 @@ async def monthly_sales(year: int, month: int):
     for name in all_names:
         inv_p = inv_dict.get(name, {"count":0,"amount_untaxed":0,"amount_tax":0,"amount_total":0})
         crd_p = crd_dict.get(name, {"count":0,"amount_untaxed":0,"amount_tax":0,"amount_total":0})
+        # amount_untaxed is already signed (negative for credits), so just add
         net_by_person.append({
             "salesperson":        name,
             "invoice_count":      inv_p["count"],
             "credit_note_count":  crd_p["count"],
-            "net_amount_untaxed": round(inv_p["amount_untaxed"] - crd_p["amount_untaxed"], 2),
-            "net_amount_tax":     round(inv_p["amount_tax"]     - crd_p["amount_tax"],     2),
-            "net_amount_total":   round(inv_p["amount_total"]   - crd_p["amount_total"],   2),
+            "invoice_amount":     inv_p["amount_untaxed"],
+            "credit_amount":      round(-abs(crd_p["amount_untaxed"]), 2),
+            "net_amount_untaxed": round(inv_p["amount_untaxed"] + crd_p["amount_untaxed"], 2),
+            "net_amount_tax":     round(inv_p["amount_tax"]     + crd_p["amount_tax"],     2),
+            "net_amount_total":   round(inv_p["amount_total"]   + crd_p["amount_total"],   2),
         })
     net_by_person.sort(key=lambda x: x["net_amount_untaxed"], reverse=True)
 
@@ -555,9 +564,9 @@ async def monthly_sales(year: int, month: int):
         "note":        "Includes paid, in_payment, reversed. Format matches Odoo SALE COMMISSION NEW template.",
         "by_salesperson": net_by_person,
         "commission_base": {
-            "net_sales_excl_tax": round(inv_total["total_untaxed"] - crd_total["total_untaxed"], 2),
-            "net_sales_incl_tax": round(inv_total["total_amount"]  - crd_total["total_amount"],  2),
-            "net_tax":            round(inv_total["total_tax"]     - crd_total["total_tax"],     2),
+            "net_sales_excl_tax": round(inv_total["total_untaxed"] + crd_total["total_untaxed"], 2),
+            "net_sales_incl_tax": round(inv_total["total_amount"]  + crd_total["total_amount"],  2),
+            "net_tax":            round(inv_total["total_tax"]     + crd_total["total_tax"],     2),
             "invoice_count":      inv_total["count"],
             "credit_note_count":  crd_total["count"],
         },
