@@ -1458,53 +1458,32 @@ async def run_tool(name, inp):
                 validated_lines.append({"product_id": pid, "quantity": line["quantity"],
                                         "price_unit": line.get("price_unit", 0)})
 
-            # Batch create all lines using load() — mimics Excel import
+            # Create lines one by one with MINIMAL fields only
+            # Odoo server-side compute fills name, uom, date_planned automatically
+            # Fields: partner_id (header), order_line/product_id, order_line/product_qty
+            # First row has partner_id, subsequent rows leave it empty (Odoo groups them)
             if validated_lines:
-                try:
-                    async with httpx.AsyncClient(timeout=60, follow_redirects=True) as lc:
-                        fields = ["order_id", "product_id", "product_qty", "price_unit"]
-                        data_rows = [
-                            [str(po_id), str(l["product_id"]), str(l["quantity"]), str(l["price_unit"])]
-                            for l in validated_lines
-                        ]
-                        load_r = await lc.post(f"{ODOO_URL}/web/dataset/call_kw", json={
-                            "jsonrpc": "2.0", "method": "call", "id": 3,
-                            "params": {
-                                "model": "purchase.order.line",
-                                "method": "load",
-                                "args": [fields, data_rows],
-                                "kwargs": {}
-                            }
-                        }, cookies=cookies)
-                        load_data = load_r.json()
-                        result = load_data.get("result", {})
-                        if isinstance(result, dict):
-                            ids = result.get("ids", [])
-                            msgs = result.get("messages", [])
-                            lines_created = len(ids)
-                            for msg in msgs:
-                                if msg.get("type") == "error":
-                                    row_idx = msg.get("rows", {}).get("from", "?")
-                                    line_errors.append(f"Row {row_idx}: {msg.get('message','unknown error')}")
-                        elif load_data.get("error"):
-                            # Fallback: create one by one
-                            for l in validated_lines:
-                                pinfo = prod_info.get(l["product_id"], {})
-                                line_vals = {
-                                    "order_id": po_id,
-                                    "product_id": l["product_id"],
-                                    "product_qty": l["quantity"],
-                                    "price_unit": l["price_unit"],
-                                    "name": pinfo.get("name", ""),
-                                    "date_planned": date_planned,
-                                }
-                                lr = await odoo_create("purchase.order.line", line_vals, cookies=cookies)
-                                if lr.get("error"):
-                                    line_errors.append(f"Product {l['product_id']}: {lr['error']}")
-                                else:
-                                    lines_created += 1
-                except Exception as e:
-                    line_errors.append(f"Batch create error: {str(e)}")
+                for l in validated_lines:
+                    # Minimal fields only — Odoo fills name/uom/date_planned server-side
+                    line_vals = {
+                        "order_id": po_id,
+                        "product_id": l["product_id"],
+                        "product_qty": l["quantity"],
+                    }
+                    if l.get("price_unit"):
+                        line_vals["price_unit"] = l["price_unit"]
+
+                    lr = await odoo_create("purchase.order.line", line_vals, cookies=cookies)
+                    if lr.get("error"):
+                        # Retry with name + date_planned as fallback
+                        pinfo = prod_info.get(l["product_id"], {})
+                        line_vals["name"] = pinfo.get("name", "")
+                        line_vals["date_planned"] = date_planned
+                        lr = await odoo_create("purchase.order.line", line_vals, cookies=cookies)
+                        if lr.get("error"):
+                            line_errors.append(f"Product {l['product_id']}: {lr['error']}")
+                            continue
+                    lines_created += 1
 
             created.append({
                 "po_id": po_id,
@@ -1769,7 +1748,8 @@ async def extract_file(file: UploadFile = File(...)):
             b64 = base64.standard_b64encode(content).decode('utf-8')
             fid = str(uuid.uuid4())
             FILE_CACHE[fid] = {"b64": b64, "media_type": media_type, "name": file.filename}
-            return {"text": "", "name": file.filename, "file_id": fid}
+            preview = f"data:{media_type};base64,{b64[:200]}..."  # truncated for transport
+            return {"text": "", "name": file.filename, "file_id": fid, "is_image": True, "preview_url": f"data:{media_type};base64,{b64}"}
         return {"text": content.decode('utf-8', errors='ignore'), "name": file.filename}
     except Exception as e:
         return {"error": str(e)}
@@ -1960,19 +1940,32 @@ async def chat(req: ChatRequest, background_tasks: BackgroundTasks):
             continue
         allowed_tools.append(tool)
 
+    has_file = False
+    cached_file = None
     if req.file_id and req.file_id in FILE_CACHE:
-        cached = FILE_CACHE[req.file_id]
-        doc_type = "document" if cached["media_type"] == "application/pdf" else "image"
+        cached_file = FILE_CACHE[req.file_id]
+        has_file = True
+
+    if has_file and cached_file:
+        doc_type = "document" if cached_file["media_type"] == "application/pdf" else "image"
+        # Anthropic format (default)
         user_message_content = [
-            {"type": doc_type, "source": {"type": "base64", "media_type": cached["media_type"], "data": cached["b64"]}},
-            {"type": "text", "text": f"[Attached file: {cached['name']}]\n\nUser question: {req.message}"}
+            {"type": doc_type, "source": {"type": "base64", "media_type": cached_file["media_type"], "data": cached_file["b64"]}},
+            {"type": "text", "text": f"[Attached file: {cached_file['name']}]\n\nUser question: {req.message}"}
+        ]
+        # Prepare OpenAI format separately
+        openai_image_content = [
+            {"type": "image_url", "image_url": {"url": f"data:{cached_file['media_type']};base64,{cached_file['b64']}"}},
+            {"type": "text", "text": f"[Attached file: {cached_file['name']}]\n\nUser question: {req.message}"}
         ]
     elif req.file_content and req.file_name:
         user_message_content = (
             f"=== ATTACHED FILE: {req.file_name} ===\n{req.file_content}\n=== END OF FILE ===\n\nUser question: {req.message}"
         )
+        openai_image_content = None
     else:
         user_message_content = req.message
+        openai_image_content = None
 
     messages = req.history + [{"role": "user", "content": user_message_content}]
     headers = {"x-api-key": ANTHROPIC_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json"}
@@ -1994,7 +1987,12 @@ async def chat(req: ChatRequest, background_tasks: BackgroundTasks):
 
     # Route to OpenAI if selected
     if selected_model in OPENAI_MODELS:
-        reply = await chat_openai(messages, system_prompt, selected_model, allowed_tools)
+        # For OpenAI, swap image format if file attached
+        if has_file and openai_image_content:
+            oai_messages = req.history + [{"role": "user", "content": openai_image_content}]
+        else:
+            oai_messages = messages
+        reply = await chat_openai(oai_messages, system_prompt, selected_model, allowed_tools)
     else:
         # Anthropic path
         async with httpx.AsyncClient(timeout=300) as c:
