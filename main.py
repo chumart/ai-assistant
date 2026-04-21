@@ -24,6 +24,8 @@ class ChatRequest(BaseModel):
     history: list = []
     file_content: str = ""
     file_name: str = ""
+    file_b64: str = ""        # raw base64 for PDF/image direct passing
+    file_media_type: str = "" # e.g. "application/pdf" or "image/jpeg"
 
 # ---------- Odoo ----------
 
@@ -429,49 +431,36 @@ async def extract_file(file: UploadFile = File(...)):
     try:
         content = await file.read()
         filename = file.filename.lower()
+
+        # Plain text files — decode and return as-is
         if filename.endswith(('.txt', '.md', '.csv')):
             return {"text": content.decode('utf-8', errors='ignore'), "name": file.filename}
+
+        # PDF — return raw base64 so the chat endpoint passes it directly to Claude
         if filename.endswith('.pdf'):
-            media_type = "application/pdf"
-            doc_type = "document"
-        elif filename.endswith(('.png', '.jpg', '.jpeg', '.webp')):
+            b64 = base64.standard_b64encode(content).decode('utf-8')
+            return {
+                "text": "",
+                "name": file.filename,
+                "file_b64": b64,
+                "file_media_type": "application/pdf"
+            }
+
+        # Images — return raw base64
+        if filename.endswith(('.png', '.jpg', '.jpeg', '.webp')):
             ext = filename.split('.')[-1].replace('jpg', 'jpeg')
             media_type = f"image/{ext}"
-            doc_type = "image"
-        else:
-            return {"text": content.decode('utf-8', errors='ignore'), "name": file.filename}
-        b64 = base64.standard_b64encode(content).decode('utf-8')
+            b64 = base64.standard_b64encode(content).decode('utf-8')
+            return {
+                "text": "",
+                "name": file.filename,
+                "file_b64": b64,
+                "file_media_type": media_type
+            }
 
-        # Choose extraction prompt based on file type
-        if doc_type == "document":
-            extract_prompt = (
-                "This is a multi-page document. Extract ALL text content from EVERY page completely. "
-                "Include all product names, model numbers, specifications, dimensions, features, and descriptions. "
-                "Go through every single page from start to finish without skipping anything. "
-                "Return the raw text only, no commentary, no page labels."
-            )
-        else:
-            extract_prompt = "Extract and return ALL text content visible in this image. Return the raw text only, no commentary."
+        # Fallback
+        return {"text": content.decode('utf-8', errors='ignore'), "name": file.filename}
 
-        async with httpx.AsyncClient(timeout=120) as c:
-            r = await c.post("https://api.anthropic.com/v1/messages",
-                headers={"x-api-key": ANTHROPIC_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json"},
-                json={
-                    "model": "claude-sonnet-4-5",
-                    "max_tokens": 8000,
-                    "messages": [{
-                        "role": "user",
-                        "content": [
-                            {"type": doc_type, "source": {"type": "base64", "media_type": media_type, "data": b64}},
-                            {"type": "text", "text": extract_prompt}
-                        ]
-                    }]
-                })
-            data = r.json()
-            if data.get("error"):
-                return {"error": data["error"].get("message", str(data["error"])), "name": file.filename}
-            text = "".join(b.get("text", "") for b in data.get("content", []) if b.get("type") == "text")
-            return {"text": text, "name": file.filename}
     except Exception as e:
         return {"error": str(e)}
 
@@ -479,21 +468,43 @@ async def extract_file(file: UploadFile = File(...)):
 
 @app.post("/chat")
 async def chat(req: ChatRequest):
-    user_content = req.message
-    if req.file_content and req.file_name:
-        user_content = (
+    # Build the user message content
+    # Case 1: PDF or image attached — pass directly to Claude (no text extraction needed)
+    if req.file_b64 and req.file_media_type:
+        doc_type = "document" if req.file_media_type == "application/pdf" else "image"
+        user_message_content = [
+            {
+                "type": doc_type,
+                "source": {
+                    "type": "base64",
+                    "media_type": req.file_media_type,
+                    "data": req.file_b64
+                }
+            },
+            {
+                "type": "text",
+                "text": f"[Attached file: {req.file_name}]\n\nUser question: {req.message}"
+            }
+        ]
+    # Case 2: Plain text file content (txt/csv/md)
+    elif req.file_content and req.file_name:
+        user_message_content = (
             f"=== ATTACHED FILE: {req.file_name} ===\n"
             f"{req.file_content}\n"
             f"=== END OF FILE ===\n\n"
             f"User question: {req.message}"
         )
-    messages = req.history + [{"role": "user", "content": user_content}]
+    # Case 3: Normal text message
+    else:
+        user_message_content = req.message
+
+    messages = req.history + [{"role": "user", "content": user_message_content}]
     headers = {
         "x-api-key": ANTHROPIC_KEY,
         "anthropic-version": "2023-06-01",
         "content-type": "application/json"
     }
-    async with httpx.AsyncClient(timeout=90) as c:
+    async with httpx.AsyncClient(timeout=120) as c:
         current_messages = list(messages)
         for _ in range(5):
             r = await c.post("https://api.anthropic.com/v1/messages", headers=headers, json={
