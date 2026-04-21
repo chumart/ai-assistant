@@ -664,15 +664,16 @@ async def resolve_po_vendor(suggested_partner_id, line_product_ids: list, cookie
     print(f"VENDOR FIX: {fix_note}")
     return best_vid, best["name"], fix_note
 
-async def odoo_write_record(model: str, record_id: int, vals: dict) -> dict:
+async def odoo_write_record(model: str, record_id: int, vals: dict, cookies=None) -> dict:
     """Update a record in Odoo."""
     try:
         async with httpx.AsyncClient(timeout=20, follow_redirects=True) as c:
-            login_r = await c.post(f"{ODOO_URL}/web/session/authenticate", json={
-                "jsonrpc": "2.0", "method": "call", "id": 1,
-                "params": {"db": ODOO_DB, "login": ODOO_USERNAME, "password": ODOO_PASSWORD}
-            })
-            cookies = login_r.cookies
+            if not cookies:
+                login_r = await c.post(f"{ODOO_URL}/web/session/authenticate", json={
+                    "jsonrpc": "2.0", "method": "call", "id": 1,
+                    "params": {"db": ODOO_DB, "login": ODOO_USERNAME, "password": ODOO_PASSWORD}
+                })
+                cookies = dict(login_r.cookies)
             r = await c.post(f"{ODOO_URL}/web/dataset/call_kw", json={
                 "jsonrpc": "2.0", "method": "call", "id": 2,
                 "params": {"model": model, "method": "write", "args": [[record_id], vals], "kwargs": {}}
