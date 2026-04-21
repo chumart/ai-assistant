@@ -411,20 +411,20 @@ async def fetch_credits(date_from, date_to):
         return [], records["error"]
     return records, None
 
-def summarize_moves(records):
+def summarize_moves(records, is_credit=False):
     by_state = {"paid":0,"in_payment":0,"reversed":0}
     total_untaxed = total_tax = total_amount = 0
+    sign = -1 if is_credit else 1
     for r in records:
         state = r.get("payment_state","")
         if state in by_state: by_state[state] += 1
-        # Use amount_untaxed_signed so credit notes count as negative automatically
         untaxed_signed = r.get("amount_untaxed_signed")
         if untaxed_signed is not None:
             total_untaxed += untaxed_signed
         else:
-            total_untaxed += r.get("amount_untaxed", 0)
-        total_tax    += r.get("amount_tax", 0)
-        total_amount += r.get("amount_total", 0)
+            total_untaxed += r.get("amount_untaxed", 0) * sign
+        total_tax    += r.get("amount_tax", 0) * sign
+        total_amount += r.get("amount_total", 0) * sign
     return {"count":len(records),"by_payment_state":by_state,
             "total_untaxed":round(total_untaxed,2),"total_tax":round(total_tax,2),"total_amount":round(total_amount,2)}
 
@@ -437,12 +437,12 @@ async def monthly_tax(year: int, month: int):
     credits,  err2 = await fetch_credits(date_from, date_to)
     if err1 or err2: return {"error": err1 or err2}
     inv = summarize_moves(invoices)
-    crd = summarize_moves(credits)
+    crd = summarize_moves(credits, is_credit=True)
     return {"period":f"{year}-{month:02d}","report_type":"Monthly Tax Report","invoices":inv,"credit_notes":crd,
             "net":{"count":inv["count"]-crd["count"],
-                   "total_untaxed":round(inv["total_untaxed"]-crd["total_untaxed"],2),
-                   "total_tax":round(inv["total_tax"]-crd["total_tax"],2),
-                   "total_amount":round(inv["total_amount"]-crd["total_amount"],2)}}
+                   "total_untaxed":round(inv["total_untaxed"]+crd["total_untaxed"],2),
+                   "total_tax":round(inv["total_tax"]+crd["total_tax"],2),
+                   "total_amount":round(inv["total_amount"]+crd["total_amount"],2)}}
 
 @app.get("/report/quarterly-tax")
 async def quarterly_tax(year: int, quarter: int):
@@ -456,21 +456,21 @@ async def quarterly_tax(year: int, quarter: int):
     credits,  err2 = await fetch_credits(date_from, date_to)
     if err1 or err2: return {"error": err1 or err2}
     inv = summarize_moves(invoices)
-    crd = summarize_moves(credits)
+    crd = summarize_moves(credits, is_credit=True)
     monthly = []
     for m in range(start_month, end_month+1):
         ld = calendar.monthrange(year,m)[1]
         inv_m,_ = await fetch_moves("out_invoice",f"{year}-{m:02d}-01",f"{year}-{m:02d}-{ld}")
         crd_m,_ = await fetch_credits(f"{year}-{m:02d}-01",f"{year}-{m:02d}-{ld}")
-        inv_s = summarize_moves(inv_m); crd_s = summarize_moves(crd_m)
+        inv_s = summarize_moves(inv_m); crd_s = summarize_moves(crd_m, is_credit=True)
         monthly.append({"month":f"{year}-{m:02d}","invoice_tax":inv_s["total_tax"],
                         "credit_note_tax":crd_s["total_tax"],"net_tax":round(inv_s["total_tax"]-crd_s["total_tax"],2),
                         "invoice_count":inv_s["count"],"credit_note_count":crd_s["count"]})
     return {"period":f"Q{quarter} {year}","report_type":"Quarterly Tax Report",
             "date_range":f"{date_from} to {date_to}","invoices":inv,"credit_notes":crd,
-            "net":{"total_untaxed":round(inv["total_untaxed"]-crd["total_untaxed"],2),
-                   "total_tax":round(inv["total_tax"]-crd["total_tax"],2),
-                   "total_amount":round(inv["total_amount"]-crd["total_amount"],2)},
+            "net":{"total_untaxed":round(inv["total_untaxed"]+crd["total_untaxed"],2),
+                   "total_tax":round(inv["total_tax"]+crd["total_tax"],2),
+                   "total_amount":round(inv["total_amount"]+crd["total_amount"],2)},
             "monthly_breakdown":monthly}
 
 @app.get("/report/monthly-sales")
@@ -507,8 +507,9 @@ async def monthly_sales(year: int, month: int):
         }
 
     # Group by salesperson for summary
-    def group_by_salesperson(records):
+    def group_by_salesperson(records, is_credit=False):
         by_person = {}
+        sign = -1 if is_credit else 1
         for r in records:
             name = get_salesperson(r)
             if name not in by_person:
@@ -516,17 +517,17 @@ async def monthly_sales(year: int, month: int):
                                    "amount_untaxed": 0, "amount_tax": 0, "amount_total": 0}
             by_person[name]["count"] += 1
             untaxed_signed = r.get("amount_untaxed_signed")
-            by_person[name]["amount_untaxed"] += untaxed_signed if untaxed_signed is not None else r.get("amount_untaxed", 0)
-            by_person[name]["amount_tax"]     += r.get("amount_tax", 0)
-            by_person[name]["amount_total"]   += r.get("amount_total", 0)
+            by_person[name]["amount_untaxed"] += untaxed_signed if untaxed_signed is not None else r.get("amount_untaxed", 0) * sign
+            by_person[name]["amount_tax"]     += r.get("amount_tax", 0) * sign
+            by_person[name]["amount_total"]   += r.get("amount_total", 0) * sign
         for p in by_person.values():
             p["amount_untaxed"] = round(p["amount_untaxed"], 2)
             p["amount_tax"]     = round(p["amount_tax"], 2)
             p["amount_total"]   = round(p["amount_total"], 2)
         return sorted(by_person.values(), key=lambda x: x["amount_untaxed"], reverse=True)
 
-    inv_by_person = group_by_salesperson(invoices)
-    crd_by_person = group_by_salesperson(credits)
+    inv_by_person = group_by_salesperson(invoices, is_credit=False)
+    crd_by_person = group_by_salesperson(credits, is_credit=True)
 
     inv_dict = {p["salesperson"]: p for p in inv_by_person}
     crd_dict = {p["salesperson"]: p for p in crd_by_person}
@@ -540,8 +541,8 @@ async def monthly_sales(year: int, month: int):
             "salesperson":        name,
             "invoice_count":      inv_p["count"],
             "credit_note_count":  crd_p["count"],
-            "invoice_amount":     inv_p["amount_untaxed"],
-            "credit_amount":      round(-abs(crd_p["amount_untaxed"]), 2),
+            "invoice_amount":     round(inv_p["amount_untaxed"], 2),
+            "credit_amount":      round(crd_p["amount_untaxed"], 2),
             "net_amount_untaxed": round(inv_p["amount_untaxed"] + crd_p["amount_untaxed"], 2),
             "net_amount_tax":     round(inv_p["amount_tax"]     + crd_p["amount_tax"],     2),
             "net_amount_total":   round(inv_p["amount_total"]   + crd_p["amount_total"],   2),
@@ -549,7 +550,7 @@ async def monthly_sales(year: int, month: int):
     net_by_person.sort(key=lambda x: x["net_amount_untaxed"], reverse=True)
 
     inv_total = summarize_moves(invoices)
-    crd_total = summarize_moves(credits)
+    crd_total = summarize_moves(credits, is_credit=True)
 
     # All rows formatted per Odoo template (invoices + credit notes combined, sorted by salesperson then date)
     all_rows = (
