@@ -1013,21 +1013,40 @@ async def run_tool(name, inp):
         try:
             query = inp["query"]
             category = inp.get("category", "")
+            # Build fuzzy search terms from query words
+            words = [w for w in query.lower().split() if len(w) > 2]
+            if not words:
+                words = [query.lower()]
+
             if category:
                 rows = await conn.fetch("""
                     SELECT id, original_name, category, description, public_url, chunk_count, created_at
                     FROM documents
-                    WHERE (LOWER(original_name) LIKE $1 OR LOWER(description) LIKE $1)
-                    AND category = $2
+                    WHERE category = $2
+                    AND (LOWER(original_name) LIKE $1 OR LOWER(description) LIKE $1
+                         OR LOWER(REPLACE(original_name, '_', ' ')) LIKE $1)
                     ORDER BY created_at DESC LIMIT 10
                 """, f"%{query.lower()}%", category)
             else:
+                # Try full query first, then individual words
                 rows = await conn.fetch("""
                     SELECT id, original_name, category, description, public_url, chunk_count, created_at
                     FROM documents
-                    WHERE LOWER(original_name) LIKE $1 OR LOWER(description) LIKE $1
+                    WHERE LOWER(original_name) LIKE $1
+                       OR LOWER(description) LIKE $1
+                       OR LOWER(REPLACE(original_name, '_', ' ')) LIKE $1
                     ORDER BY created_at DESC LIMIT 10
                 """, f"%{query.lower()}%")
+                # If no results, try each word separately
+                if not rows and words:
+                    for word in words:
+                        rows = await conn.fetch("""
+                            SELECT id, original_name, category, description, public_url, chunk_count, created_at
+                            FROM documents WHERE LOWER(original_name) LIKE $1 OR LOWER(description) LIKE $1
+                            ORDER BY created_at DESC LIMIT 10
+                        """, f"%{word}%")
+                        if rows:
+                            break
             if not rows:
                 return f"No documents found matching '{query}'. Ask the admin to upload relevant documents."
             results = []
@@ -1545,18 +1564,27 @@ ALLOWED_CATEGORIES = ["service_manual", "employee_handbook", "after_sales", "war
 @app.post("/admin/upload-doc")
 async def upload_doc(
     background_tasks: BackgroundTasks,
+    request: Request,
     file: UploadFile = File(...),
     category: str = "general",
     description: str = "",
     admin_key: str = "",
-    key: str = ""  # alternate param name
+    key: str = ""
 ):
-    # Accept admin_key from query param, form, or 'key' param
-    effective_key = admin_key or key
+    # Also read from query params (more reliable with multipart)
+    qp = request.query_params
+    effective_key = qp.get("admin_key", "") or admin_key or key
+    cat_from_qp = qp.get("category", "")
+    desc_from_qp = qp.get("description", "")
+    if cat_from_qp:
+        category = cat_from_qp
+    if desc_from_qp:
+        description = desc_from_qp
+
     if effective_key != os.getenv("ADMIN_KEY", "chumart2024"):
         return {"error": "Invalid admin key"}
     if not R2_ACCOUNT_ID or not R2_ACCESS_KEY:
-        return {"error": "R2 not configured. Add R2_ACCOUNT_ID, R2_ACCESS_KEY, R2_SECRET_KEY, R2_BUCKET, R2_PUBLIC_URL to Railway variables."}
+        return {"error": "R2 not configured."}
     if category not in ALLOWED_CATEGORIES:
         category = "general"
 
