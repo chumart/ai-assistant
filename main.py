@@ -686,6 +686,27 @@ COST/MARGIN RULES (NO ACCESS):
     else:
         inventory_rules = "INVENTORY: No access to inventory data."
 
+    # Admin gets a special free-mode system prompt
+    if role == "admin":
+        return f"""今天是{today}。你是 Chumart AI，Chumart 管理员的专属私人助手。
+你支持中英文，用用户的语言回复。
+
+【你的能力没有限制】
+- 你既是企业AI助手（连接Odoo ERP和产品知识库），也是管理员的私人助手
+- 可以回答任何话题：商业分析、Odoo数据查询、产品知识、娱乐、算命、星座、趣味问答、创意写作、日常建议等等
+- 遇到算命/星座/塔罗等娱乐话题，以轻松有趣的方式回应，加入一些幽默感
+- 不需要把每个问题都往Odoo上靠，自然对话即可
+
+【Odoo 工具使用规则】
+- 涉及产品/规格/价格时：先调用 search_knowledge
+- 涉及财务报表：get_monthly_tax / get_quarterly_tax / get_monthly_sales / get_missing_tax
+- 涉及库存/客户/订单：用 odoo_search，company_id=1，stock加 location_id.usage=internal
+- 涉及产品搜索：name 和 default_code 都用 ilike，OR 逻辑
+
+【数据展示】
+- 财务数字用 $ 加千位分隔符
+- 表格数据用 Markdown 表格格式 | col | col |"""
+
     return f"""今天是{today}。You are Chumart Assistant, an enterprise AI assistant.
 You support both English and Chinese - reply in the same language the user uses.
 
@@ -743,6 +764,80 @@ async def run_tool(name, inp):
                 parts.append(f"[{r['site_name']} | {r['page_title']}]\n{r['chunk_text']}")
         return "\n\n---\n\n".join(parts) if parts else "No sufficiently relevant results found."
     return "Unknown tool"
+
+# ─────────────────────────────────────────────
+# OpenAI chat helper
+# ─────────────────────────────────────────────
+
+def convert_tools_to_openai(tools: list) -> list:
+    """Convert Anthropic tool format to OpenAI function format."""
+    oai_tools = []
+    for t in tools:
+        oai_tools.append({
+            "type": "function",
+            "function": {
+                "name": t["name"],
+                "description": t["description"],
+                "parameters": t["input_schema"]
+            }
+        })
+    return oai_tools
+
+async def chat_openai(messages: list, system: str, model: str, tools: list) -> str:
+    """Call OpenAI Chat Completions API with full tool use support."""
+    openai_key = os.getenv("OPENAI_API_KEY", "")
+    if not openai_key:
+        return "OpenAI API key not configured. Please add OPENAI_API_KEY to Railway environment variables."
+    try:
+        oai_tools = convert_tools_to_openai(tools)
+        oai_messages = [{"role": "system", "content": system}] + messages
+
+        async with httpx.AsyncClient(timeout=120) as c:
+            current_messages = list(oai_messages)
+            for _ in range(8):
+                payload = {
+                    "model": model,
+                    "messages": current_messages,
+                    "max_tokens": 4096,
+                }
+                if oai_tools:
+                    payload["tools"] = oai_tools
+                    payload["tool_choice"] = "auto"
+
+                r = await c.post(
+                    "https://api.openai.com/v1/chat/completions",
+                    headers={"Authorization": f"Bearer {openai_key}", "Content-Type": "application/json"},
+                    json=payload
+                )
+                data = r.json()
+                if "error" in data:
+                    return f"OpenAI error: {data['error'].get('message', str(data['error']))}"
+
+                choice = data["choices"][0]
+                msg = choice["message"]
+                finish = choice.get("finish_reason")
+
+                # If tool calls needed
+                if finish == "tool_calls" and msg.get("tool_calls"):
+                    current_messages.append(msg)
+                    for tc in msg["tool_calls"]:
+                        fn_name = tc["function"]["name"]
+                        try:
+                            fn_args = json.loads(tc["function"]["arguments"])
+                        except Exception:
+                            fn_args = {}
+                        result = await run_tool(fn_name, fn_args)
+                        current_messages.append({
+                            "role": "tool",
+                            "tool_call_id": tc["id"],
+                            "content": result
+                        })
+                else:
+                    return msg.get("content", "") or "No response."
+
+        return "Sorry, max iterations reached."
+    except Exception as e:
+        return f"OpenAI request failed: {e}"
 
 # ─────────────────────────────────────────────
 # Admin endpoints
@@ -850,6 +945,23 @@ async def extract_file(file: UploadFile = File(...)):
 # Chat
 # ─────────────────────────────────────────────
 
+ALLOWED_MODELS = {
+    # Anthropic
+    "claude-sonnet-4-5":          "Claude Sonnet 4.5",
+    "claude-opus-4-5":            "Claude Opus 4.5",
+    "claude-haiku-4-5-20251001":  "Claude Haiku 4.5",
+    # OpenAI
+    "gpt-4o":                     "GPT-4o",
+    "gpt-4o-mini":                "GPT-4o Mini",
+    "o3-mini":                    "o3-mini",
+    "o4-mini":                    "o4-mini",
+}
+
+# Models non-admin users can choose from
+NON_ADMIN_MODELS = {"claude-sonnet-4-5", "claude-haiku-4-5-20251001"}
+
+OPENAI_MODELS = {"gpt-4o", "gpt-4o-mini", "o3-mini", "o4-mini"}
+
 class ChatRequest(BaseModel):
     message: str
     history: list = []
@@ -859,6 +971,7 @@ class ChatRequest(BaseModel):
     role: str = "guest"
     user_name: str = ""
     user_id: int = 0
+    model: str = "claude-sonnet-4-5"
 
 @app.post("/chat")
 async def chat(req: ChatRequest):
@@ -890,13 +1003,28 @@ async def chat(req: ChatRequest):
     messages = req.history + [{"role": "user", "content": user_message_content}]
     headers = {"x-api-key": ANTHROPIC_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json"}
 
+    # Determine model based on role
+    if req.role == "admin" and req.model in ALLOWED_MODELS:
+        selected_model = req.model
+    elif req.role != "admin" and req.model in NON_ADMIN_MODELS:
+        selected_model = req.model
+    else:
+        selected_model = "claude-sonnet-4-5"
+    system_prompt = get_system_prompt(req.role, req.user_name, req.user_id)
+
+    # Route to OpenAI if selected
+    if selected_model in OPENAI_MODELS:
+        reply = await chat_openai(messages, system_prompt, selected_model, allowed_tools)
+        return {"reply": reply or "Sorry, no response generated."}
+
+    # Anthropic path
     async with httpx.AsyncClient(timeout=120) as c:
         current_messages = list(messages)
         for _ in range(8):
             r = await c.post("https://api.anthropic.com/v1/messages", headers=headers, json={
-                "model": "claude-sonnet-4-5",
+                "model": selected_model,
                 "max_tokens": 4096,
-                "system": get_system_prompt(req.role, req.user_name, req.user_id),
+                "system": system_prompt,
                 "tools": allowed_tools,
                 "messages": current_messages
             })
