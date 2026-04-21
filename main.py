@@ -23,6 +23,13 @@ ODOO_PASSWORD = os.getenv("ODOO_PASSWORD", "")
 ANTHROPIC_KEY = os.getenv("ANTHROPIC_API_KEY", "")
 DATABASE_URL  = os.getenv("DATABASE_URL", "")
 
+# Cloudflare R2
+R2_ACCOUNT_ID = os.getenv("R2_ACCOUNT_ID", "")
+R2_ACCESS_KEY = os.getenv("R2_ACCESS_KEY", "")
+R2_SECRET_KEY = os.getenv("R2_SECRET_KEY", "")
+R2_BUCKET     = os.getenv("R2_BUCKET", "chumart-docs")
+R2_PUBLIC_URL = os.getenv("R2_PUBLIC_URL", "")
+
 VALID_STATES = ["paid", "in_payment", "reversed"]
 CA_STATE_ID  = 13
 
@@ -113,6 +120,28 @@ async def init_db():
                 updated_at TIMESTAMP DEFAULT NOW()
             )
         """)
+        # Document library
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS documents (
+                id          TEXT PRIMARY KEY,
+                filename    TEXT NOT NULL,
+                original_name TEXT NOT NULL,
+                category    TEXT DEFAULT 'general',
+                description TEXT DEFAULT '',
+                file_size   INTEGER DEFAULT 0,
+                mime_type   TEXT DEFAULT '',
+                r2_key      TEXT NOT NULL,
+                public_url  TEXT NOT NULL,
+                uploaded_by TEXT DEFAULT '',
+                chunk_count INTEGER DEFAULT 0,
+                created_at  TIMESTAMP DEFAULT NOW()
+            )
+        """)
+        await conn.execute("""
+            CREATE INDEX IF NOT EXISTS knowledge_chunks_doc_idx
+            ON knowledge_chunks(site_url)
+            WHERE site_url LIKE 'doc:%'
+        """)
         print("DB initialized OK")
     except Exception as e:
         print(f"DB init error: {e}")
@@ -162,6 +191,157 @@ async def get_embedding(text: str) -> Optional[list]:
         print(f"OpenAI embedding exception: {e}")
         return None
 
+
+# ─────────────────────────────────────────────
+# Cloudflare R2 helpers
+# ─────────────────────────────────────────────
+
+def get_r2_client():
+    """Get boto3 S3 client configured for Cloudflare R2."""
+    try:
+        import boto3
+        return boto3.client(
+            "s3",
+            endpoint_url=f"https://{R2_ACCOUNT_ID}.r2.cloudflarestorage.com",
+            aws_access_key_id=R2_ACCESS_KEY,
+            aws_secret_access_key=R2_SECRET_KEY,
+            region_name="auto"
+        )
+    except Exception as e:
+        print(f"R2 client error: {e}")
+        return None
+
+async def r2_upload(file_bytes: bytes, r2_key: str, content_type: str) -> bool:
+    """Upload file to R2."""
+    try:
+        import asyncio
+        loop = asyncio.get_event_loop()
+        client = get_r2_client()
+        if not client:
+            return False
+        await loop.run_in_executor(None, lambda: client.put_object(
+            Bucket=R2_BUCKET,
+            Key=r2_key,
+            Body=file_bytes,
+            ContentType=content_type
+        ))
+        return True
+    except Exception as e:
+        print(f"R2 upload error: {e}")
+        return False
+
+async def r2_delete(r2_key: str) -> bool:
+    """Delete file from R2."""
+    try:
+        import asyncio
+        loop = asyncio.get_event_loop()
+        client = get_r2_client()
+        if not client:
+            return False
+        await loop.run_in_executor(None, lambda: client.delete_object(
+            Bucket=R2_BUCKET, Key=r2_key
+        ))
+        return True
+    except Exception as e:
+        print(f"R2 delete error: {e}")
+        return False
+
+# ─────────────────────────────────────────────
+# Document text extraction
+# ─────────────────────────────────────────────
+
+async def extract_text_from_file(file_bytes: bytes, filename: str, mime_type: str) -> str:
+    """Extract text from PDF, Word, image, or plain text files."""
+    fname = filename.lower()
+
+    # Plain text
+    if fname.endswith(('.txt', '.md', '.csv')):
+        return file_bytes.decode('utf-8', errors='ignore')
+
+    # PDF or image — use Claude vision
+    if fname.endswith('.pdf'):
+        doc_type = "document"
+        media_type = "application/pdf"
+    elif fname.endswith(('.png', '.jpg', '.jpeg', '.webp')):
+        ext = fname.split('.')[-1].replace('jpg', 'jpeg')
+        doc_type = "image"
+        media_type = f"image/{ext}"
+    elif fname.endswith(('.docx', '.doc')):
+        # Try python-docx first
+        try:
+            import io
+            from docx import Document as DocxDocument
+            doc = DocxDocument(io.BytesIO(file_bytes))
+            text = "\n".join(p.text for p in doc.paragraphs if p.text.strip())
+            return text
+        except Exception:
+            # Fallback to Claude
+            doc_type = "document"
+            media_type = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+    else:
+        return file_bytes.decode('utf-8', errors='ignore')
+
+    # Use Claude to extract text from PDF/image/docx
+    b64 = base64.standard_b64encode(file_bytes).decode('utf-8')
+    try:
+        async with httpx.AsyncClient(timeout=120) as c:
+            r = await c.post(
+                "https://api.anthropic.com/v1/messages",
+                headers={"x-api-key": ANTHROPIC_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json"},
+                json={
+                    "model": "claude-haiku-4-5-20251001",
+                    "max_tokens": 8000,
+                    "messages": [{
+                        "role": "user",
+                        "content": [
+                            {"type": doc_type, "source": {"type": "base64", "media_type": media_type, "data": b64}},
+                            {"type": "text", "text": "Extract ALL text content from this document completely. Include every section, table, specification, error code, procedure, and detail. Return raw text only, no commentary."}
+                        ]
+                    }]
+                }
+            )
+            data = r.json()
+            return "".join(b.get("text", "") for b in data.get("content", []) if b.get("type") == "text")
+    except Exception as e:
+        print(f"Text extraction error: {e}")
+        return ""
+
+async def process_document_to_kb(doc_id: str, doc_name: str, text: str, category: str):
+    """Chunk document text and store in knowledge base."""
+    if not text.strip():
+        return 0
+
+    conn = await get_db_conn()
+    if not conn:
+        return 0
+
+    try:
+        # Delete old chunks for this doc
+        await conn.execute("DELETE FROM knowledge_chunks WHERE site_url = $1", f"doc:{doc_id}")
+
+        chunks = chunk_text(text, chunk_size=600, overlap=100)
+        count = 0
+        for chunk in chunks:
+            if not chunk.strip():
+                continue
+            embedding = await get_embedding(chunk)
+            if embedding:
+                await conn.execute("""
+                    INSERT INTO knowledge_chunks
+                    (site_name, site_url, page_url, page_title, chunk_text, embedding, category)
+                    VALUES ($1, $2, $3, $4, $5, $6::vector, $7)
+                """, doc_name, f"doc:{doc_id}", f"doc:{doc_id}", doc_name, chunk,
+                    json.dumps(embedding), f"doc_{category}")
+                count += 1
+
+        # Update chunk count
+        await conn.execute("UPDATE documents SET chunk_count=$1 WHERE id=$2", count, doc_id)
+        return count
+    except Exception as e:
+        print(f"Document KB processing error: {e}")
+        return 0
+    finally:
+        await conn.close()
 
 # ─────────────────────────────────────────────
 # Web crawler
@@ -654,8 +834,13 @@ TOOLS = [
     },
     {
         "name": "search_knowledge",
-        "description": "Search the internal knowledge base built from our websites (chumartusa.com, polarmanusa.com, flamasterusa.com, chefasstusa.com). Use this for product questions, specs, pricing, installation, sales training, competitor comparison. Always use this before answering product-related questions.",
-        "input_schema": {"type":"object","properties":{"query":{"type":"string","description":"Search query"},"top_k":{"type":"integer","default":5,"description":"Number of results"}},"required":["query"]}
+        "description": "Search the internal knowledge base — includes websites (chumartusa.com, polarmanusa.com, flamasterusa.com, chefasstusa.com) AND uploaded internal documents (employee handbook, service manuals, after-sales procedures, warranty docs). ALWAYS use this first for ANY product question, maintenance, repair, troubleshooting, error codes, company policy, or procedures.",
+        "input_schema": {"type":"object","properties":{"query":{"type":"string","description":"Search query"},"top_k":{"type":"integer","default":6,"description":"Number of results"}},"required":["query"]}
+    },
+    {
+        "name": "search_documents",
+        "description": "Search for specific internal documents by name or category. Use when user asks to find or download a specific file like a service manual, employee handbook, or procedure document. Returns document name, category, and download link.",
+        "input_schema": {"type":"object","properties":{"query":{"type":"string","description":"Document name or keywords"},"category":{"type":"string","description":"Optional: service_manual, employee_handbook, after_sales, warranty, general"}},"required":["query"]}
     }
 ]
 
@@ -728,7 +913,8 @@ COST/MARGIN RULES (NO ACCESS):
 - 不需要把每个问题都往Odoo上靠，自然对话即可
 
 【Odoo 工具使用规则】
-- 涉及产品/规格/价格时：先调用 search_knowledge
+- 涉及产品/规格/价格/维修/故障排除时：先调用 search_knowledge（包含网站内容和上传的文档如service manual）
+- 如果用户想找或下载某个文件：用 search_documents 工具
 - 涉及财务报表：get_monthly_tax / get_quarterly_tax / get_monthly_sales / get_missing_tax
 - 涉及库存/客户/订单：用 odoo_search，company_id=1，stock加 location_id.usage=internal
 - 涉及产品搜索：name 和 default_code 都用 ilike，OR 逻辑
@@ -753,8 +939,10 @@ You support both English and Chinese - reply in the same language the user uses.
 CURRENT USER: {user_name} | ROLE: {perms['label']} | UID: {user_id}{memory_block}
 
 KNOWLEDGE BASE RULES (MOST IMPORTANT):
-- For ANY product question, spec, price, installation, or sales question: ALWAYS call search_knowledge first
-- Never answer product questions from memory — always search first
+- For ANY product question, spec, price, installation, maintenance, repair, troubleshooting, error codes, or company policy: ALWAYS call search_knowledge first
+- The knowledge base contains: website content (chumartusa.com, polarmanusa.com etc.) AND uploaded internal documents (service manuals, employee handbook, after-sales procedures, warranty docs)
+- If user asks to find or download a specific document, use search_documents tool
+- Never answer product/maintenance/repair questions from memory — always search first
 
 {finance_rules}
 
@@ -804,14 +992,57 @@ async def run_tool(name, inp):
     if name == "get_missing_tax":
         return json.dumps(await missing_tax(inp["year"], inp["month"]), ensure_ascii=False)
     if name == "search_knowledge":
-        results = await search_knowledge(inp["query"], inp.get("top_k", 5))
+        results = await search_knowledge(inp["query"], inp.get("top_k", 6))
         if not results:
-            return "No relevant knowledge found. The knowledge base may not be crawled yet. Ask admin to run /admin/crawl."
+            return "No relevant knowledge found in knowledge base or documents."
         parts = []
         for r in results:
             if r.get("similarity", 0) > 0.25:
-                parts.append(f"[{r['site_name']} | {r['page_title']}]\n{r['chunk_text']}")
+                source = r['site_name']
+                # Add download link for document sources
+                if r.get('site_url', '').startswith('doc:'):
+                    doc_id = r['site_url'].replace('doc:', '')
+                    parts.append(f"[📄 {source}]\n{r['chunk_text']}\n[Doc ID: {doc_id}]")
+                else:
+                    parts.append(f"[{source} | {r['page_title']}]\n{r['chunk_text']}")
         return "\n\n---\n\n".join(parts) if parts else "No sufficiently relevant results found."
+    if name == "search_documents":
+        conn = await get_db_conn()
+        if not conn:
+            return "Database not available."
+        try:
+            query = inp["query"]
+            category = inp.get("category", "")
+            if category:
+                rows = await conn.fetch("""
+                    SELECT id, original_name, category, description, public_url, chunk_count, created_at
+                    FROM documents
+                    WHERE (LOWER(original_name) LIKE $1 OR LOWER(description) LIKE $1)
+                    AND category = $2
+                    ORDER BY created_at DESC LIMIT 10
+                """, f"%{query.lower()}%", category)
+            else:
+                rows = await conn.fetch("""
+                    SELECT id, original_name, category, description, public_url, chunk_count, created_at
+                    FROM documents
+                    WHERE LOWER(original_name) LIKE $1 OR LOWER(description) LIKE $1
+                    ORDER BY created_at DESC LIMIT 10
+                """, f"%{query.lower()}%")
+            if not rows:
+                return f"No documents found matching '{query}'. Ask the admin to upload relevant documents."
+            results = []
+            for r in rows:
+                results.append(
+                    f"📄 **{r['original_name']}**\n"
+                    f"   Category: {r['category']} | Chunks: {r['chunk_count']}\n"
+                    f"   Description: {r['description'] or 'N/A'}\n"
+                    f"   Download: {r['public_url']}"
+                )
+            return "\n\n".join(results)
+        except Exception as e:
+            return f"Search error: {e}"
+        finally:
+            await conn.close()
     return "Unknown tool"
 
 # ─────────────────────────────────────────────
@@ -1015,21 +1246,23 @@ async def extract_file(file: UploadFile = File(...)):
 # ─────────────────────────────────────────────
 
 ALLOWED_MODELS = {
-    # Anthropic
+    # Anthropic Claude
     "claude-sonnet-4-5":          "Claude Sonnet 4.5",
     "claude-opus-4-5":            "Claude Opus 4.5",
     "claude-haiku-4-5-20251001":  "Claude Haiku 4.5",
-    # OpenAI
+    # OpenAI GPT-5 (latest)
+    "gpt-5.4":                    "GPT-5.4 · Flagship",
+    "gpt-5.4-mini":               "GPT-5.4 Mini · Fast",
+    "gpt-5.4-nano":               "GPT-5.4 Nano · Fastest",
+    # OpenAI GPT-4 (still available via API)
     "gpt-4o":                     "GPT-4o",
     "gpt-4o-mini":                "GPT-4o Mini",
-    "o3-mini":                    "o3-mini",
-    "o4-mini":                    "o4-mini",
 }
 
 # Models non-admin users can choose from
 NON_ADMIN_MODELS = {"claude-sonnet-4-5", "claude-haiku-4-5-20251001"}
 
-OPENAI_MODELS = {"gpt-4o", "gpt-4o-mini", "o3-mini", "o4-mini"}
+OPENAI_MODELS = {"gpt-5.4", "gpt-5.4-mini", "gpt-5.4-nano", "gpt-4o", "gpt-4o-mini"}
 
 
 # ─────────────────────────────────────────────
@@ -1302,6 +1535,128 @@ async def clear_memory(uid: int):
         await conn.execute("DELETE FROM user_memory WHERE uid=$1", uid)
         await conn.close()
     return {"status": "cleared"}
+
+# ─────────────────────────────────────────────
+# Document Management (Admin)
+# ─────────────────────────────────────────────
+
+ALLOWED_CATEGORIES = ["service_manual", "employee_handbook", "after_sales", "warranty", "general"]
+
+@app.post("/admin/upload-doc")
+async def upload_doc(
+    background_tasks: BackgroundTasks,
+    file: UploadFile = File(...),
+    category: str = "general",
+    description: str = "",
+    admin_key: str = ""
+):
+    if admin_key != os.getenv("ADMIN_KEY", "chumart2024"):
+        return {"error": "Invalid admin key"}
+    if not R2_ACCOUNT_ID or not R2_ACCESS_KEY:
+        return {"error": "R2 not configured. Add R2_ACCOUNT_ID, R2_ACCESS_KEY, R2_SECRET_KEY, R2_BUCKET, R2_PUBLIC_URL to Railway variables."}
+    if category not in ALLOWED_CATEGORIES:
+        category = "general"
+
+    try:
+        file_bytes = await file.read()
+        file_size = len(file_bytes)
+        doc_id = str(uuid.uuid4())
+        ext = file.filename.rsplit('.', 1)[-1].lower() if '.' in file.filename else 'bin'
+        r2_key = f"{category}/{doc_id}.{ext}"
+        public_url = f"{R2_PUBLIC_URL}/{r2_key}"
+
+        # Determine mime type
+        mime_map = {
+            'pdf': 'application/pdf',
+            'docx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+            'doc': 'application/msword',
+            'txt': 'text/plain',
+            'md': 'text/markdown',
+            'png': 'image/png',
+            'jpg': 'image/jpeg',
+            'jpeg': 'image/jpeg',
+            'webp': 'image/webp',
+        }
+        mime_type = mime_map.get(ext, 'application/octet-stream')
+
+        # Upload to R2
+        ok = await r2_upload(file_bytes, r2_key, mime_type)
+        if not ok:
+            return {"error": "Failed to upload to R2. Check R2 credentials."}
+
+        # Save metadata to DB
+        conn = await get_db_conn()
+        if conn:
+            await conn.execute("""
+                INSERT INTO documents (id, filename, original_name, category, description, file_size, mime_type, r2_key, public_url)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+            """, doc_id, r2_key, file.filename, category, description, file_size, mime_type, r2_key, public_url)
+            await conn.close()
+
+        # Process text extraction and knowledge base indexing in background
+        background_tasks.add_task(
+            _process_doc_background,
+            doc_id, file.filename, file_bytes, mime_type, category
+        )
+
+        return {
+            "status": "uploaded",
+            "doc_id": doc_id,
+            "filename": file.filename,
+            "category": category,
+            "public_url": public_url,
+            "message": "File uploaded. Knowledge base indexing started in background (may take 1-2 min)."
+        }
+
+    except Exception as e:
+        return {"error": str(e)}
+
+async def _process_doc_background(doc_id: str, filename: str, file_bytes: bytes, mime_type: str, category: str):
+    """Background task: extract text and index into knowledge base."""
+    print(f"Processing document: {filename}")
+    text = await extract_text_from_file(file_bytes, filename, mime_type)
+    if text:
+        count = await process_document_to_kb(doc_id, filename, text, category)
+        print(f"Indexed {count} chunks for {filename}")
+    else:
+        print(f"No text extracted from {filename}")
+
+@app.get("/admin/documents")
+async def list_documents(admin_key: str = ""):
+    if admin_key != os.getenv("ADMIN_KEY", "chumart2024"):
+        return {"error": "Invalid admin key"}
+    conn = await get_db_conn()
+    if not conn:
+        return {"error": "DB not connected"}
+    try:
+        rows = await conn.fetch("""
+            SELECT id, original_name, category, description, file_size, chunk_count, public_url, created_at
+            FROM documents ORDER BY created_at DESC
+        """)
+        return {"documents": [dict(r) for r in rows]}
+    finally:
+        await conn.close()
+
+@app.delete("/admin/documents/{doc_id}")
+async def delete_document(doc_id: str, admin_key: str = ""):
+    if admin_key != os.getenv("ADMIN_KEY", "chumart2024"):
+        return {"error": "Invalid admin key"}
+    conn = await get_db_conn()
+    if not conn:
+        return {"error": "DB not connected"}
+    try:
+        row = await conn.fetchrow("SELECT r2_key FROM documents WHERE id=$1", doc_id)
+        if not row:
+            return {"error": "Document not found"}
+        # Delete from R2
+        await r2_delete(row["r2_key"])
+        # Delete chunks from knowledge base
+        await conn.execute("DELETE FROM knowledge_chunks WHERE site_url=$1", f"doc:{doc_id}")
+        # Delete metadata
+        await conn.execute("DELETE FROM documents WHERE id=$1", doc_id)
+        return {"status": "deleted"}
+    finally:
+        await conn.close()
 
 # ─────────────────────────────────────────────
 # Health
