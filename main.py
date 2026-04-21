@@ -1405,7 +1405,8 @@ async def run_tool(name, inp):
             partner_id = po["partner_id"]
 
             # Auto-detect correct vendor from first product's supplierinfo
-            first_pid = validated_lines[0]["product_id"] if validated_lines else None
+            po_lines = po.get("lines", [])
+            first_pid = po_lines[0]["product_id"] if po_lines else None
             if first_pid:
                 # Get product template
                 prod_tmpl_r = await odoo_query("product.product",
