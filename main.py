@@ -1458,32 +1458,48 @@ async def run_tool(name, inp):
                 validated_lines.append({"product_id": pid, "quantity": line["quantity"],
                                         "price_unit": line.get("price_unit", 0)})
 
-            # Create lines one by one with MINIMAL fields only
-            # Odoo server-side compute fills name, uom, date_planned automatically
-            # Fields: partner_id (header), order_line/product_id, order_line/product_qty
-            # First row has partner_id, subsequent rows leave it empty (Odoo groups them)
+            # Batch create ALL lines in ONE write() call using One2many (0,0,vals) commands
             if validated_lines:
+                order_lines_cmds = []
                 for l in validated_lines:
-                    # Minimal fields only — Odoo fills name/uom/date_planned server-side
-                    line_vals = {
-                        "order_id": po_id,
-                        "product_id": l["product_id"],
+                    pid = l["product_id"]
+                    pinfo = prod_info.get(pid, {})
+                    line_data = {
+                        "product_id": pid,
                         "product_qty": l["quantity"],
+                        "name": pinfo.get("name", "Product"),
+                        "date_planned": date_planned,
                     }
                     if l.get("price_unit"):
-                        line_vals["price_unit"] = l["price_unit"]
+                        line_data["price_unit"] = l["price_unit"]
+                    uom_id = pinfo.get("uom_id")
+                    if uom_id:
+                        line_data["product_uom"] = uom_id
+                    order_lines_cmds.append([0, 0, line_data])
 
-                    lr = await odoo_create("purchase.order.line", line_vals, cookies=cookies)
-                    if lr.get("error"):
-                        # Retry with name + date_planned as fallback
+                # Single API call to add all lines
+                write_result = await odoo_write_record(
+                    "purchase.order", po_id,
+                    {"order_line": order_lines_cmds},
+                    cookies=cookies
+                )
+                if write_result.get("error"):
+                    # Fallback: one by one
+                    for l in validated_lines:
                         pinfo = prod_info.get(l["product_id"], {})
-                        line_vals["name"] = pinfo.get("name", "")
-                        line_vals["date_planned"] = date_planned
-                        lr = await odoo_create("purchase.order.line", line_vals, cookies=cookies)
+                        lr = await odoo_create("purchase.order.line", {
+                            "order_id": po_id,
+                            "product_id": l["product_id"],
+                            "product_qty": l["quantity"],
+                            "name": pinfo.get("name", ""),
+                            "date_planned": date_planned,
+                        }, cookies=cookies)
                         if lr.get("error"):
-                            line_errors.append(f"Product {l['product_id']}: {lr['error']}")
-                            continue
-                    lines_created += 1
+                            line_errors.append(f"{pinfo.get('name','?')}: {lr['error']}")
+                        else:
+                            lines_created += 1
+                else:
+                    lines_created = len(validated_lines)
 
             created.append({
                 "po_id": po_id,
