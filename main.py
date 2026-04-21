@@ -2607,7 +2607,7 @@ ROLE_PERMISSIONS = {
         "can_see_inventory":  True,
         "can_see_products":   True,
         "can_export":         True,
-        "can_write_odoo":     False,
+        "can_write_odoo":     True,
     },
     "purchase": {
         "label": "Purchase",
@@ -2667,10 +2667,18 @@ ODOO_GROUP_ROLE_MAP = [
     ("purchase.group_purchase_manager",    "warehouse"),
 ]
 
-async def get_user_role(uid: int, cookies) -> str:
-    """Query Odoo groups for a logged-in user and return their highest role."""
+async def get_user_role(uid: int, cookies=None) -> str:
+    """Query Odoo groups for a logged-in user and return their highest role.
+    Uses the admin service account to ensure sufficient permissions to read group data."""
     try:
         async with httpx.AsyncClient(timeout=15, follow_redirects=True) as c:
+            # Use admin session — user's own session may lack permission to read ir.model.data
+            login_r = await c.post(f"{ODOO_URL}/web/session/authenticate", json={
+                "jsonrpc": "2.0", "method": "call", "id": 1,
+                "params": {"db": ODOO_DB, "login": ODOO_USERNAME, "password": ODOO_PASSWORD}
+            })
+            admin_cookies = dict(login_r.cookies)
+
             # Get user's group IDs
             r = await c.post(f"{ODOO_URL}/web/dataset/call_kw", json={
                 "jsonrpc": "2.0", "method": "call", "id": 2,
@@ -2679,35 +2687,46 @@ async def get_user_role(uid: int, cookies) -> str:
                     "args": [[uid]],
                     "kwargs": {"fields": ["groups_id"]}
                 }
-            }, cookies=cookies)
+            }, cookies=admin_cookies)
             data = r.json()
             result = data.get("result", [])
             if not result:
+                print(f"ROLE DETECT uid={uid}: no user record found")
                 return "guest"
             group_ids = result[0].get("groups_id", [])
+            print(f"ROLE DETECT uid={uid}: {len(group_ids)} groups")
 
-            # Get group XML IDs
+            if not group_ids:
+                return "guest"
+
+            # Get group XML IDs (raise limit — users can have 200+ groups)
             r2 = await c.post(f"{ODOO_URL}/web/dataset/call_kw", json={
                 "jsonrpc": "2.0", "method": "call", "id": 3,
                 "params": {
                     "model": "ir.model.data", "method": "search_read",
                     "args": [[["model", "=", "res.groups"], ["res_id", "in", group_ids]]],
-                    "kwargs": {"fields": ["module", "name", "res_id"], "limit": 100}
+                    "kwargs": {"fields": ["module", "name", "res_id"], "limit": 500}
                 }
-            }, cookies=cookies)
+            }, cookies=admin_cookies)
             data2 = r2.json()
             xml_ids = set()
             for rec in data2.get("result", []):
                 xml_ids.add(f"{rec['module']}.{rec['name']}")
 
+            print(f"ROLE DETECT uid={uid}: {len(xml_ids)} XML IDs resolved")
+
             # Match to role in priority order
             for xml_id, role in ODOO_GROUP_ROLE_MAP:
                 if xml_id in xml_ids:
+                    print(f"ROLE DETECT uid={uid}: matched '{xml_id}' → role={role}")
                     return role
 
+            # Log what we found for debugging
+            account_groups = [x for x in xml_ids if 'account' in x or 'sale' in x or 'stock' in x or 'purchase' in x]
+            print(f"ROLE DETECT uid={uid}: no match found. Relevant groups: {account_groups}")
             return "guest"
     except Exception as e:
-        print(f"Role detection error: {e}")
+        print(f"Role detection error for uid={uid}: {e}")
         return "guest"
 
 
@@ -2733,8 +2752,8 @@ async def login(req: LoginRequest):
             uid = result.get("uid")
             cookies = r.cookies
 
-            # Detect role
-            role = await get_user_role(uid, cookies)
+            # Detect role (uses admin session internally)
+            role = await get_user_role(uid)
             permissions = ROLE_PERMISSIONS.get(role, ROLE_PERMISSIONS["guest"])
 
             return {
