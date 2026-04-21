@@ -1481,20 +1481,33 @@ async def run_tool(name, inp):
             sup_rows = json.loads(r1)
             if isinstance(sup_rows, dict) and "error" in sup_rows:
                 sup_rows = []
-        # If nothing found by template, try by product_id directly
-        if not sup_rows and product_ids:
+
+        # Check which templates were NOT found — do fallback queries for those
+        found_tmpls = set()
+        for row in sup_rows if isinstance(sup_rows, list) else []:
+            if row.get("product_tmpl_id"):
+                found_tmpls.add(row["product_tmpl_id"][0])
+        missing_tmpls = [t for t in tmpl_ids if t not in found_tmpls]
+        missing_pids = [pid for pid, tid in prod_to_tmpl.items() if tid in set(missing_tmpls)]
+
+        if missing_pids:
+            print(f"VENDOR QUERY: {len(missing_pids)} products missing vendors after template query, "
+                  f"trying product_id fallback...")
+            # Try by product_id directly for the missing ones
             r2 = await odoo_query(
                 "product.supplierinfo",
-                [["product_id", "in", product_ids]],
+                [["product_id", "in", missing_pids]],
                 ["product_id", "product_tmpl_id", "partner_id", "price", "min_qty", "currency_id", "company_id"],
                 limit=1000, order="sequence asc"
             )
-            sup_rows = json.loads(r2)
-            if isinstance(sup_rows, dict) and "error" in sup_rows:
-                sup_rows = []
-        # If still nothing, try without any product filter (get ALL supplierinfo and match manually)
+            extra = json.loads(r2)
+            if isinstance(extra, list):
+                sup_rows.extend(extra)
+                print(f"VENDOR QUERY: found {len(extra)} extra supplierinfo records via product_id")
+
+        # If STILL nothing at all, try getting all supplierinfo and match manually
         if not sup_rows and tmpl_ids:
-            # Broader search: get all supplierinfo records
+            print(f"VENDOR QUERY: zero results from targeted queries, doing full scan fallback...")
             all_r = await odoo_query(
                 "product.supplierinfo",
                 [],
@@ -1508,6 +1521,7 @@ async def run_tool(name, inp):
                 sup_rows = [r for r in all_sup
                     if (r.get("product_tmpl_id") and r["product_tmpl_id"][0] in tmpl_set)
                     or (r.get("product_id") and r["product_id"][0] in pid_set)]
+                print(f"VENDOR QUERY: full scan found {len(sup_rows)} matching records")
 
         # Step 3: Group vendors by product_id
         # For template-level records, assign to all products with that template
