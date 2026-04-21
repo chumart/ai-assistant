@@ -284,7 +284,7 @@ async def extract_text_from_file(file_bytes: bytes, filename: str, mime_type: st
     # Use Claude to extract text from PDF/image/docx
     b64 = base64.standard_b64encode(file_bytes).decode('utf-8')
     try:
-        async with httpx.AsyncClient(timeout=120) as c:
+        async with httpx.AsyncClient(timeout=300) as c:
             r = await c.post(
                 "https://api.anthropic.com/v1/messages",
                 headers={"x-api-key": ANTHROPIC_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json"},
@@ -530,15 +530,25 @@ async def get_kb_context(query: str) -> str:
 # Odoo Write operations
 # ─────────────────────────────────────────────
 
-async def odoo_create(model: str, vals: dict) -> dict:
+async def odoo_get_session():
+    """Get a reusable authenticated session (cookies) for Odoo."""
+    async with httpx.AsyncClient(timeout=20, follow_redirects=True) as c:
+        login_r = await c.post(f"{ODOO_URL}/web/session/authenticate", json={
+            "jsonrpc": "2.0", "method": "call", "id": 1,
+            "params": {"db": ODOO_DB, "login": ODOO_USERNAME, "password": ODOO_PASSWORD}
+        })
+        return dict(login_r.cookies)
+
+async def odoo_create(model: str, vals: dict, cookies=None) -> dict:
     """Create a record in Odoo. Returns {id} or {error}."""
     try:
-        async with httpx.AsyncClient(timeout=20, follow_redirects=True) as c:
-            login_r = await c.post(f"{ODOO_URL}/web/session/authenticate", json={
-                "jsonrpc": "2.0", "method": "call", "id": 1,
-                "params": {"db": ODOO_DB, "login": ODOO_USERNAME, "password": ODOO_PASSWORD}
-            })
-            cookies = login_r.cookies
+        async with httpx.AsyncClient(timeout=30, follow_redirects=True) as c:
+            if not cookies:
+                login_r = await c.post(f"{ODOO_URL}/web/session/authenticate", json={
+                    "jsonrpc": "2.0", "method": "call", "id": 1,
+                    "params": {"db": ODOO_DB, "login": ODOO_USERNAME, "password": ODOO_PASSWORD}
+                })
+                cookies = dict(login_r.cookies)
             r = await c.post(f"{ODOO_URL}/web/dataset/call_kw", json={
                 "jsonrpc": "2.0", "method": "call", "id": 2,
                 "params": {"model": model, "method": "create", "args": [vals], "kwargs": {}}
@@ -1293,62 +1303,64 @@ async def run_tool(name, inp):
         product_ids = inp.get("product_ids", [])
         if not product_ids:
             return json.dumps({"error": "No product IDs provided"})
-        r = await odoo_query(
-            "product.supplierinfo",
-            [["product_id", "in", product_ids]],
-            ["product_id", "product_tmpl_id", "partner_id", "price", "min_qty", "currency_id"],
-            limit=500, order="sequence asc"
+
+        # Step 1: Get product_tmpl_id for all products
+        prod_r = await odoo_query(
+            "product.product",
+            [["id", "in", product_ids]],
+            ["id", "product_tmpl_id"], limit=500
         )
-        rows = json.loads(r)
-        # Group by product_id
-        by_product = {}
-        for row in rows:
-            pid = row["product_id"][0] if row.get("product_id") else None
-            # Also try template-level match
-            if pid is None:
+        prod_rows = json.loads(prod_r)
+        # Map product_id -> tmpl_id
+        prod_to_tmpl = {}
+        for p in prod_rows:
+            if p.get("product_tmpl_id"):
+                prod_to_tmpl[p["id"]] = p["product_tmpl_id"][0]
+        tmpl_ids = list(set(prod_to_tmpl.values()))
+
+        # Step 2: Query supplierinfo by template ID (most reliable)
+        # Also query by product_id for variant-level overrides
+        sup_rows = []
+        if tmpl_ids:
+            r1 = await odoo_query(
+                "product.supplierinfo",
+                [["product_tmpl_id", "in", tmpl_ids]],
+                ["product_id", "product_tmpl_id", "partner_id", "price", "min_qty", "currency_id"],
+                limit=1000, order="sequence asc"
+            )
+            sup_rows = json.loads(r1)
+
+        # Step 3: Group vendors by product_id
+        # For template-level records, assign to all products with that template
+        tmpl_to_prods = {}
+        for pid, tmpl_id in prod_to_tmpl.items():
+            tmpl_to_prods.setdefault(tmpl_id, []).append(pid)
+
+        by_product = {pid: [] for pid in product_ids}
+        for row in sup_rows:
+            if not row.get("partner_id"):
                 continue
-            if pid not in by_product:
-                by_product[pid] = []
-            by_product[pid].append({
+            vendor_info = {
                 "vendor_id": row["partner_id"][0],
                 "vendor_name": row["partner_id"][1],
                 "price": row.get("price", 0),
                 "min_qty": row.get("min_qty", 0),
                 "currency": row["currency_id"][1] if row.get("currency_id") else "USD"
-            })
-        # For products not found in supplierinfo, try via product_tmpl_id
-        missing_ids = [pid for pid in product_ids if pid not in by_product]
-        if missing_ids:
-            # Get template IDs for missing products
-            tmpl_r = await odoo_query(
-                "product.product",
-                [["id", "in", missing_ids]],
-                ["id", "product_tmpl_id"], limit=100
-            )
-            tmpl_rows = json.loads(tmpl_r)
-            tmpl_map = {r["id"]: r["product_tmpl_id"][0] for r in tmpl_rows if r.get("product_tmpl_id")}
-            if tmpl_map:
-                tmpl_ids = list(set(tmpl_map.values()))
-                tmpl_sup_r = await odoo_query(
-                    "product.supplierinfo",
-                    [["product_tmpl_id", "in", tmpl_ids], ["product_id", "=", False]],
-                    ["product_tmpl_id", "partner_id", "price", "min_qty", "currency_id"],
-                    limit=200
-                )
-                tmpl_sup_rows = json.loads(tmpl_sup_r)
-                for pid, tmpl_id in tmpl_map.items():
-                    vendors = [
-                        {
-                            "vendor_id": r["partner_id"][0],
-                            "vendor_name": r["partner_id"][1],
-                            "price": r.get("price", 0),
-                            "min_qty": r.get("min_qty", 0),
-                            "currency": r["currency_id"][1] if r.get("currency_id") else "USD"
-                        }
-                        for r in tmpl_sup_rows if r["product_tmpl_id"][0] == tmpl_id
-                    ]
-                    if vendors:
-                        by_product[pid] = vendors
+            }
+            tmpl_id = row["product_tmpl_id"][0] if row.get("product_tmpl_id") else None
+            row_product_id = row["product_id"][0] if row.get("product_id") else None
+
+            if row_product_id and row_product_id in by_product:
+                # Variant-specific vendor
+                by_product[row_product_id].append(vendor_info)
+            elif tmpl_id and tmpl_id in tmpl_to_prods:
+                # Template-level vendor — assign to all matching products
+                for pid in tmpl_to_prods[tmpl_id]:
+                    # Avoid duplicates
+                    existing_ids = [v["vendor_id"] for v in by_product[pid]]
+                    if vendor_info["vendor_id"] not in existing_ids:
+                        by_product[pid].append(vendor_info)
+
         result = []
         for pid in product_ids:
             vendors = by_product.get(pid, [])
@@ -1368,26 +1380,44 @@ async def run_tool(name, inp):
         errors = []
         import datetime
         date_planned = (datetime.datetime.now() + datetime.timedelta(days=7)).strftime("%Y-%m-%d %H:%M:%S")
+        now_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        # Get one shared session for all Odoo calls
+        cookies = await odoo_get_session()
+
+        # Pre-fetch all product info in one batch per PO
+        all_product_ids = list({line["product_id"] for po in orders for line in po.get("lines", [])})
+        prod_info = {}
+        if all_product_ids:
+            prod_r = await odoo_query("product.product",
+                [["id","in",all_product_ids]],
+                ["id","name","uom_po_id","uom_id"], limit=500)
+            for p in json.loads(prod_r):
+                uom = p.get("uom_po_id") or p.get("uom_id")
+                prod_info[p["id"]] = {
+                    "name": p["name"],
+                    "uom_id": uom[0] if uom else None
+                }
 
         for po in orders:
             partner_id = po["partner_id"]
 
-            # Verify partner_id is a valid res.partner (supplier)
+            # Verify partner
             partner_check = await odoo_query(
                 "res.partner", [["id","=",partner_id]],
-                ["id","name","supplier_rank"], limit=1)
+                ["id","name"], limit=1)
             partner_data = json.loads(partner_check)
             if not partner_data:
                 errors.append({"vendor": po.get("partner_name"),
-                               "error": f"Partner ID {partner_id} not found in Odoo. Use vendor_id from odoo_get_product_vendors."})
+                               "error": f"Partner ID {partner_id} not found."})
                 continue
 
-            # Create PO header
+            # Create PO header using shared session
             po_result = await odoo_create("purchase.order", {
                 "partner_id": partner_id,
                 "company_id": 1,
-                "date_order": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            })
+                "date_order": now_str,
+            }, cookies=cookies)
             if po_result.get("error"):
                 errors.append({"vendor": po.get("partner_name"), "error": po_result["error"]})
                 continue
@@ -1398,28 +1428,19 @@ async def run_tool(name, inp):
             po_name_data = json.loads(po_name_r)
             po_name = po_name_data[0]["name"] if po_name_data else f"ID:{po_id}"
 
-            # Add lines with all required fields
+            # Add lines using pre-fetched product info and shared session
             line_errors = []
             lines_created = 0
             for line in po.get("lines", []):
-                # Get product details including UOM, name, standard price
-                prod_r = await odoo_query("product.product",
-                    [["id","=",line["product_id"]]],
-                    ["uom_po_id","uom_id","name","description_pickingin"], limit=1)
-                prod_data = json.loads(prod_r)
-                uom_id = None
-                prod_name = line.get("product_name", "")
-                if prod_data:
-                    p = prod_data[0]
-                    uom_id = (p.get("uom_po_id") or p.get("uom_id") or [None, None])[0]
-                    if not prod_name:
-                        prod_name = p.get("name", "")
-
+                pid = line["product_id"]
+                pinfo = prod_info.get(pid, {})
+                prod_name = line.get("product_name") or pinfo.get("name", "")
+                uom_id = pinfo.get("uom_id")
                 price = line.get("price_unit", 0)
 
                 line_vals = {
                     "order_id": po_id,
-                    "product_id": line["product_id"],
+                    "product_id": pid,
                     "product_qty": line["quantity"],
                     "price_unit": price,
                     "name": prod_name,
@@ -1428,11 +1449,10 @@ async def run_tool(name, inp):
                 if uom_id:
                     line_vals["product_uom"] = uom_id
 
-                line_result = await odoo_create("purchase.order.line", line_vals)
+                line_result = await odoo_create("purchase.order.line", line_vals, cookies=cookies)
                 if line_result.get("error"):
-                    # Retry without product_uom if that was the issue
                     line_vals.pop("product_uom", None)
-                    line_result = await odoo_create("purchase.order.line", line_vals)
+                    line_result = await odoo_create("purchase.order.line", line_vals, cookies=cookies)
                     if line_result.get("error"):
                         line_errors.append(f"{prod_name}: {line_result['error']}")
                         continue
@@ -1557,7 +1577,7 @@ async def chat_openai(messages: list, system: str, model: str, tools: list) -> s
         oai_tools = convert_tools_to_openai(tools)
         oai_messages = [{"role": "system", "content": system}] + messages
 
-        async with httpx.AsyncClient(timeout=120) as c:
+        async with httpx.AsyncClient(timeout=300) as c:
             current_messages = list(oai_messages)
             for _ in range(8):
                 payload = {
@@ -1929,7 +1949,7 @@ async def chat(req: ChatRequest, background_tasks: BackgroundTasks):
         reply = await chat_openai(messages, system_prompt, selected_model, allowed_tools)
     else:
         # Anthropic path
-        async with httpx.AsyncClient(timeout=120) as c:
+        async with httpx.AsyncClient(timeout=300) as c:
             current_messages = list(messages)
             for _ in range(8):
                 r = await c.post("https://api.anthropic.com/v1/messages", headers=headers, json={
