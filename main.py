@@ -151,7 +151,7 @@ async def init_db():
 @app.on_event("startup")
 async def startup():
     print("=" * 60)
-    print("CHUMART AI BACKEND — BUILD: vendor-fix-v3 (2026-04-21)")
+    print("CHUMART AI BACKEND — BUILD: vendor-fix-v4 (2026-04-21)")
     print("=" * 60)
     await init_db()
 
@@ -1133,8 +1133,9 @@ TOOLS = [
                                 "items": {
                                     "type": "object",
                                     "properties": {
-                                        "product_id": {"type": "integer", "description": "Product ID — MUST be product_id returned by odoo_search_products_by_sku"},
-                                        "product_name": {"type": "string"},
+                                        "sku": {"type": "string", "description": "SKU (default_code) — STRONGLY PREFERRED. Copy from user's request or odoo_search_products_by_sku. Backend will resolve product_id from this if provided."},
+                                        "product_id": {"type": "integer", "description": "Product ID — MUST be product_id returned by odoo_search_products_by_sku. If unsure, provide sku instead."},
+                                        "product_name": {"type": "string", "description": "Product name from odoo_search_products_by_sku result"},
                                         "quantity": {"type": "number"},
                                         "price_unit": {"type": "number"}
                                     }
@@ -1552,6 +1553,104 @@ async def run_tool(name, inp):
 
         # Get one shared session for all Odoo calls
         cookies = await odoo_get_session()
+
+        # ─────────────────────────────────────────────────────────────
+        # Phase 0: ID rescue — rescue AI-hallucinated product_id / partner_id
+        # by falling back to SKU / product_name / partner_name lookup.
+        # ─────────────────────────────────────────────────────────────
+
+        # (A) Batch-validate all product_ids the AI passed
+        all_pids = list({l.get("product_id") for po in orders
+                         for l in po.get("lines", []) if l.get("product_id")})
+        valid_pids = set()
+        if all_pids:
+            r = json.loads(await odoo_query("product.product",
+                [["id","in",all_pids],["active","=",True]],
+                ["id"], limit=1000, cookies=cookies))
+            if isinstance(r, list):
+                valid_pids = {p["id"] for p in r}
+        print(f"ID RESCUE: {len(valid_pids)}/{len(all_pids)} product_ids valid as-is")
+
+        # (B) For invalid product_ids, try SKU → exact name → prefix name
+        for po in orders:
+            for line in po.get("lines", []):
+                pid = line.get("product_id")
+                if pid and pid in valid_pids:
+                    continue
+                sku = (line.get("sku") or "").strip()
+                pname = (line.get("product_name") or "").strip()
+                resolved = None
+                via = None
+
+                if sku:
+                    r = json.loads(await odoo_query("product.product",
+                        [["default_code","=",sku],["active","=",True]],
+                        ["id"], limit=1, cookies=cookies))
+                    if isinstance(r, list) and r:
+                        resolved, via = r[0]["id"], f"SKU={sku}"
+
+                if not resolved and pname:
+                    r = json.loads(await odoo_query("product.product",
+                        [["name","=",pname],["active","=",True]],
+                        ["id"], limit=1, cookies=cookies))
+                    if isinstance(r, list) and r:
+                        resolved, via = r[0]["id"], "exact name"
+
+                if not resolved and pname:
+                    # Use the first distinctive chunk of name (before first comma)
+                    prefix = pname.split(",")[0].strip()[:60]
+                    if len(prefix) >= 10:
+                        r = json.loads(await odoo_query("product.product",
+                            [["name","ilike",prefix],["active","=",True]],
+                            ["id","name"], limit=3, cookies=cookies))
+                        if isinstance(r, list) and len(r) == 1:
+                            resolved, via = r[0]["id"], f"prefix match '{prefix[:30]}'"
+
+                if resolved:
+                    print(f"ID RESCUE: product_id {pid} → {resolved} (via {via})")
+                    line["product_id"] = resolved
+                    valid_pids.add(resolved)
+                else:
+                    print(f"ID RESCUE FAIL: pid={pid} sku='{sku}' name='{pname[:60]}'")
+
+        # (C) Validate partner_ids; rescue via partner_name
+        all_partner_ids = list({po.get("partner_id") for po in orders if po.get("partner_id")})
+        valid_suppliers = set()
+        if all_partner_ids:
+            r = json.loads(await odoo_query("res.partner",
+                [["id","in",all_partner_ids]],
+                ["id","supplier_rank"], limit=100, cookies=cookies))
+            if isinstance(r, list):
+                valid_suppliers = {p["id"] for p in r
+                                   if (p.get("supplier_rank", 0) or 0) > 0}
+        print(f"ID RESCUE: {len(valid_suppliers)}/{len(all_partner_ids)} partner_ids are valid suppliers")
+
+        for po in orders:
+            pid = po.get("partner_id")
+            if pid in valid_suppliers:
+                continue
+            pname = (po.get("partner_name") or "").strip()
+            if not pname:
+                continue
+            resolved = None
+            # Exact name match first
+            r = json.loads(await odoo_query("res.partner",
+                [["name","=",pname],["supplier_rank",">",0]],
+                ["id","name"], limit=1, cookies=cookies))
+            if isinstance(r, list) and r:
+                resolved = r[0]["id"]
+            # ilike as last resort, only if unique
+            if not resolved:
+                r = json.loads(await odoo_query("res.partner",
+                    [["name","ilike",pname],["supplier_rank",">",0]],
+                    ["id","name"], limit=3, cookies=cookies))
+                if isinstance(r, list) and len(r) == 1:
+                    resolved = r[0]["id"]
+            if resolved:
+                print(f"ID RESCUE: partner_id {pid} → {resolved} (by name '{pname}')")
+                po["partner_id"] = resolved
+            else:
+                print(f"ID RESCUE FAIL: partner_id={pid} name='{pname}'")
 
         # Pre-fetch all product info in one batch per PO
         all_product_ids = list({line["product_id"] for po in orders for line in po.get("lines", [])})
