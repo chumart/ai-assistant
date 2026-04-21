@@ -634,7 +634,7 @@ TOOLS = [
     }
 ]
 
-def get_system_prompt(role: str = "guest", user_name: str = "", user_id: int = 0):
+def get_system_prompt(role: str = "guest", user_name: str = "", user_id: int = 0, free_mode: bool = False):
     today = datetime.date.today().strftime("%Y年%m月%d日")
     perms = ROLE_PERMISSIONS.get(role, ROLE_PERMISSIONS["guest"])
 
@@ -686,8 +686,8 @@ COST/MARGIN RULES (NO ACCESS):
     else:
         inventory_rules = "INVENTORY: No access to inventory data."
 
-    # Admin gets a special free-mode system prompt
-    if role == "admin":
+    # Free mode: admin manually toggled on
+    if role == "admin" and free_mode:
         return f"""今天是{today}。你是 Chumart AI，Chumart 管理员的专属私人助手。
 你支持中英文，用用户的语言回复。
 
@@ -705,7 +705,8 @@ COST/MARGIN RULES (NO ACCESS):
 
 【数据展示】
 - 财务数字用 $ 加千位分隔符
-- 表格数据用 Markdown 表格格式 | col | col |"""
+- 表格数据用 Markdown 表格格式 | col | col |
+- 计算规则：财务汇总永远直接引用工具返回的预计算值，不要自己重新加总"""
 
     return f"""今天是{today}。You are Chumart Assistant, an enterprise AI assistant.
 You support both English and Chinese - reply in the same language the user uses.
@@ -733,7 +734,8 @@ GENERAL ODOO RULES:
 
 When showing financial data: use $ with commas, be precise.
 When helping sales: be specific, cite model numbers, give concrete talking points.
-When showing tabular data: ALWAYS format as markdown tables using | col | col | syntax."""
+When showing tabular data: ALWAYS format as markdown tables using | col | col | syntax.
+CALCULATION RULES: When summing financial data from tool results, always use the exact numbers returned by the tool. Never recalculate totals yourself — use the pre-calculated values from the data (commission_base.net_sales_excl_tax etc). If showing a summary, copy the numbers directly from the tool response."""
 
 
 async def run_tool(name, inp):
@@ -992,6 +994,7 @@ class ChatRequest(BaseModel):
     user_name: str = ""
     user_id: int = 0
     model: str = "claude-sonnet-4-5"
+    free_mode: bool = False
 
 @app.post("/chat")
 async def chat(req: ChatRequest):
@@ -1030,7 +1033,7 @@ async def chat(req: ChatRequest):
         selected_model = req.model
     else:
         selected_model = "claude-sonnet-4-5"
-    system_prompt = get_system_prompt(req.role, req.user_name, req.user_id)
+    system_prompt = get_system_prompt(req.role, req.user_name, req.user_id, req.free_mode)
 
     # Route to OpenAI if selected
     if selected_model in OPENAI_MODELS:
