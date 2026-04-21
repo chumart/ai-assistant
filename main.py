@@ -961,7 +961,7 @@ GENERAL ODOO RULES:
 
 When showing financial data: use $ with commas, be precise.
 When helping sales: be specific, cite model numbers, give concrete talking points.
-When showing tabular data: ALWAYS format as markdown tables using | col | col | syntax.
+Only use markdown tables when data is genuinely tabular (multi-row comparisons, reports, lists with multiple columns). Do NOT use tables for single items, simple answers, or narrative responses.
 CALCULATION RULES: When summing financial data from tool results, always use the exact numbers returned by the tool. Never recalculate totals yourself — use the pre-calculated values from the data (commission_base.net_sales_excl_tax etc). If showing a summary, copy the numbers directly from the tool response.
 
 SCOPE OF KNOWLEDGE (answer freely):
@@ -1036,7 +1036,7 @@ async def run_tool(name, inp):
                     f"📄 **{r['original_name']}**\n"
                     f"   Category: {r['category']} | Chunks: {r['chunk_count']}\n"
                     f"   Description: {r['description'] or 'N/A'}\n"
-                    f"   Download: {r['public_url']}"
+                    f"   [📥 Download File](/docs/signed-url/{r['id']})"
                 )
             return "\n\n".join(results)
         except Exception as e:
@@ -1658,6 +1658,39 @@ async def delete_document(doc_id: str, admin_key: str = ""):
         # Delete metadata
         await conn.execute("DELETE FROM documents WHERE id=$1", doc_id)
         return {"status": "deleted"}
+    finally:
+        await conn.close()
+
+# ─────────────────────────────────────────────
+# Signed URL for secure document downloads
+# ─────────────────────────────────────────────
+
+@app.get("/docs/signed-url/{doc_id}")
+async def get_signed_url(doc_id: str):
+    """Generate a time-limited signed URL for secure document download (1 hour expiry)."""
+    conn = await get_db_conn()
+    if not conn:
+        return {"error": "DB not connected"}
+    try:
+        row = await conn.fetchrow("SELECT r2_key, original_name FROM documents WHERE id=$1", doc_id)
+        if not row:
+            return {"error": "Document not found"}
+
+        import asyncio
+        loop = asyncio.get_event_loop()
+        client = get_r2_client()
+        if not client:
+            return {"error": "Storage not configured"}
+
+        # Generate presigned URL valid for 1 hour
+        signed_url = await loop.run_in_executor(None, lambda: client.generate_presigned_url(
+            'get_object',
+            Params={'Bucket': R2_BUCKET, 'Key': row['r2_key']},
+            ExpiresIn=3600  # 1 hour
+        ))
+        return {"url": signed_url, "filename": row["original_name"], "expires_in": 3600}
+    except Exception as e:
+        return {"error": str(e)}
     finally:
         await conn.close()
 
