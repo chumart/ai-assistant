@@ -1430,62 +1430,81 @@ async def run_tool(name, inp):
             po_name_data = json.loads(po_name_r)
             po_name = po_name_data[0]["name"] if po_name_data else f"ID:{po_id}"
 
-            # Add lines using pre-fetched product info and shared session
+            # Use Odoo's load() method — same as Excel import, triggers onchange automatically
+            # Only need: order_id (as partner_id equivalent), product_id, product_qty
             line_errors = []
             lines_created = 0
+
+            # Validate and collect all product IDs first
+            validated_lines = []
             for line in po.get("lines", []):
                 pid = line["product_id"]
-
-                # Validate: if pid not in prod_info, it might be a template ID — find real product ID
+                # Auto-fix template IDs
                 if pid not in prod_info:
-                    # Try as product.product directly
-                    chk = await odoo_query("product.product", [["id","=",pid]], ["id","name"], limit=1, cookies=cookies)
+                    chk = await odoo_query("product.product",
+                        [["id","=",pid]], ["id","name"], limit=1, cookies=cookies)
                     chk_data = json.loads(chk)
                     if not chk_data:
-                        # Try as product.template ID — get first variant
                         tmpl_chk = await odoo_query("product.product",
                             [["product_tmpl_id","=",pid],["active","=",True]],
                             ["id","name","uom_po_id","uom_id"], limit=1, cookies=cookies)
                         tmpl_data = json.loads(tmpl_chk)
                         if tmpl_data:
-                            real_pid = tmpl_data[0]["id"]
-                            uom = tmpl_data[0].get("uom_po_id") or tmpl_data[0].get("uom_id")
-                            prod_info[real_pid] = {
-                                "name": tmpl_data[0]["name"],
-                                "uom_id": uom[0] if uom else None
-                            }
-                            pid = real_pid
+                            pid = tmpl_data[0]["id"]
+                            prod_info[pid] = {"name": tmpl_data[0]["name"], "uom_id": None}
                         else:
-                            line_errors.append(f"{line.get('product_name','SKU?')}: product ID {line['product_id']} not found")
+                            line_errors.append(f"{line.get('product_name','?')}: product ID {line['product_id']} not found")
                             continue
-                    else:
-                        p = chk_data[0]
-                        prod_info[pid] = {"name": p["name"], "uom_id": None}
+                validated_lines.append({"product_id": pid, "quantity": line["quantity"],
+                                        "price_unit": line.get("price_unit", 0)})
 
-                pinfo = prod_info.get(pid, {})
-                prod_name = line.get("product_name") or pinfo.get("name", "")
-                uom_id = pinfo.get("uom_id")
-                price = line.get("price_unit", 0)
-
-                line_vals = {
-                    "order_id": po_id,
-                    "product_id": pid,
-                    "product_qty": line["quantity"],
-                    "price_unit": price,
-                    "name": prod_name,
-                    "date_planned": date_planned,
-                }
-                if uom_id:
-                    line_vals["product_uom"] = uom_id
-
-                line_result = await odoo_create("purchase.order.line", line_vals, cookies=cookies)
-                if line_result.get("error"):
-                    line_vals.pop("product_uom", None)
-                    line_result = await odoo_create("purchase.order.line", line_vals, cookies=cookies)
-                    if line_result.get("error"):
-                        line_errors.append(f"{prod_name}: {line_result['error']}")
-                        continue
-                lines_created += 1
+            # Batch create all lines using load() — mimics Excel import
+            if validated_lines:
+                try:
+                    async with httpx.AsyncClient(timeout=60, follow_redirects=True) as lc:
+                        fields = ["order_id", "product_id", "product_qty", "price_unit"]
+                        data_rows = [
+                            [str(po_id), str(l["product_id"]), str(l["quantity"]), str(l["price_unit"])]
+                            for l in validated_lines
+                        ]
+                        load_r = await lc.post(f"{ODOO_URL}/web/dataset/call_kw", json={
+                            "jsonrpc": "2.0", "method": "call", "id": 3,
+                            "params": {
+                                "model": "purchase.order.line",
+                                "method": "load",
+                                "args": [fields, data_rows],
+                                "kwargs": {}
+                            }
+                        }, cookies=cookies)
+                        load_data = load_r.json()
+                        result = load_data.get("result", {})
+                        if isinstance(result, dict):
+                            ids = result.get("ids", [])
+                            msgs = result.get("messages", [])
+                            lines_created = len(ids)
+                            for msg in msgs:
+                                if msg.get("type") == "error":
+                                    row_idx = msg.get("rows", {}).get("from", "?")
+                                    line_errors.append(f"Row {row_idx}: {msg.get('message','unknown error')}")
+                        elif load_data.get("error"):
+                            # Fallback: create one by one
+                            for l in validated_lines:
+                                pinfo = prod_info.get(l["product_id"], {})
+                                line_vals = {
+                                    "order_id": po_id,
+                                    "product_id": l["product_id"],
+                                    "product_qty": l["quantity"],
+                                    "price_unit": l["price_unit"],
+                                    "name": pinfo.get("name", ""),
+                                    "date_planned": date_planned,
+                                }
+                                lr = await odoo_create("purchase.order.line", line_vals, cookies=cookies)
+                                if lr.get("error"):
+                                    line_errors.append(f"Product {l['product_id']}: {lr['error']}")
+                                else:
+                                    lines_created += 1
+                except Exception as e:
+                    line_errors.append(f"Batch create error: {str(e)}")
 
             created.append({
                 "po_id": po_id,
