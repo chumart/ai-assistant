@@ -88,6 +88,31 @@ async def init_db():
                 finished_at TIMESTAMP
             )
         """)
+        # Chat history
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS chat_sessions (
+                id         TEXT PRIMARY KEY,
+                uid        INTEGER NOT NULL,
+                username   TEXT,
+                title      TEXT,
+                messages   JSONB DEFAULT '[]',
+                created_at TIMESTAMP DEFAULT NOW(),
+                updated_at TIMESTAMP DEFAULT NOW()
+            )
+        """)
+        await conn.execute("""
+            CREATE INDEX IF NOT EXISTS chat_sessions_uid_idx
+            ON chat_sessions(uid, updated_at DESC)
+        """)
+        # User memory
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS user_memory (
+                uid        INTEGER PRIMARY KEY,
+                username   TEXT,
+                memories   JSONB DEFAULT '[]',
+                updated_at TIMESTAMP DEFAULT NOW()
+            )
+        """)
         print("DB initialized OK")
     except Exception as e:
         print(f"DB init error: {e}")
@@ -634,7 +659,7 @@ TOOLS = [
     }
 ]
 
-def get_system_prompt(role: str = "guest", user_name: str = "", user_id: int = 0, free_mode: bool = False):
+def get_system_prompt(role: str = "guest", user_name: str = "", user_id: int = 0, free_mode: bool = False, memories: list = []):
     today = datetime.date.today().strftime("%Y年%m月%d日")
     perms = ROLE_PERMISSIONS.get(role, ROLE_PERMISSIONS["guest"])
 
@@ -686,10 +711,15 @@ COST/MARGIN RULES (NO ACCESS):
     else:
         inventory_rules = "INVENTORY: No access to inventory data."
 
-    # Free mode: admin manually toggled on
+    # Build memory block
+    memory_block = ""
+    if memories:
+        memory_block = "\n\n【关于你的记忆】\n" + "\n".join(f"- {m}" for m in memories)
+
+    # Free mode: ONLY when admin explicitly toggles it on
     if role == "admin" and free_mode:
         return f"""今天是{today}。你是 Chumart AI，Chumart 管理员的专属私人助手。
-你支持中英文，用用户的语言回复。
+你支持中英文，用用户的语言回复。{memory_block}
 
 【你的能力没有限制】
 - 你既是企业AI助手（连接Odoo ERP和产品知识库），也是管理员的私人助手
@@ -708,10 +738,19 @@ COST/MARGIN RULES (NO ACCESS):
 - 表格数据用 Markdown 表格格式 | col | col |
 - 计算规则：财务汇总永远直接引用工具返回的预计算值，不要自己重新加总"""
 
+    # Admin in work mode = same as finance (full access, enterprise assistant)
+    if role == "admin":
+        role = "finance"  # treat admin as finance for work mode prompt
+
+    # Build memory block for work mode
+    memory_block = ""
+    if memories:
+        memory_block = f"\n\nUSER MEMORY (personalization context):\n" + "\n".join(f"- {m}" for m in memories)
+
     return f"""今天是{today}。You are Chumart Assistant, an enterprise AI assistant.
 You support both English and Chinese - reply in the same language the user uses.
 
-CURRENT USER: {user_name} | ROLE: {perms['label']} | UID: {user_id}
+CURRENT USER: {user_name} | ROLE: {perms['label']} | UID: {user_id}{memory_block}
 
 KNOWLEDGE BASE RULES (MOST IMPORTANT):
 - For ANY product question, spec, price, installation, or sales question: ALWAYS call search_knowledge first
@@ -735,7 +774,15 @@ GENERAL ODOO RULES:
 When showing financial data: use $ with commas, be precise.
 When helping sales: be specific, cite model numbers, give concrete talking points.
 When showing tabular data: ALWAYS format as markdown tables using | col | col | syntax.
-CALCULATION RULES: When summing financial data from tool results, always use the exact numbers returned by the tool. Never recalculate totals yourself — use the pre-calculated values from the data (commission_base.net_sales_excl_tax etc). If showing a summary, copy the numbers directly from the tool response."""
+CALCULATION RULES: When summing financial data from tool results, always use the exact numbers returned by the tool. Never recalculate totals yourself — use the pre-calculated values from the data (commission_base.net_sales_excl_tax etc). If showing a summary, copy the numbers directly from the tool response.
+
+SCOPE OF KNOWLEDGE (answer freely):
+- Our own products: Chumart, Polarman, Flamaster, ChefAsst — specs, pricing, installation, maintenance
+- Competitor/industry products: True, Turbo Air, Beverage-Air, Hoshizaki, Manitowoc, Continental, Victory, Traulsen, Arctic Air, and any other commercial refrigeration or foodservice equipment brands — answer product questions, maintenance, repair, troubleshooting, comparisons
+- General commercial kitchen equipment: installation guides, cleaning procedures, error codes, preventive maintenance, repair tips
+- Food service industry knowledge: NSF standards, health codes, energy efficiency, refrigerant types (R290, R404A, R134a etc.)
+- General business questions related to the industry
+- For questions completely outside work context (personal topics, entertainment etc): politely redirect to work topics"""
 
 
 async def run_tool(name, inp):
@@ -984,6 +1031,139 @@ NON_ADMIN_MODELS = {"claude-sonnet-4-5", "claude-haiku-4-5-20251001"}
 
 OPENAI_MODELS = {"gpt-4o", "gpt-4o-mini", "o3-mini", "o4-mini"}
 
+
+# ─────────────────────────────────────────────
+# Chat session persistence
+# ─────────────────────────────────────────────
+
+async def db_save_session(session_id: str, uid: int, username: str, title: str, messages: list):
+    conn = await get_db_conn()
+    if not conn: return
+    try:
+        await conn.execute("""
+            INSERT INTO chat_sessions (id, uid, username, title, messages, updated_at)
+            VALUES ($1, $2, $3, $4, $5::jsonb, NOW())
+            ON CONFLICT (id) DO UPDATE
+            SET messages = $5::jsonb, title = $4, updated_at = NOW()
+        """, session_id, uid, username, title, json.dumps(messages, ensure_ascii=False))
+    except Exception as e:
+        print(f"Session save error: {e}")
+    finally:
+        await conn.close()
+
+async def db_get_sessions(uid: int) -> list:
+    conn = await get_db_conn()
+    if not conn: return []
+    try:
+        rows = await conn.fetch("""
+            SELECT id, title, messages, updated_at
+            FROM chat_sessions WHERE uid = $1
+            ORDER BY updated_at DESC LIMIT 50
+        """, uid)
+        return [{"id": r["id"], "title": r["title"],
+                 "history": json.loads(r["messages"]),
+                 "updated_at": r["updated_at"].isoformat()} for r in rows]
+    except Exception as e:
+        print(f"Session fetch error: {e}")
+        return []
+    finally:
+        await conn.close()
+
+async def db_delete_session(session_id: str, uid: int):
+    conn = await get_db_conn()
+    if not conn: return
+    try:
+        await conn.execute("DELETE FROM chat_sessions WHERE id=$1 AND uid=$2", session_id, uid)
+    finally:
+        await conn.close()
+
+# ─────────────────────────────────────────────
+# User memory
+# ─────────────────────────────────────────────
+
+async def db_get_memory(uid: int) -> list:
+    conn = await get_db_conn()
+    if not conn: return []
+    try:
+        row = await conn.fetchrow("SELECT memories FROM user_memory WHERE uid=$1", uid)
+        return json.loads(row["memories"]) if row else []
+    except Exception as e:
+        print(f"Memory fetch error: {e}")
+        return []
+    finally:
+        await conn.close()
+
+async def db_save_memory(uid: int, username: str, memories: list):
+    conn = await get_db_conn()
+    if not conn: return
+    try:
+        await conn.execute("""
+            INSERT INTO user_memory (uid, username, memories, updated_at)
+            VALUES ($1, $2, $3::jsonb, NOW())
+            ON CONFLICT (uid) DO UPDATE
+            SET memories = $3::jsonb, updated_at = NOW()
+        """, uid, username, json.dumps(memories, ensure_ascii=False))
+    except Exception as e:
+        print(f"Memory save error: {e}")
+    finally:
+        await conn.close()
+
+async def extract_and_update_memory(uid: int, username: str, conversation: list):
+    """After each conversation, ask Claude to extract memorable facts and update user memory."""
+    if len(conversation) < 2:
+        return
+    try:
+        existing = await db_get_memory(uid)
+        existing_str = "\n".join(f"- {m}" for m in existing) if existing else "None yet."
+
+        # Build a short summary of the conversation for memory extraction
+        conv_summary = []
+        for m in conversation[-10:]:  # last 10 messages
+            role = m.get("role", "")
+            content = m.get("content", "")
+            if isinstance(content, str) and content:
+                conv_summary.append(f"{role}: {content[:300]}")
+
+        if not conv_summary:
+            return
+
+        prompt = f"""You are a memory extractor. Given a conversation, extract ONLY genuinely useful long-term facts about the user that would help personalize future conversations.
+
+EXISTING MEMORIES:
+{existing_str}
+
+RECENT CONVERSATION:
+{chr(10).join(conv_summary)}
+
+Extract new memorable facts (preferences, habits, important context, recurring needs). 
+Rules:
+- Only extract facts that are truly useful for future conversations
+- Do NOT extract temporary/one-time queries
+- Do NOT duplicate existing memories
+- Keep each memory concise (max 20 words)
+- Return a JSON array of strings, or empty array [] if nothing new
+- Max 5 new memories per conversation
+
+Reply ONLY with a JSON array, nothing else. Example: ["Prefers reports in Chinese", "Usually queries March data"]"""
+
+        async with httpx.AsyncClient(timeout=30) as c:
+            r = await c.post("https://api.anthropic.com/v1/messages",
+                headers={"x-api-key": ANTHROPIC_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json"},
+                json={"model": "claude-haiku-4-5-20251001", "max_tokens": 300,
+                      "messages": [{"role": "user", "content": prompt}]})
+            data = r.json()
+            text = "".join(b.get("text","") for b in data.get("content",[]) if b.get("type")=="text")
+            text = text.strip()
+            if text.startswith("["):
+                new_memories = json.loads(text)
+                if new_memories:
+                    # Merge with existing, keep max 30 total
+                    all_memories = existing + new_memories
+                    all_memories = all_memories[-30:]
+                    await db_save_memory(uid, username, all_memories)
+    except Exception as e:
+        print(f"Memory extraction error: {e}")
+
 class ChatRequest(BaseModel):
     message: str
     history: list = []
@@ -995,9 +1175,11 @@ class ChatRequest(BaseModel):
     user_id: int = 0
     model: str = "claude-sonnet-4-5"
     free_mode: bool = False
+    session_id: str = ""
+    session_title: str = ""
 
 @app.post("/chat")
-async def chat(req: ChatRequest):
+async def chat(req: ChatRequest, background_tasks: BackgroundTasks):
     perms = ROLE_PERMISSIONS.get(req.role, ROLE_PERMISSIONS["guest"])
 
     # Filter tools based on permissions
@@ -1006,7 +1188,7 @@ async def chat(req: ChatRequest):
     for tool in TOOLS:
         tname = tool["name"]
         if tname in finance_tools and not perms["can_see_finance"]:
-            continue  # hide finance tools from non-finance roles
+            continue
         allowed_tools.append(tool)
 
     if req.file_id and req.file_id in FILE_CACHE:
@@ -1026,46 +1208,100 @@ async def chat(req: ChatRequest):
     messages = req.history + [{"role": "user", "content": user_message_content}]
     headers = {"x-api-key": ANTHROPIC_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json"}
 
-    # Determine model based on role
+    # Load user memory
+    memories = []
+    if req.user_id:
+        memories = await db_get_memory(req.user_id)
+
+    # Determine model
     if req.role == "admin" and req.model in ALLOWED_MODELS:
         selected_model = req.model
     elif req.role != "admin" and req.model in NON_ADMIN_MODELS:
         selected_model = req.model
     else:
         selected_model = "claude-sonnet-4-5"
-    system_prompt = get_system_prompt(req.role, req.user_name, req.user_id, req.free_mode)
+
+    system_prompt = get_system_prompt(req.role, req.user_name, req.user_id, req.free_mode, memories)
 
     # Route to OpenAI if selected
     if selected_model in OPENAI_MODELS:
         reply = await chat_openai(messages, system_prompt, selected_model, allowed_tools)
-        return {"reply": reply or "Sorry, no response generated."}
+    else:
+        # Anthropic path
+        async with httpx.AsyncClient(timeout=120) as c:
+            current_messages = list(messages)
+            for _ in range(8):
+                r = await c.post("https://api.anthropic.com/v1/messages", headers=headers, json={
+                    "model": selected_model,
+                    "max_tokens": 4096,
+                    "system": system_prompt,
+                    "tools": allowed_tools,
+                    "messages": current_messages
+                })
+                d = r.json()
+                if "error" in d:
+                    return {"reply": f"API error: {d['error'].get('message', str(d['error']))}"}
+                if d.get("stop_reason") == "tool_use":
+                    tool_results = []
+                    for block in d.get("content", []):
+                        if block.get("type") == "tool_use":
+                            result = await run_tool(block["name"], block.get("input", {}))
+                            tool_results.append({"type":"tool_result","tool_use_id":block["id"],"content":result})
+                    current_messages.append({"role": "assistant", "content": d["content"]})
+                    current_messages.append({"role": "user", "content": tool_results})
+                else:
+                    break
+            reply = "".join(b.get("text","") for b in d.get("content",[]) if b.get("type")=="text")
 
-    # Anthropic path
-    async with httpx.AsyncClient(timeout=120) as c:
-        current_messages = list(messages)
-        for _ in range(8):
-            r = await c.post("https://api.anthropic.com/v1/messages", headers=headers, json={
-                "model": selected_model,
-                "max_tokens": 4096,
-                "system": system_prompt,
-                "tools": allowed_tools,
-                "messages": current_messages
-            })
-            d = r.json()
-            if "error" in d:
-                return {"reply": f"API error: {d['error'].get('message', str(d['error']))}"}
-            if d.get("stop_reason") == "tool_use":
-                tool_results = []
-                for block in d.get("content", []):
-                    if block.get("type") == "tool_use":
-                        result = await run_tool(block["name"], block.get("input", {}))
-                        tool_results.append({"type":"tool_result","tool_use_id":block["id"],"content":result})
-                current_messages.append({"role": "assistant", "content": d["content"]})
-                current_messages.append({"role": "user", "content": tool_results})
-            else:
-                break
-        reply = "".join(b.get("text","") for b in d.get("content",[]) if b.get("type")=="text")
-        return {"reply": reply or "Sorry, no response generated."}
+    reply = reply or "Sorry, no response generated."
+
+    # Persist session to DB in background
+    if req.session_id and req.user_id:
+        full_history = req.history + [
+            {"role": "user", "content": req.message},
+            {"role": "assistant", "content": reply}
+        ]
+        background_tasks.add_task(
+            db_save_session,
+            req.session_id, req.user_id, req.user_name,
+            req.session_title or req.message[:20],
+            full_history
+        )
+        # Extract memory every 4 turns
+        if len(full_history) % 8 == 0:
+            background_tasks.add_task(
+                extract_and_update_memory,
+                req.user_id, req.user_name, full_history
+            )
+
+    return {"reply": reply}
+
+# ─────────────────────────────────────────────
+# Session & Memory API
+# ─────────────────────────────────────────────
+
+@app.get("/sessions/{uid}")
+async def get_sessions(uid: int):
+    sessions = await db_get_sessions(uid)
+    return {"sessions": sessions}
+
+@app.delete("/sessions/{session_id}")
+async def delete_session(session_id: str, uid: int):
+    await db_delete_session(session_id, uid)
+    return {"status": "deleted"}
+
+@app.get("/memory/{uid}")
+async def get_memory(uid: int):
+    memories = await db_get_memory(uid)
+    return {"memories": memories}
+
+@app.delete("/memory/{uid}")
+async def clear_memory(uid: int):
+    conn = await get_db_conn()
+    if conn:
+        await conn.execute("DELETE FROM user_memory WHERE uid=$1", uid)
+        await conn.close()
+    return {"status": "cleared"}
 
 # ─────────────────────────────────────────────
 # Health
