@@ -875,3 +875,133 @@ async def health():
     db_ok = conn is not None
     if conn: await conn.close()
     return {"status": "ok", "db": "connected" if db_ok else "disconnected"}
+
+# ─────────────────────────────────────────────
+# Excel Export
+# ─────────────────────────────────────────────
+
+@app.get("/export/commission")
+async def export_commission(year: int, month: int):
+    """Export full commission data as Excel matching SALE COMMISSION NEW template."""
+    from fastapi.responses import StreamingResponse
+    import openpyxl
+    from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+    from io import BytesIO
+
+    last_day = calendar.monthrange(year, month)[1]
+    date_from = f"{year}-{month:02d}-01"
+    date_to   = f"{year}-{month:02d}-{last_day}"
+
+    invoices, err1 = await fetch_moves("out_invoice", date_from, date_to)
+    credits,  err2 = await fetch_credits(date_from, date_to)
+    if err1 or err2:
+        return {"error": err1 or err2}
+
+    def get_salesperson(r):
+        user = r.get("invoice_user_id")
+        if user and isinstance(user, (list, tuple)) and len(user) > 1:
+            return user[1]
+        return "Unassigned"
+
+    def make_row(r, is_credit=False):
+        source = r.get("source_id")
+        sign = -1 if is_credit else 1
+        return {
+            "Invoice Partner Display Name": r.get("invoice_partner_display_name") or (r["partner_id"][1] if r.get("partner_id") else ""),
+            "Invoice/Bill Date":            r.get("invoice_date", ""),
+            "Number":                       r.get("name", ""),
+            "Origin":                       r.get("invoice_origin", "") or "",
+            "Untaxed Amount Signed":        round((r.get("amount_untaxed_signed") or r.get("amount_untaxed", 0) * sign), 2),
+            "Reference":                    r.get("ref", "") or "",
+            "Source":                       (source[1] if source and isinstance(source,(list,tuple)) and len(source)>1 else ""),
+            "Payment Method":               r.get("x_payment_method", "") or "",
+            "Tags":                         "",
+            "Salesperson":                  get_salesperson(r),
+            "Payment Status":               r.get("payment_state", ""),
+        }
+
+    all_rows = (
+        [make_row(r, False) for r in invoices] +
+        [make_row(r, True)  for r in credits]
+    )
+    all_rows.sort(key=lambda x: (x["Salesperson"], x["Invoice/Bill Date"]))
+
+    # Build Excel
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = f"{year}-{month:02d} Commission"
+
+    headers = ["Invoice Partner Display Name","Invoice/Bill Date","Number","Origin",
+               "Untaxed Amount Signed","Reference","Source","Payment Method","Tags",
+               "Salesperson","Payment Status"]
+
+    # Header style
+    header_fill = PatternFill("solid", fgColor="1F4E79")
+    header_font = Font(bold=True, color="FFFFFF", size=11)
+    thin = Side(style="thin", color="CCCCCC")
+    border = Border(left=thin, right=thin, top=thin, bottom=thin)
+
+    for ci, h in enumerate(headers, 1):
+        cell = ws.cell(row=1, column=ci, value=h)
+        cell.fill = header_fill
+        cell.font = header_font
+        cell.alignment = Alignment(horizontal="center", vertical="center")
+        cell.border = border
+
+    ws.row_dimensions[1].height = 20
+
+    # Data rows
+    for ri, row in enumerate(all_rows, 2):
+        for ci, h in enumerate(headers, 1):
+            val = row.get(h, "")
+            cell = ws.cell(row=ri, column=ci, value=val)
+            cell.border = border
+            cell.alignment = Alignment(vertical="center")
+            # Format amount column
+            if h == "Untaxed Amount Signed":
+                cell.number_format = '#,##0.00'
+                cell.alignment = Alignment(horizontal="right", vertical="center")
+            # Alternate row color
+            if ri % 2 == 0:
+                cell.fill = PatternFill("solid", fgColor="F2F7FF")
+
+    # Auto column widths
+    col_widths = [30, 14, 18, 20, 18, 15, 20, 16, 12, 16, 14]
+    for ci, w in enumerate(col_widths, 1):
+        ws.column_dimensions[ws.cell(row=1, column=ci).column_letter].width = w
+
+    ws.freeze_panes = "A2"
+
+    # Summary sheet
+    ws2 = wb.create_sheet("Summary")
+    ws2.append(["Salesperson", "Invoice Count", "Credit Count", "Net Sales (Excl Tax)"])
+    by_person = {}
+    for r in all_rows:
+        sp = r["Salesperson"]
+        if sp not in by_person:
+            by_person[sp] = {"inv": 0, "crd": 0, "net": 0}
+        if r["Payment Status"] in VALID_STATES:
+            amt = r["Untaxed Amount Signed"]
+            if amt < 0:
+                by_person[sp]["crd"] += 1
+            else:
+                by_person[sp]["inv"] += 1
+            by_person[sp]["net"] += amt
+    for sp, v in sorted(by_person.items(), key=lambda x: -x[1]["net"]):
+        ws2.append([sp, v["inv"], v["crd"], round(v["net"], 2)])
+
+    # Style summary header
+    for cell in ws2[1]:
+        cell.font = Font(bold=True, color="FFFFFF")
+        cell.fill = PatternFill("solid", fgColor="1F4E79")
+
+    output = BytesIO()
+    wb.save(output)
+    output.seek(0)
+
+    filename = f"Commission_{year}_{month:02d}.xlsx"
+    return StreamingResponse(
+        output,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f"attachment; filename={filename}"}
+    )
