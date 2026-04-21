@@ -6,6 +6,7 @@ import os
 import json
 import base64
 import calendar
+import uuid
 
 app = FastAPI()
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -19,13 +20,16 @@ ANTHROPIC_KEY = os.getenv("ANTHROPIC_API_KEY", "")
 VALID_STATES  = ["paid", "in_payment", "reversed"]
 CA_STATE_ID   = 13
 
+# In-memory file cache: file_id -> { b64, media_type, name }
+# Files expire after use or on restart — good enough for single-turn uploads
+FILE_CACHE: dict = {}
+
 class ChatRequest(BaseModel):
     message: str
     history: list = []
-    file_content: str = ""
+    file_content: str = ""   # for txt/csv
     file_name: str = ""
-    file_b64: str = ""        # raw base64 for PDF/image direct passing
-    file_media_type: str = "" # e.g. "application/pdf" or "image/jpeg"
+    file_id: str = ""        # key into FILE_CACHE for PDF/image
 
 # ---------- Odoo ----------
 
@@ -432,31 +436,25 @@ async def extract_file(file: UploadFile = File(...)):
         content = await file.read()
         filename = file.filename.lower()
 
-        # Plain text files — decode and return as-is
+        # Plain text — return content directly (small enough)
         if filename.endswith(('.txt', '.md', '.csv')):
             return {"text": content.decode('utf-8', errors='ignore'), "name": file.filename}
 
-        # PDF — return raw base64 so the chat endpoint passes it directly to Claude
+        # PDF
         if filename.endswith('.pdf'):
             b64 = base64.standard_b64encode(content).decode('utf-8')
-            return {
-                "text": "",
-                "name": file.filename,
-                "file_b64": b64,
-                "file_media_type": "application/pdf"
-            }
+            fid = str(uuid.uuid4())
+            FILE_CACHE[fid] = {"b64": b64, "media_type": "application/pdf", "name": file.filename}
+            return {"text": "", "name": file.filename, "file_id": fid}
 
-        # Images — return raw base64
+        # Images
         if filename.endswith(('.png', '.jpg', '.jpeg', '.webp')):
             ext = filename.split('.')[-1].replace('jpg', 'jpeg')
             media_type = f"image/{ext}"
             b64 = base64.standard_b64encode(content).decode('utf-8')
-            return {
-                "text": "",
-                "name": file.filename,
-                "file_b64": b64,
-                "file_media_type": media_type
-            }
+            fid = str(uuid.uuid4())
+            FILE_CACHE[fid] = {"b64": b64, "media_type": media_type, "name": file.filename}
+            return {"text": "", "name": file.filename, "file_id": fid}
 
         # Fallback
         return {"text": content.decode('utf-8', errors='ignore'), "name": file.filename}
@@ -469,24 +467,25 @@ async def extract_file(file: UploadFile = File(...)):
 @app.post("/chat")
 async def chat(req: ChatRequest):
     # Build the user message content
-    # Case 1: PDF or image attached — pass directly to Claude (no text extraction needed)
-    if req.file_b64 and req.file_media_type:
-        doc_type = "document" if req.file_media_type == "application/pdf" else "image"
+    # Case 1: PDF or image — look up from server-side cache by file_id
+    if req.file_id and req.file_id in FILE_CACHE:
+        cached = FILE_CACHE[req.file_id]
+        doc_type = "document" if cached["media_type"] == "application/pdf" else "image"
         user_message_content = [
             {
                 "type": doc_type,
                 "source": {
                     "type": "base64",
-                    "media_type": req.file_media_type,
-                    "data": req.file_b64
+                    "media_type": cached["media_type"],
+                    "data": cached["b64"]
                 }
             },
             {
                 "type": "text",
-                "text": f"[Attached file: {req.file_name}]\n\nUser question: {req.message}"
+                "text": f"[Attached file: {cached['name']}]\n\nUser question: {req.message}"
             }
         ]
-    # Case 2: Plain text file content (txt/csv/md)
+    # Case 2: Plain text file (txt/csv/md)
     elif req.file_content and req.file_name:
         user_message_content = (
             f"=== ATTACHED FILE: {req.file_name} ===\n"
@@ -494,7 +493,7 @@ async def chat(req: ChatRequest):
             f"=== END OF FILE ===\n\n"
             f"User question: {req.message}"
         )
-    # Case 3: Normal text message
+    # Case 3: Normal message
     else:
         user_message_content = req.message
 
