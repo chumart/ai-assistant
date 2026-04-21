@@ -1280,6 +1280,16 @@ WRITE OPERATION RULES:
 BULK PURCHASE ORDER WORKFLOW (when user gives a list of SKUs):
 Follow these steps in order:
 
+STEP 0 — If user provides SKUs WITHOUT quantities:
+  After Step 1 and Step 2 complete, list all found products WITH their SKUs and ask user to fill in quantities.
+  Format it so user only needs to type numbers:
+  "请为以下产品填写采购数量：
+  1. SLTHUT507 — 12" Coiled Spring Utility Tong → 数量: __
+  2. PLMC064CL — 105g Scrubber Ball → 数量: __
+  ..."
+  NEVER show an empty template like "SKU1: qty". Always pre-fill the actual SKUs you already found.
+  If user then replies with just numbers (e.g. "4, 5, 6"), match them to the SKUs in the order you listed.
+
 STEP 1 — Search all products at once:
   Call odoo_search_products_by_sku with all SKUs in one call.
   IMPORTANT: Always use the product_id returned from odoo_search_products_by_sku — never use product_tmpl_id or any other ID.
