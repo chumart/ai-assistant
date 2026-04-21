@@ -769,16 +769,36 @@ async def run_tool(name, inp):
 # OpenAI chat helper
 # ─────────────────────────────────────────────
 
+def fix_schema_for_openai(schema: dict) -> dict:
+    """Recursively fix schema to satisfy OpenAI requirements.
+    - array types must have 'items'
+    - remove unsupported keys like 'default' at top level properties
+    """
+    if not isinstance(schema, dict):
+        return schema
+    result = {}
+    for k, v in schema.items():
+        if isinstance(v, dict):
+            v = fix_schema_for_openai(v)
+        elif isinstance(v, list):
+            v = [fix_schema_for_openai(i) if isinstance(i, dict) else i for i in v]
+        result[k] = v
+    # Ensure array type has items
+    if result.get("type") == "array" and "items" not in result:
+        result["items"] = {}
+    return result
+
 def convert_tools_to_openai(tools: list) -> list:
     """Convert Anthropic tool format to OpenAI function format."""
     oai_tools = []
     for t in tools:
+        fixed_schema = fix_schema_for_openai(t["input_schema"])
         oai_tools.append({
             "type": "function",
             "function": {
                 "name": t["name"],
                 "description": t["description"],
-                "parameters": t["input_schema"]
+                "parameters": fixed_schema
             }
         })
     return oai_tools
