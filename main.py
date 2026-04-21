@@ -16,7 +16,8 @@ ODOO_USERNAME = os.getenv("ODOO_USERNAME", "")
 ODOO_PASSWORD = os.getenv("ODOO_PASSWORD", "")
 ANTHROPIC_KEY = os.getenv("ANTHROPIC_API_KEY", "")
 
-VALID_STATES  = ["paid", "in_payment", "reversed"]  # States counted for commissions
+VALID_STATES  = ["paid", "in_payment", "reversed"]
+CA_STATE_ID   = 13
 
 class ChatRequest(BaseModel):
     message: str
@@ -73,10 +74,9 @@ async def odoo_list_fields(model):
     except Exception as e:
         return json.dumps({"error": str(e)})
 
-# ---------- Core report function ----------
+# ---------- Core helpers ----------
 
 async def fetch_moves(move_type, date_from, date_to):
-    """Fetch invoices or credit notes for a date range"""
     result = await odoo_query(
         "account.move",
         [
@@ -96,7 +96,6 @@ async def fetch_moves(move_type, date_from, date_to):
     return records, None
 
 def summarize_moves(records):
-    """Summarize a list of moves"""
     by_state = {"paid": 0, "in_payment": 0, "reversed": 0}
     total_untaxed = 0
     total_tax = 0
@@ -116,44 +115,39 @@ def summarize_moves(records):
         "total_amount": round(total_amount, 2)
     }
 
-# ---------- Monthly tax report ----------
+# ---------- Reports ----------
 
 @app.get("/report/monthly-tax")
 async def monthly_tax(year: int, month: int):
-    """Monthly tax report: invoice tax - credit note tax"""
     last_day = calendar.monthrange(year, month)[1]
     date_from = f"{year}-{month:02d}-01"
     date_to = f"{year}-{month:02d}-{last_day}"
 
     invoices, err1 = await fetch_moves("out_invoice", date_from, date_to)
     credits, err2 = await fetch_moves("out_refund", date_from, date_to)
-
     if err1 or err2:
         return {"error": err1 or err2}
 
-    inv_summary = summarize_moves(invoices)
-    crd_summary = summarize_moves(credits)
+    inv = summarize_moves(invoices)
+    crd = summarize_moves(credits)
 
     return {
         "period": f"{year}-{month:02d}",
         "report_type": "Monthly Tax Report",
-        "invoices": inv_summary,
-        "credit_notes": crd_summary,
+        "invoices": inv,
+        "credit_notes": crd,
         "net": {
-            "count": inv_summary["count"] - crd_summary["count"],
-            "total_untaxed": round(inv_summary["total_untaxed"] - crd_summary["total_untaxed"], 2),
-            "total_tax": round(inv_summary["total_tax"] - crd_summary["total_tax"], 2),
-            "total_amount": round(inv_summary["total_amount"] - crd_summary["total_amount"], 2)
+            "count": inv["count"] - crd["count"],
+            "total_untaxed": round(inv["total_untaxed"] - crd["total_untaxed"], 2),
+            "total_tax": round(inv["total_tax"] - crd["total_tax"], 2),
+            "total_amount": round(inv["total_amount"] - crd["total_amount"], 2)
         }
     }
 
-# ---------- Quarterly tax report ----------
-
 @app.get("/report/quarterly-tax")
 async def quarterly_tax(year: int, quarter: int):
-    """Quarterly tax report: combines 3 months"""
     if quarter not in [1, 2, 3, 4]:
-        return {"error": "Quarter must be 1, 2, 3, or 4"}
+        return {"error": "Quarter must be 1-4"}
 
     start_month = (quarter - 1) * 3 + 1
     end_month = start_month + 2
@@ -163,21 +157,17 @@ async def quarterly_tax(year: int, quarter: int):
 
     invoices, err1 = await fetch_moves("out_invoice", date_from, date_to)
     credits, err2 = await fetch_moves("out_refund", date_from, date_to)
-
     if err1 or err2:
         return {"error": err1 or err2}
 
-    inv_summary = summarize_moves(invoices)
-    crd_summary = summarize_moves(credits)
+    inv = summarize_moves(invoices)
+    crd = summarize_moves(credits)
 
-    # Also break down by month
     monthly = []
     for m in range(start_month, end_month + 1):
         ld = calendar.monthrange(year, m)[1]
-        df = f"{year}-{m:02d}-01"
-        dt = f"{year}-{m:02d}-{ld}"
-        inv_m, _ = await fetch_moves("out_invoice", df, dt)
-        crd_m, _ = await fetch_moves("out_refund", df, dt)
+        inv_m, _ = await fetch_moves("out_invoice", f"{year}-{m:02d}-01", f"{year}-{m:02d}-{ld}")
+        crd_m, _ = await fetch_moves("out_refund", f"{year}-{m:02d}-01", f"{year}-{m:02d}-{ld}")
         inv_s = summarize_moves(inv_m)
         crd_s = summarize_moves(crd_m)
         monthly.append({
@@ -193,43 +183,36 @@ async def quarterly_tax(year: int, quarter: int):
         "period": f"Q{quarter} {year}",
         "report_type": "Quarterly Tax Report",
         "date_range": f"{date_from} to {date_to}",
-        "invoices": inv_summary,
-        "credit_notes": crd_summary,
+        "invoices": inv,
+        "credit_notes": crd,
         "net": {
-            "total_untaxed": round(inv_summary["total_untaxed"] - crd_summary["total_untaxed"], 2),
-            "total_tax": round(inv_summary["total_tax"] - crd_summary["total_tax"], 2),
-            "total_amount": round(inv_summary["total_amount"] - crd_summary["total_amount"], 2)
+            "total_untaxed": round(inv["total_untaxed"] - crd["total_untaxed"], 2),
+            "total_tax": round(inv["total_tax"] - crd["total_tax"], 2),
+            "total_amount": round(inv["total_amount"] - crd["total_amount"], 2)
         },
         "monthly_breakdown": monthly
     }
 
-# ---------- Monthly sales + commission base ----------
-
 @app.get("/report/monthly-sales")
 async def monthly_sales(year: int, month: int):
-    """Monthly sales report for commission calculation"""
     last_day = calendar.monthrange(year, month)[1]
     date_from = f"{year}-{month:02d}-01"
     date_to = f"{year}-{month:02d}-{last_day}"
 
     invoices, err1 = await fetch_moves("out_invoice", date_from, date_to)
     credits, err2 = await fetch_moves("out_refund", date_from, date_to)
-
     if err1 or err2:
         return {"error": err1 or err2}
 
-    inv_summary = summarize_moves(invoices)
-    crd_summary = summarize_moves(credits)
-
-    net_sales = round(inv_summary["total_untaxed"] - crd_summary["total_untaxed"], 2)
-    net_amount = round(inv_summary["total_amount"] - crd_summary["total_amount"], 2)
+    inv = summarize_moves(invoices)
+    crd = summarize_moves(credits)
 
     return {
         "period": f"{year}-{month:02d}",
         "report_type": "Monthly Sales Report (Commission Base)",
-        "note": "Includes paid, in_payment, reversed status only",
+        "note": "Includes paid, in_payment, reversed only",
         "invoices": {
-            **inv_summary,
+            **inv,
             "detail": [
                 {
                     "name": r["name"],
@@ -244,7 +227,7 @@ async def monthly_sales(year: int, month: int):
             ]
         },
         "credit_notes": {
-            **crd_summary,
+            **crd,
             "detail": [
                 {
                     "name": r["name"],
@@ -259,25 +242,20 @@ async def monthly_sales(year: int, month: int):
             ]
         },
         "commission_base": {
-            "net_sales_excl_tax": net_sales,
-            "net_sales_incl_tax": net_amount,
-            "net_tax": round(inv_summary["total_tax"] - crd_summary["total_tax"], 2),
-            "invoice_count": inv_summary["count"],
-            "credit_note_count": crd_summary["count"]
+            "net_sales_excl_tax": round(inv["total_untaxed"] - crd["total_untaxed"], 2),
+            "net_sales_incl_tax": round(inv["total_amount"] - crd["total_amount"], 2),
+            "net_tax": round(inv["total_tax"] - crd["total_tax"], 2),
+            "invoice_count": inv["count"],
+            "credit_note_count": crd["count"]
         }
     }
 
-# ---------- Missing tax report (CA customers) ----------
-
-CA_STATE_ID = 13  # Odoo res.country.state id for California (US)
-
 @app.get("/report/missing-tax")
-async def missing_tax(date_from: str, date_to: str):
-    """
-    Detect CA customer invoices (bill_state_id = 13) with zero tax.
-    date_from / date_to format: YYYY-MM-DD
-    Uses bill_state_id directly on account.move — single query, no extra lookups.
-    """
+async def missing_tax(year: int, month: int):
+    last_day = calendar.monthrange(year, month)[1]
+    date_from = f"{year}-{month:02d}-01"
+    date_to = f"{year}-{month:02d}-{last_day}"
+
     result = await odoo_query(
         "account.move",
         [
@@ -286,42 +264,34 @@ async def missing_tax(date_from: str, date_to: str):
             ["invoice_date", ">=", date_from],
             ["invoice_date", "<=", date_to],
             ["company_id", "=", 1],
-            ["bill_state_id", "in", [CA_STATE_ID]],
             ["amount_tax", "=", 0],
+            ["partner_shipping_id.state_id", "in", [CA_STATE_ID]]
         ],
-        [
-            "name", "partner_id", "invoice_date",
-            "amount_untaxed", "amount_tax", "amount_total",
-            "payment_state", "bill_state_id",
-        ],
+        ["name", "partner_id", "partner_shipping_id", "invoice_date",
+         "amount_untaxed", "amount_tax", "amount_total", "payment_state"],
         limit=2000
     )
     records = json.loads(result)
     if isinstance(records, dict) and "error" in records:
-        return {"error": records["error"]}
-
-    flagged = [
-        {
-            "invoice": r["name"],
-            "customer": r["partner_id"][1] if r.get("partner_id") else "N/A",
-            "invoice_date": r.get("invoice_date", ""),
-            "amount_untaxed": r.get("amount_untaxed", 0),
-            "amount_tax": 0,
-            "amount_total": r.get("amount_total", 0),
-            "payment_state": r.get("payment_state", ""),
-            "bill_state": r["bill_state_id"][1] if r.get("bill_state_id") else "N/A",
-        }
-        for r in records
-    ]
-
-    flagged.sort(key=lambda x: x["invoice_date"] or "")
+        return records
 
     return {
-        "report_type": "Missing Tax Report (CA Customers)",
-        "date_range": f"{date_from} to {date_to}",
-        "flagged_count": len(flagged),
-        "total_untaxed_exposure": round(sum(f["amount_untaxed"] for f in flagged), 2),
-        "invoices": flagged
+        "period": f"{year}-{month:02d}",
+        "report_type": "Missing Tax Detection - CA Invoices",
+        "total_found": len(records),
+        "note": "These CA invoices have $0 tax - please review",
+        "invoices": [
+            {
+                "name": r["name"],
+                "customer": r["partner_id"][1] if r.get("partner_id") else "N/A",
+                "date": r.get("invoice_date", ""),
+                "amount": r.get("amount_untaxed", 0),
+                "tax": r.get("amount_tax", 0),
+                "total": r.get("amount_total", 0),
+                "payment_state": r.get("payment_state", "")
+            }
+            for r in records
+        ]
     }
 
 # ---------- Tools ----------
@@ -353,36 +323,48 @@ TOOLS = [
     },
     {
         "name": "get_monthly_tax",
-        "description": "Get accurate monthly tax report. Returns invoice tax, credit note tax, and net tax for a specific month. Always use this for monthly tax queries.",
+        "description": "Get accurate monthly tax report. Returns invoice tax, credit note tax, and net tax. Always use for monthly tax queries.",
         "input_schema": {
             "type": "object",
             "properties": {
                 "year": {"type": "integer"},
-                "month": {"type": "integer", "description": "Month 1-12"}
+                "month": {"type": "integer"}
             },
             "required": ["year", "month"]
         }
     },
     {
         "name": "get_quarterly_tax",
-        "description": "Get accurate quarterly tax report with monthly breakdown. Always use this for quarterly tax queries.",
+        "description": "Get accurate quarterly tax report with monthly breakdown. Always use for quarterly tax queries.",
         "input_schema": {
             "type": "object",
             "properties": {
                 "year": {"type": "integer"},
-                "quarter": {"type": "integer", "description": "Quarter 1-4"}
+                "quarter": {"type": "integer"}
             },
             "required": ["year", "quarter"]
         }
     },
     {
         "name": "get_monthly_sales",
-        "description": "Get monthly sales report for commission calculation. Returns invoice and credit note details with net sales figures. Includes paid, in_payment, and reversed states only. Always use this for sales commission queries.",
+        "description": "Get monthly sales report for commission calculation. Includes paid, in_payment, reversed invoices and credit notes. Always use for sales/commission queries.",
         "input_schema": {
             "type": "object",
             "properties": {
                 "year": {"type": "integer"},
-                "month": {"type": "integer", "description": "Month 1-12"}
+                "month": {"type": "integer"}
+            },
+            "required": ["year", "month"]
+        }
+    },
+    {
+        "name": "get_missing_tax",
+        "description": "Find CA invoices with zero tax amount. Use when asked about missing tax, invoices without tax, or CA orders that should have tax.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "year": {"type": "integer"},
+                "month": {"type": "integer"}
             },
             "required": ["year", "month"]
         }
@@ -393,13 +375,14 @@ SYSTEM = """You are Chumart Assistant, an enterprise AI assistant connected to O
 You support both English and Chinese - reply in the same language the user uses.
 
 FINANCIAL REPORT RULES (always use dedicated tools for accuracy):
-- Monthly tax questions -> use get_monthly_tax
-- Quarterly tax questions -> use get_quarterly_tax
-- Monthly sales / commission base -> use get_monthly_sales
+- Monthly tax -> get_monthly_tax
+- Quarterly tax -> get_quarterly_tax
+- Monthly sales / commission base -> get_monthly_sales
+- CA invoices missing tax -> get_missing_tax
 - These tools are ALWAYS more accurate than odoo_search for financial reports
 
 GENERAL QUERY RULES:
-- ABSOLUTE RULE: Always include date filters when user mentions a time period
+- Always include date filters when user mentions a time period
 - For date ranges: use >= start and <= end
 - Invoice types: out_invoice=customer invoice, out_refund=credit note
 - Always filter by state=posted unless asked otherwise
@@ -433,6 +416,9 @@ async def run_tool(name, inp):
         return json.dumps(result, ensure_ascii=False)
     if name == "get_monthly_sales":
         result = await monthly_sales(inp["year"], inp["month"])
+        return json.dumps(result, ensure_ascii=False)
+    if name == "get_missing_tax":
+        result = await missing_tax(inp["year"], inp["month"])
         return json.dumps(result, ensure_ascii=False)
     return "Unknown tool"
 
