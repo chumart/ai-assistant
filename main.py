@@ -151,7 +151,7 @@ async def init_db():
 @app.on_event("startup")
 async def startup():
     print("=" * 60)
-    print("CHUMART AI BACKEND — BUILD: vendor-fix-v2 (2026-04-21)")
+    print("CHUMART AI BACKEND — BUILD: vendor-fix-v3 (2026-04-21)")
     print("=" * 60)
     await init_db()
 
@@ -597,15 +597,34 @@ async def resolve_po_vendor(suggested_partner_id, line_product_ids: list, cookie
             is_valid_supplier = (chk_data[0].get("supplier_rank", 0) or 0) > 0
 
     # (b) Map products → templates
+    # (b) Map products → templates. AI sometimes passes product_tmpl_id or
+    # even invalid IDs — also query by product_tmpl_id as a fallback so we
+    # can resolve vendors across as many of the PO's products as possible.
     prod_r = await odoo_query("product.product",
         [["id","in",line_product_ids]],
         ["id","product_tmpl_id"], limit=500, cookies=cookies)
     prod_rows = json.loads(prod_r)
     if not isinstance(prod_rows, list):
-        print(f"RESOLVE_VENDOR: product query failed: {prod_rows}")
-        return final_partner_id, final_vendor_name, fix_note
-    tmpl_ids = list({p["product_tmpl_id"][0] for p in prod_rows
-                     if p.get("product_tmpl_id")})
+        prod_rows = []
+    tmpl_ids = {p["product_tmpl_id"][0] for p in prod_rows
+                if p.get("product_tmpl_id")}
+    found_pids = {p["id"] for p in prod_rows}
+
+    # Treat any IDs that weren't valid product.product records as possible
+    # product.template IDs and verify them
+    unknown_ids = [pid for pid in line_product_ids if pid not in found_pids]
+    if unknown_ids:
+        tmpl_r = await odoo_query("product.template",
+            [["id","in",unknown_ids]],
+            ["id"], limit=500, cookies=cookies)
+        tmpl_rows = json.loads(tmpl_r)
+        if isinstance(tmpl_rows, list):
+            for t in tmpl_rows:
+                tmpl_ids.add(t["id"])
+            print(f"RESOLVE_VENDOR: {len(tmpl_rows)}/{len(unknown_ids)} "
+                  f"unknown IDs were actually template IDs (AI error)")
+
+    tmpl_ids = list(tmpl_ids)
     if not tmpl_ids:
         print(f"RESOLVE_VENDOR: no templates resolved from products {line_product_ids}")
         return final_partner_id, final_vendor_name, fix_note
@@ -1098,7 +1117,7 @@ TOOLS = [
     },
     {
         "name": "odoo_create_bulk_po",
-        "description": "Create multiple purchase orders at once, one per vendor. Only call after user has confirmed the full plan. Each PO has one vendor and multiple product lines.",
+        "description": "Create multiple purchase orders at once, one per vendor. Only call after user has confirmed the full plan. Each PO has one vendor and multiple product lines. CRITICAL: partner_id MUST come from odoo_get_product_vendors' vendor_id field (never user ID, never partner_name string). product_id MUST come from odoo_search_products_by_sku's product_id field (never invented, never product_tmpl_id).",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -1107,14 +1126,14 @@ TOOLS = [
                     "items": {
                         "type": "object",
                         "properties": {
-                            "partner_id": {"type": "integer", "description": "Vendor partner ID"},
+                            "partner_id": {"type": "integer", "description": "Vendor partner ID — MUST be vendor_id from odoo_get_product_vendors"},
                             "partner_name": {"type": "string"},
                             "lines": {
                                 "type": "array",
                                 "items": {
                                     "type": "object",
                                     "properties": {
-                                        "product_id": {"type": "integer"},
+                                        "product_id": {"type": "integer", "description": "Product ID — MUST be product_id returned by odoo_search_products_by_sku"},
                                         "product_name": {"type": "string"},
                                         "quantity": {"type": "number"},
                                         "price_unit": {"type": "number"}
@@ -1566,10 +1585,12 @@ async def run_tool(name, inp):
                 ["id","name"], limit=1, cookies=cookies)
             partner_data = json.loads(partner_check)
             if not partner_data:
-                errors.append({"vendor": po.get("partner_name"),
+                errors.append({"vendor": final_vendor_name or po.get("partner_name"),
                                "error": f"Partner ID {partner_id} not found."})
                 continue
-            actual_vendor_name = partner_data[0]["name"]
+            # Final authoritative name (covers edge cases where resolve_po_vendor didn't set it)
+            if not final_vendor_name:
+                final_vendor_name = partner_data[0]["name"]
 
             # Create PO header with verified vendor
             po_result = await odoo_create("purchase.order", {
