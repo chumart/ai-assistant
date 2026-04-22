@@ -334,7 +334,7 @@ async def process_document_to_kb(doc_id: str, doc_name: str, text: str, category
                     (site_name, site_url, page_url, page_title, chunk_text, embedding, category)
                     VALUES ($1, $2, $3, $4, $5, $6::vector, $7)
                 """, doc_name, f"doc:{doc_id}", f"doc:{doc_id}", doc_name, chunk,
-                    json.dumps(embedding), f"doc_{category}")
+                    json.dumps(embedding), category)
                 count += 1
 
         # Update chunk count
@@ -492,16 +492,16 @@ async def search_knowledge(query: str, top_k: int = 5, category: str = None) -> 
 
         if category:
             rows = await conn.fetch("""
-                SELECT site_name, page_url, page_title, chunk_text,
+                SELECT site_name, site_url, page_url, page_title, chunk_text,
                        1 - (embedding <=> $1::vector) AS similarity
                 FROM knowledge_chunks
-                WHERE category = $2
+                WHERE category = $2 OR category = $3
                 ORDER BY embedding <=> $1::vector
-                LIMIT $3
-            """, json.dumps(embedding), category, top_k)
+                LIMIT $4
+            """, json.dumps(embedding), category, f"doc_{category}", top_k)
         else:
             rows = await conn.fetch("""
-                SELECT site_name, page_url, page_title, chunk_text,
+                SELECT site_name, site_url, page_url, page_title, chunk_text,
                        1 - (embedding <=> $1::vector) AS similarity
                 FROM knowledge_chunks
                 ORDER BY embedding <=> $1::vector
