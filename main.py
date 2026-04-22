@@ -1887,21 +1887,27 @@ async def run_tool(name, inp, context=None):
 
         # (C) Validate partner_ids; rescue via partner_name
         all_partner_ids = list({po.get("partner_id") for po in orders if po.get("partner_id")})
-        valid_suppliers = set()
+        valid_suppliers = {}  # id -> actual name
         if all_partner_ids:
             r = json.loads(await odoo_query("res.partner",
                 [["id","in",all_partner_ids]],
-                ["id","supplier_rank"], limit=100, cookies=cookies))
+                ["id","name","supplier_rank"], limit=100, cookies=cookies))
             if isinstance(r, list):
-                valid_suppliers = {p["id"] for p in r
+                valid_suppliers = {p["id"]: p.get("name", "") for p in r
                                    if (p.get("supplier_rank", 0) or 0) > 0}
         print(f"ID RESCUE: {len(valid_suppliers)}/{len(all_partner_ids)} partner_ids are valid suppliers")
 
         for po in orders:
             pid = po.get("partner_id")
-            if pid in valid_suppliers:
-                continue
             pname = (po.get("partner_name") or "").strip()
+            # Check: is pid a valid supplier AND does its actual name match what AI claimed?
+            if pid in valid_suppliers:
+                actual_name = valid_suppliers[pid]
+                # If names roughly match, keep it
+                if pname and pname.lower() not in actual_name.lower() and actual_name.lower() not in pname.lower():
+                    print(f"ID RESCUE: partner_id {pid} is supplier '{actual_name}' but AI said '{pname}' — name mismatch, resolving by name")
+                else:
+                    continue  # Valid supplier + name matches → keep
             if not pname:
                 continue
             resolved = None
