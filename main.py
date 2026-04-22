@@ -2501,6 +2501,36 @@ Reply ONLY with a JSON array, nothing else. Example: ["Prefers reports in Chines
     except Exception as e:
         print(f"Memory extraction error: {e}")
 
+def rebuild_history_with_files(history: list) -> list:
+    """Rebuild history messages, re-attaching files from FILE_CACHE where file_id is present.
+    This allows Claude to 'see' images/PDFs from earlier in the conversation."""
+    rebuilt = []
+    for msg in history:
+        role = msg.get("role", "user")
+        content = msg.get("content", "")
+        fid = msg.get("file_id", "")
+        fname = msg.get("file_name", "")
+        fcontent = msg.get("file_content", "")
+
+        if role == "user" and fid and fid in FILE_CACHE:
+            cached = FILE_CACHE[fid]
+            doc_type = "document" if cached["media_type"] == "application/pdf" else "image"
+            rebuilt.append({
+                "role": "user",
+                "content": [
+                    {"type": doc_type, "source": {"type": "base64", "media_type": cached["media_type"], "data": cached["b64"]}},
+                    {"type": "text", "text": f"[Attached file: {cached['name']}]\n\n{content}"}
+                ]
+            })
+        elif role == "user" and fcontent and fname:
+            rebuilt.append({
+                "role": "user",
+                "content": f"=== ATTACHED FILE: {fname} ===\n{fcontent}\n=== END ===\n\n{content}"
+            })
+        else:
+            rebuilt.append({"role": role, "content": content})
+    return rebuilt
+
 class ChatRequest(BaseModel):
     message: str
     history: list = []
@@ -2558,10 +2588,8 @@ async def chat(req: ChatRequest, background_tasks: BackgroundTasks):
         user_message_content = req.message
         openai_image_content = None
 
-    messages = req.history + [{"role": "user", "content": user_message_content}]
+    messages = rebuild_history_with_files(req.history) + [{"role": "user", "content": user_message_content}]
     headers = {"x-api-key": ANTHROPIC_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json"}
-
-    # Load user memory
     memories = []
     if req.user_id:
         memories = await db_get_memory(req.user_id)
@@ -2686,7 +2714,7 @@ async def chat_stream(req: ChatRequest, background_tasks: BackgroundTasks):
     else:
         user_message_content = req.message
 
-    messages = req.history + [{"role": "user", "content": user_message_content}]
+    messages = rebuild_history_with_files(req.history) + [{"role": "user", "content": user_message_content}]
 
     # Load memory & build system prompt
     memories = []
