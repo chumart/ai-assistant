@@ -827,28 +827,38 @@ async def odoo_call_method(model: str, record_id: int, method: str) -> dict:
 # ─────────────────────────────────────────────
 
 async def odoo_query(model, domain, fields, limit=2000, order="id desc", cookies=None):
-    try:
-        async with httpx.AsyncClient(timeout=20, follow_redirects=True) as c:
-            if not cookies:
-                login_r = await c.post(f"{ODOO_URL}/web/session/authenticate", json={
-                    "jsonrpc": "2.0", "method": "call", "id": 1,
-                    "params": {"db": ODOO_DB, "login": ODOO_USERNAME, "password": ODOO_PASSWORD}
-                })
-                cookies = dict(login_r.cookies)
-            r = await c.post(f"{ODOO_URL}/web/dataset/call_kw", json={
-                "jsonrpc": "2.0", "method": "call", "id": 2,
-                "params": {
-                    "model": model, "method": "search_read",
-                    "args": [domain],
-                    "kwargs": {"fields": fields, "limit": limit, "order": order}
-                }
-            }, cookies=cookies)
-            data = r.json()
-            if data.get("error"):
-                return json.dumps({"error": data["error"].get("message", str(data["error"]))})
-            return json.dumps(data.get("result", []), default=str, ensure_ascii=False)
-    except Exception as e:
-        return json.dumps({"error": str(e)})
+    last_error = None
+    for attempt in range(3):  # Auto-retry up to 3 times
+        try:
+            async with httpx.AsyncClient(timeout=20, follow_redirects=True) as c:
+                if not cookies or attempt > 0:  # Re-login on retry
+                    login_r = await c.post(f"{ODOO_URL}/web/session/authenticate", json={
+                        "jsonrpc": "2.0", "method": "call", "id": 1,
+                        "params": {"db": ODOO_DB, "login": ODOO_USERNAME, "password": ODOO_PASSWORD}
+                    })
+                    cookies = dict(login_r.cookies)
+                r = await c.post(f"{ODOO_URL}/web/dataset/call_kw", json={
+                    "jsonrpc": "2.0", "method": "call", "id": 2,
+                    "params": {
+                        "model": model, "method": "search_read",
+                        "args": [domain],
+                        "kwargs": {"fields": fields, "limit": limit, "order": order}
+                    }
+                }, cookies=cookies)
+                data = r.json()
+                if data.get("error"):
+                    last_error = data["error"].get("message", str(data["error"]))
+                    if attempt < 2:
+                        await asyncio.sleep(1)
+                        continue
+                    return json.dumps({"error": last_error})
+                return json.dumps(data.get("result", []), default=str, ensure_ascii=False)
+        except Exception as e:
+            last_error = str(e)
+            if attempt < 2:
+                await asyncio.sleep(1)
+            continue
+    return json.dumps({"error": f"Failed after 3 attempts: {last_error}"})
 
 async def odoo_list_fields(model):
     try:
