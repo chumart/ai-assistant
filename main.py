@@ -333,6 +333,20 @@ async def process_document_to_kb(doc_id: str, doc_name: str, text: str, category
 
         chunks = chunk_text(text, chunk_size=600, overlap=100)
         count = 0
+
+        # First chunk: index chunk with doc name + description + first content
+        # This ensures searching by filename or category always finds this doc
+        index_chunk = f"Document: {doc_name}\nCategory: {category}\n\n{text[:800]}"
+        index_embedding = await get_embedding(index_chunk)
+        if index_embedding:
+            await conn.execute("""
+                INSERT INTO knowledge_chunks
+                (site_name, site_url, page_url, page_title, chunk_text, embedding, category)
+                VALUES ($1, $2, $3, $4, $5, $6::vector, $7)
+            """, doc_name, f"doc:{doc_id}", f"doc:{doc_id}", doc_name,
+                index_chunk, json.dumps(index_embedding), category)
+            count += 1
+
         for chunk in chunks:
             if not chunk.strip():
                 continue
@@ -1065,6 +1079,11 @@ TOOLS = [
         "input_schema": {"type":"object","properties":{"query":{"type":"string","description":"Search query — use specific terms like model number, symptom, part name, procedure"},"top_k":{"type":"integer","default":10,"description":"Number of chunks to retrieve, default 10, max 20"},"doc_name":{"type":"string","description":"Optional: filter by document name (partial match). E.g. 'Gas Fryer' or 'FLM-F3' or 'warranty'"},"category":{"type":"string","description":"Optional: service_manual, product_manual, spec_sheet, employee_handbook, after_sales, warranty, general"}},"required":["query"]}
     },
     {
+        "name": "list_documents",
+        "description": "List all uploaded documents in the knowledge base with their names, categories, and descriptions. Use this when: (1) user asks what documents/manuals are available, (2) search_knowledge returns no results and you want to check if a relevant document exists under a different name, (3) user asks for a file download. Returns document names and download links.",
+        "input_schema": {"type":"object","properties":{"category":{"type":"string","description":"Optional filter: service_manual, product_manual, spec_sheet, employee_handbook, after_sales, warranty, general"}},"required":[]}
+    },
+    {
         "name": "web_search",
         "description": "Search the live internet for up-to-date information. Use when: (1) user explicitly asks to search online/Google it/看网上, (2) question needs current info not in knowledge base (news, recent prices, competitor info, latest model releases), (3) you don't have enough info from search_knowledge to answer troubleshooting/repair questions. Prefer search_knowledge FIRST for Chumart/Polarman/Flamaster/ChefAsst brand questions. Returns structured results optimized for LLMs.",
         "input_schema": {"type":"object","properties":{"query":{"type":"string","description":"Search query in natural language (English recommended for better results)"},"max_results":{"type":"integer","default":5,"description":"Number of results, 3-10"}},"required":["query"]}
@@ -1615,7 +1634,46 @@ async def run_tool(name, inp, context=None):
         return json.dumps(await monthly_sales(inp["year"], inp["month"]), ensure_ascii=False)
     if name == "get_missing_tax":
         return json.dumps(await missing_tax(inp["year"], inp["month"]), ensure_ascii=False)
-    if name == "search_knowledge":
+    if name == "list_documents":
+        category_filter = inp.get("category", "")
+        conn = await get_db_conn()
+        if not conn:
+            return "Database not available."
+        try:
+            if category_filter:
+                rows = await conn.fetch("""
+                    SELECT original_name, category, description, public_url, chunk_count, r2_key
+                    FROM documents
+                    WHERE category = $1
+                    ORDER BY created_at DESC
+                """, category_filter)
+            else:
+                rows = await conn.fetch("""
+                    SELECT original_name, category, description, public_url, chunk_count, r2_key
+                    FROM documents
+                    ORDER BY category, created_at DESC
+                """)
+        finally:
+            await conn.close()
+
+        if not rows:
+            return "No documents found in the knowledge base."
+
+        lines = ["Available documents in knowledge base:\n"]
+        current_cat = None
+        for r in rows:
+            cat = r["category"]
+            if cat != current_cat:
+                current_cat = cat
+                lines.append(f"\n[{cat.upper().replace('_',' ')}]")
+            name_str = r["original_name"]
+            desc = r["description"] or ""
+            chunks = r["chunk_count"] or 0
+            url = r["public_url"] or ""
+            lines.append(f"• {name_str}" + (f" — {desc}" if desc else "") + f" ({chunks} chunks)" + (f"\n  Download: {url}" if url else ""))
+
+        return "\n".join(lines)
+
         query = inp.get("query", "")
         top_k = min(inp.get("top_k", 10), 20)  # default 10, max 20
         doc_name = inp.get("doc_name", "")  # optional: filter by document name (partial match)
