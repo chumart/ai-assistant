@@ -151,7 +151,7 @@ async def init_db():
 @app.on_event("startup")
 async def startup():
     print("=" * 60)
-    print("CHUMART AI BACKEND — BUILD: stream-v7 (2026-04-21)")
+    print("CHUMART AI BACKEND — BUILD: haiku-default-v8 (2026-04-22)")
     print("=" * 60)
     await init_db()
 
@@ -1534,7 +1534,9 @@ Examples of correct priority:
 Include rough cost hint for common fixes where relevant ("$10-30 零件" / "$200+ 压缩机更换")."""
 
 
-async def run_tool(name, inp):
+async def run_tool(name, inp, context=None):
+    """context = dict with user info: {uid, username, role}"""
+    ctx = context or {}
     try:
         print(f"[TOOL] {name} input={json.dumps(inp, ensure_ascii=False, default=str)[:500]}")
     except Exception:
@@ -1962,11 +1964,16 @@ async def run_tool(name, inp):
                 final_vendor_name = partner_data[0]["name"]
 
             # Create PO header with verified vendor
-            po_result = await odoo_create("purchase.order", {
+            po_vals = {
                 "partner_id": partner_id,
                 "company_id": 1,
                 "date_order": now_str,
-            }, cookies=cookies)
+            }
+            # Set buyer (user_id) to the logged-in user if provided
+            ctx_uid = ctx.get("uid")
+            if ctx_uid and ctx_uid > 0:
+                po_vals["user_id"] = ctx_uid
+            po_result = await odoo_create("purchase.order", po_vals, cookies=cookies)
             if po_result.get("error"):
                 errors.append({"vendor": po.get("partner_name"), "error": po_result["error"]})
                 continue
@@ -2160,7 +2167,7 @@ def convert_tools_to_openai(tools: list) -> list:
         })
     return oai_tools
 
-async def chat_openai(messages: list, system: str, model: str, tools: list) -> str:
+async def chat_openai(messages: list, system: str, model: str, tools: list, context: dict = None) -> str:
     """Call OpenAI Chat Completions API with full tool use support."""
     openai_key = os.getenv("OPENAI_API_KEY", "")
     if not openai_key:
@@ -2207,7 +2214,7 @@ async def chat_openai(messages: list, system: str, model: str, tools: list) -> s
                             fn_args = json.loads(tc["function"]["arguments"])
                         except Exception:
                             fn_args = {}
-                        result = await run_tool(fn_name, fn_args)
+                        result = await run_tool(fn_name, fn_args, context=context)
                         current_messages.append({
                             "role": "tool",
                             "tool_call_id": tc["id"],
@@ -2488,7 +2495,7 @@ class ChatRequest(BaseModel):
     role: str = "guest"
     user_name: str = ""
     user_id: int = 0
-    model: str = "claude-sonnet-4-5"
+    model: str = "claude-haiku-4-5-20251001"
     free_mode: bool = False
     session_id: str = ""
     session_title: str = ""
@@ -2550,9 +2557,12 @@ async def chat(req: ChatRequest, background_tasks: BackgroundTasks):
     elif req.role != "admin" and req.model in NON_ADMIN_MODELS:
         selected_model = req.model
     else:
-        selected_model = "claude-sonnet-4-5"
+        selected_model = "claude-haiku-4-5-20251001"
 
     system_prompt = get_system_prompt(req.role, req.user_name, req.user_id, req.free_mode, memories)
+
+    # Context passed to tools (for buyer attribution, etc.)
+    tool_context = {"uid": req.user_id, "username": req.user_name, "role": req.role}
 
     # Route to OpenAI if selected
     if selected_model in OPENAI_MODELS:
@@ -2561,7 +2571,7 @@ async def chat(req: ChatRequest, background_tasks: BackgroundTasks):
             oai_messages = req.history + [{"role": "user", "content": openai_image_content}]
         else:
             oai_messages = messages
-        reply = await chat_openai(oai_messages, system_prompt, selected_model, allowed_tools)
+        reply = await chat_openai(oai_messages, system_prompt, selected_model, allowed_tools, context=tool_context)
     else:
         # Anthropic path
         async with httpx.AsyncClient(timeout=300) as c:
@@ -2581,7 +2591,7 @@ async def chat(req: ChatRequest, background_tasks: BackgroundTasks):
                     tool_results = []
                     for block in d.get("content", []):
                         if block.get("type") == "tool_use":
-                            result = await run_tool(block["name"], block.get("input", {}))
+                            result = await run_tool(block["name"], block.get("input", {}), context=tool_context)
                             tool_results.append({"type":"tool_result","tool_use_id":block["id"],"content":result})
                     current_messages.append({"role": "assistant", "content": d["content"]})
                     current_messages.append({"role": "user", "content": tool_results})
@@ -2674,7 +2684,10 @@ async def chat_stream(req: ChatRequest, background_tasks: BackgroundTasks):
     elif req.role != "admin" and req.model in NON_ADMIN_MODELS:
         selected_model = req.model
     else:
-        selected_model = "claude-sonnet-4-5"
+        selected_model = "claude-haiku-4-5-20251001"
+
+    # Context passed to tools (for buyer attribution on PO creation, etc.)
+    tool_context = {"uid": req.user_id, "username": req.user_name, "role": req.role}
 
     if selected_model in OPENAI_MODELS:
         # OpenAI streaming path with tool-call support
@@ -2803,7 +2816,7 @@ async def chat_stream(req: ChatRequest, background_tasks: BackgroundTasks):
                                 fn_args = json.loads(tc["function"]["arguments"])
                             except Exception:
                                 fn_args = {}
-                            result = await run_tool(fn_name, fn_args)
+                            result = await run_tool(fn_name, fn_args, context=tool_context)
                             yield f"data: {json.dumps({'type': 'tool_result', 'name': fn_name})}\n\n"
                             current_messages.append({
                                 "role": "tool",
@@ -2963,7 +2976,7 @@ async def chat_stream(req: ChatRequest, background_tasks: BackgroundTasks):
                     tool_results = []
                     for block in content_blocks:
                         if block.get("type") == "tool_use":
-                            result = await run_tool(block["name"], block.get("input", {}))
+                            result = await run_tool(block["name"], block.get("input", {}), context=tool_context)
                             yield f"data: {json.dumps({'type': 'tool_result', 'name': block['name']})}\n\n"
                             tool_results.append({
                                 "type": "tool_result",
