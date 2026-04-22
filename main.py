@@ -151,7 +151,7 @@ async def init_db():
 @app.on_event("startup")
 async def startup():
     print("=" * 60)
-    print("CHUMART AI BACKEND — BUILD: vendor-fix-v4 (2026-04-21)")
+    print("CHUMART AI BACKEND — BUILD: stream-v6 (2026-04-21)")
     print("=" * 60)
     await init_db()
 
@@ -1037,6 +1037,11 @@ TOOLS = [
         "input_schema": {"type":"object","properties":{"query":{"type":"string","description":"Search query"},"top_k":{"type":"integer","default":6,"description":"Number of results"}},"required":["query"]}
     },
     {
+        "name": "web_search",
+        "description": "Search the live internet for up-to-date information. Use when: (1) user explicitly asks to search online/Google it/看网上, (2) question needs current info not in knowledge base (news, recent prices, competitor info, latest model releases), (3) you don't have enough info from search_knowledge to answer troubleshooting/repair questions. Prefer search_knowledge FIRST for Chumart/Polarman/Flamaster/ChefAsst brand questions. Returns structured results optimized for LLMs.",
+        "input_schema": {"type":"object","properties":{"query":{"type":"string","description":"Search query in natural language (English recommended for better results)"},"max_results":{"type":"integer","default":5,"description":"Number of results, 3-10"}},"required":["query"]}
+    },
+    {
         "name": "search_documents",
         "description": "Search for specific internal documents by name or category. Use when user asks to find or download a specific file like a service manual, employee handbook, or procedure document. Returns document name, category, and download link.",
         "input_schema": {"type":"object","properties":{"query":{"type":"string","description":"Document name or keywords"},"category":{"type":"string","description":"Optional: service_manual, employee_handbook, after_sales, warranty, general"}},"required":["query"]}
@@ -1349,13 +1354,27 @@ STEP 4 — Execute only after confirmation:
   Report results: PO names (e.g. P00442) + Odoo links for each created PO.
   If any line_errors exist, tell user which products failed and why.
 
-SCOPE OF KNOWLEDGE (answer freely):
+SCOPE OF KNOWLEDGE (answer freely and confidently):
 - Our own products: Chumart, Polarman, Flamaster, ChefAsst — specs, pricing, installation, maintenance
 - Competitor/industry products: True, Turbo Air, Beverage-Air, Hoshizaki, Manitowoc, Continental, Victory, Traulsen, Arctic Air, and any other commercial refrigeration or foodservice equipment brands — answer product questions, maintenance, repair, troubleshooting, comparisons
 - General commercial kitchen equipment: installation guides, cleaning procedures, error codes, preventive maintenance, repair tips
 - Food service industry knowledge: NSF standards, health codes, energy efficiency, refrigerant types (R290, R404A, R134a etc.)
 - General business questions related to the industry
-- For questions completely outside work context (personal topics, entertainment etc): politely redirect to work topics"""
+
+IMPORTANT — ANSWERING INDUSTRY QUESTIONS:
+- You have extensive built-in knowledge about commercial kitchen equipment, refrigeration, fryers, ovens, etc.
+- TOOL PRIORITY: search_knowledge (internal docs/websites) FIRST → your training knowledge → web_search (live internet) LAST
+- Use web_search when: user asks to check online, asks about current prices/news, or knowledge base doesn't have enough info for troubleshooting questions
+- For repair/troubleshooting questions (e.g. "fryer点不着火", "冰机不制冷"), try search_knowledge first, then answer from training knowledge. Use web_search only if the first two don't suffice.
+- Give practical, actionable troubleshooting steps — not generic advice to "contact manufacturer".
+- When using web_search results, cite sources briefly (e.g. "根据 [site]...")
+- For questions completely outside work context (personal topics, entertainment etc): politely redirect to work topics
+
+RESPONSE STYLE:
+- Be concise and direct. Don't repeat the question back.
+- Give the answer first, then explain if needed.
+- For troubleshooting, use numbered steps.
+- Don't over-qualify with "I'm not sure" or "I think" — be confident in your industry knowledge."""
 
 
 async def run_tool(name, inp):
@@ -1395,6 +1414,51 @@ async def run_tool(name, inp):
                 else:
                     parts.append(f"[{source} | {r['page_title']}]\n{r['chunk_text']}")
         return "\n\n---\n\n".join(parts) if parts else "No sufficiently relevant results found."
+
+    if name == "web_search":
+        query = inp.get("query", "").strip()
+        max_results = min(max(inp.get("max_results", 5), 3), 10)
+        tavily_key = os.getenv("TAVILY_API_KEY", "")
+        if not tavily_key:
+            return "Web search unavailable: TAVILY_API_KEY not configured on server."
+        if not query:
+            return "Web search error: empty query."
+        try:
+            async with httpx.AsyncClient(timeout=20) as c:
+                r = await c.post(
+                    "https://api.tavily.com/search",
+                    headers={"Content-Type": "application/json"},
+                    json={
+                        "api_key": tavily_key,
+                        "query": query,
+                        "max_results": max_results,
+                        "search_depth": "basic",
+                        "include_answer": True,
+                    }
+                )
+                data = r.json()
+                if r.status_code != 200:
+                    err = data.get("detail") or data.get("error") or f"HTTP {r.status_code}"
+                    print(f"TAVILY ERROR: {err}")
+                    return f"Web search failed: {err}"
+
+                parts = []
+                answer = data.get("answer", "")
+                if answer:
+                    parts.append(f"[TAVILY SUMMARY]\n{answer}")
+                for idx, item in enumerate(data.get("results", []), 1):
+                    title = item.get("title", "Untitled")
+                    url = item.get("url", "")
+                    content = (item.get("content", "") or "")[:800]
+                    score = item.get("score", 0)
+                    parts.append(f"[Result {idx} | score={score:.2f}]\n{title}\n{url}\n{content}")
+
+                if not parts:
+                    return f"Web search returned no results for: {query}"
+                return "\n\n---\n\n".join(parts)
+        except Exception as e:
+            print(f"TAVILY exception: {e}")
+            return f"Web search error: {e}"
     if name == "odoo_create_record":
         model_name = inp.get("model", "")
         print(f"TOOL CALL: odoo_create_record model={model_name} vals_keys={list(inp.get('vals', {}).keys())}")
@@ -1954,8 +2018,12 @@ async def chat_openai(messages: list, system: str, model: str, tools: list) -> s
                 payload = {
                     "model": model,
                     "messages": current_messages,
-                    "max_tokens": 4096,
                 }
+                # GPT-5.x uses max_completion_tokens; older models use max_tokens
+                if model.startswith("gpt-5"):
+                    payload["max_completion_tokens"] = 4096
+                else:
+                    payload["max_tokens"] = 4096
                 if oai_tools:
                     payload["tools"] = oai_tools
                     payload["tool_choice"] = "auto"
@@ -2386,6 +2454,413 @@ async def chat(req: ChatRequest, background_tasks: BackgroundTasks):
             )
 
     return {"reply": reply}
+
+# ─────────────────────────────────────────────
+# Streaming chat (SSE) — Claude models only. OpenAI falls back to /chat.
+# ─────────────────────────────────────────────
+
+@app.post("/chat/stream")
+async def chat_stream(req: ChatRequest, background_tasks: BackgroundTasks):
+    """Server-Sent Events streaming endpoint.
+    Event types sent to client:
+      - {type: "text", delta: "..."}        incremental text
+      - {type: "tool_use", name: "..."}     tool being invoked
+      - {type: "tool_result", name: "..."}  tool finished
+      - {type: "done"}                      stream complete
+      - {type: "error", message: "..."}     error occurred
+    """
+    from fastapi.responses import StreamingResponse
+
+    perms = ROLE_PERMISSIONS.get(req.role, ROLE_PERMISSIONS["guest"])
+
+    # Filter tools based on permissions
+    allowed_tools = []
+    finance_tools = {"get_monthly_tax", "get_quarterly_tax", "get_monthly_sales", "get_missing_tax"}
+    write_tools = {"odoo_create_record", "odoo_add_order_line", "odoo_confirm_order", "odoo_update_record"}
+    for tool in TOOLS:
+        tname = tool["name"]
+        if tname in finance_tools and not perms.get("can_see_finance"):
+            continue
+        if tname in write_tools and not perms.get("can_write_odoo"):
+            continue
+        allowed_tools.append(tool)
+
+    has_file = False
+    cached_file = None
+    if req.file_id and req.file_id in FILE_CACHE:
+        cached_file = FILE_CACHE[req.file_id]
+        has_file = True
+
+    if has_file and cached_file:
+        doc_type = "document" if cached_file["media_type"] == "application/pdf" else "image"
+        user_message_content = [
+            {"type": doc_type, "source": {"type": "base64", "media_type": cached_file["media_type"], "data": cached_file["b64"]}},
+            {"type": "text", "text": f"[Attached file: {cached_file['name']}]\n\nUser question: {req.message}"}
+        ]
+    elif req.file_content and req.file_name:
+        user_message_content = (
+            f"=== ATTACHED FILE: {req.file_name} ===\n{req.file_content}\n=== END OF FILE ===\n\nUser question: {req.message}"
+        )
+    else:
+        user_message_content = req.message
+
+    messages = req.history + [{"role": "user", "content": user_message_content}]
+
+    # Load memory & build system prompt
+    memories = []
+    if req.user_id:
+        memories = await db_get_memory(req.user_id)
+
+    # Determine model — streaming only supports Claude. OpenAI falls back to non-stream.
+    if req.role == "admin" and req.model in ALLOWED_MODELS:
+        selected_model = req.model
+    elif req.role != "admin" and req.model in NON_ADMIN_MODELS:
+        selected_model = req.model
+    else:
+        selected_model = "claude-sonnet-4-5"
+
+    if selected_model in OPENAI_MODELS:
+        # OpenAI streaming path with tool-call support
+        openai_key = os.getenv("OPENAI_API_KEY", "")
+        system_prompt = get_system_prompt(req.role, req.user_name, req.user_id, req.free_mode, memories)
+
+        # Build OpenAI-format messages
+        if has_file and cached_file:
+            oai_image_content = [
+                {"type": "image_url", "image_url": {"url": f"data:{cached_file['media_type']};base64,{cached_file['b64']}"}},
+                {"type": "text", "text": f"[Attached file: {cached_file['name']}]\n\nUser question: {req.message}"}
+            ]
+            oai_messages_input = req.history + [{"role": "user", "content": oai_image_content}]
+        else:
+            oai_messages_input = messages
+
+        async def openai_stream():
+            if not openai_key:
+                yield f"data: {json.dumps({'type': 'error', 'message': 'OPENAI_API_KEY not configured'})}\n\n"
+                return
+
+            oai_tools = convert_tools_to_openai(allowed_tools)
+            current_messages = [{"role": "system", "content": system_prompt}] + oai_messages_input
+            full_reply_text = ""
+
+            try:
+                for iteration in range(8):
+                    payload = {
+                        "model": selected_model,
+                        "messages": current_messages,
+                        "stream": True,
+                    }
+                    # GPT-5.x uses max_completion_tokens
+                    if selected_model.startswith("gpt-5"):
+                        payload["max_completion_tokens"] = 4096
+                    else:
+                        payload["max_tokens"] = 4096
+                    if oai_tools:
+                        payload["tools"] = oai_tools
+                        payload["tool_choice"] = "auto"
+
+                    # Accumulate the assistant message as we stream
+                    assistant_content = ""
+                    # tool_calls[index] -> {"id": str, "name": str, "arguments": str}
+                    tool_calls_acc = {}
+                    finish_reason = None
+
+                    async with httpx.AsyncClient(timeout=300) as c:
+                        async with c.stream(
+                            "POST",
+                            "https://api.openai.com/v1/chat/completions",
+                            headers={"Authorization": f"Bearer {openai_key}", "Content-Type": "application/json"},
+                            json=payload
+                        ) as r:
+                            if r.status_code != 200:
+                                body = await r.aread()
+                                err_txt = body.decode("utf-8", errors="ignore")[:500]
+                                yield f"data: {json.dumps({'type': 'error', 'message': f'OpenAI {r.status_code}: {err_txt}'})}\n\n"
+                                return
+
+                            async for line in r.aiter_lines():
+                                if not line or not line.startswith("data: "):
+                                    continue
+                                data_str = line[6:]
+                                if data_str.strip() == "[DONE]":
+                                    break
+                                try:
+                                    event = json.loads(data_str)
+                                except Exception:
+                                    continue
+
+                                choices = event.get("choices", [])
+                                if not choices:
+                                    continue
+                                choice = choices[0]
+                                delta = choice.get("delta", {}) or {}
+                                fr = choice.get("finish_reason")
+                                if fr:
+                                    finish_reason = fr
+
+                                # Text content delta
+                                text_chunk = delta.get("content")
+                                if text_chunk:
+                                    assistant_content += text_chunk
+                                    full_reply_text += text_chunk
+                                    yield f"data: {json.dumps({'type': 'text', 'delta': text_chunk})}\n\n"
+
+                                # Tool call deltas
+                                tc_deltas = delta.get("tool_calls") or []
+                                for tcd in tc_deltas:
+                                    idx = tcd.get("index", 0)
+                                    if idx not in tool_calls_acc:
+                                        tool_calls_acc[idx] = {"id": "", "name": "", "arguments": ""}
+                                    entry = tool_calls_acc[idx]
+                                    if tcd.get("id"):
+                                        entry["id"] = tcd["id"]
+                                    fn = tcd.get("function") or {}
+                                    if fn.get("name"):
+                                        # Announce first time we see a name
+                                        if not entry["name"]:
+                                            yield f"data: {json.dumps({'type': 'tool_use', 'name': fn['name']})}\n\n"
+                                        entry["name"] = fn["name"]
+                                    if fn.get("arguments"):
+                                        entry["arguments"] += fn["arguments"]
+
+                    # Decide next action
+                    if finish_reason == "tool_calls" and tool_calls_acc:
+                        # Build the assistant message with tool_calls for the next round
+                        tc_list = []
+                        for idx in sorted(tool_calls_acc.keys()):
+                            e = tool_calls_acc[idx]
+                            tc_list.append({
+                                "id": e["id"],
+                                "type": "function",
+                                "function": {"name": e["name"], "arguments": e["arguments"] or "{}"}
+                            })
+                        current_messages.append({
+                            "role": "assistant",
+                            "content": assistant_content or None,
+                            "tool_calls": tc_list
+                        })
+                        # Execute tools
+                        for tc in tc_list:
+                            fn_name = tc["function"]["name"]
+                            try:
+                                fn_args = json.loads(tc["function"]["arguments"])
+                            except Exception:
+                                fn_args = {}
+                            result = await run_tool(fn_name, fn_args)
+                            yield f"data: {json.dumps({'type': 'tool_result', 'name': fn_name})}\n\n"
+                            current_messages.append({
+                                "role": "tool",
+                                "tool_call_id": tc["id"],
+                                "content": result
+                            })
+                        # Loop for another streaming round
+                        continue
+                    else:
+                        # Natural stop
+                        break
+
+                # Persist session
+                if req.session_id and req.user_id:
+                    full_history = req.history + [
+                        {"role": "user", "content": req.message},
+                        {"role": "assistant", "content": full_reply_text}
+                    ]
+                    asyncio.create_task(db_save_session(
+                        req.session_id, req.user_id, req.user_name,
+                        req.session_title or req.message[:20], full_history
+                    ))
+                    if len(full_history) % 8 == 0:
+                        asyncio.create_task(extract_and_update_memory(
+                            req.user_id, req.user_name, full_history
+                        ))
+
+                yield f"data: {json.dumps({'type': 'done'})}\n\n"
+
+            except asyncio.CancelledError:
+                print(f"OpenAI stream cancelled. Reply so far: {len(full_reply_text)} chars")
+                if req.session_id and req.user_id and full_reply_text:
+                    full_history = req.history + [
+                        {"role": "user", "content": req.message},
+                        {"role": "assistant", "content": full_reply_text + "\n\n[stopped by user]"}
+                    ]
+                    asyncio.create_task(db_save_session(
+                        req.session_id, req.user_id, req.user_name,
+                        req.session_title or req.message[:20], full_history
+                    ))
+                raise
+            except Exception as e:
+                print(f"OpenAI stream error: {e}")
+                yield f"data: {json.dumps({'type': 'error', 'message': str(e)})}\n\n"
+
+        return StreamingResponse(openai_stream(), media_type="text/event-stream", headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        })
+
+    # Anthropic streaming path
+    system_prompt = get_system_prompt(req.role, req.user_name, req.user_id, req.free_mode, memories)
+    headers = {
+        "x-api-key": ANTHROPIC_KEY,
+        "anthropic-version": "2023-06-01",
+        "content-type": "application/json"
+    }
+
+    async def claude_stream():
+        current_messages = list(messages)
+        full_reply_text = ""
+        try:
+            for iteration in range(8):
+                payload = {
+                    "model": selected_model,
+                    "max_tokens": 4096,
+                    "system": system_prompt,
+                    "tools": allowed_tools,
+                    "messages": current_messages,
+                    "stream": True,
+                }
+                async with httpx.AsyncClient(timeout=300) as c:
+                    async with c.stream("POST", "https://api.anthropic.com/v1/messages",
+                                        headers=headers, json=payload) as r:
+                        if r.status_code != 200:
+                            body = await r.aread()
+                            err_txt = body.decode("utf-8", errors="ignore")[:500]
+                            yield f"data: {json.dumps({'type': 'error', 'message': f'API {r.status_code}: {err_txt}'})}\n\n"
+                            return
+
+                        # Accumulate the assistant's content blocks so we can replay on tool_use loop
+                        content_blocks = []  # list of {type, ...}
+                        current_block = None
+                        current_tool_input_buf = ""
+                        stop_reason = None
+
+                        async for line in r.aiter_lines():
+                            if not line or not line.startswith("data: "):
+                                continue
+                            try:
+                                event = json.loads(line[6:])
+                            except Exception:
+                                continue
+
+                            et = event.get("type", "")
+
+                            if et == "content_block_start":
+                                block = event.get("content_block", {})
+                                idx = event.get("index", 0)
+                                if block.get("type") == "text":
+                                    current_block = {"type": "text", "text": "", "_idx": idx}
+                                elif block.get("type") == "tool_use":
+                                    current_block = {
+                                        "type": "tool_use",
+                                        "id": block.get("id"),
+                                        "name": block.get("name"),
+                                        "input": {},
+                                        "_idx": idx
+                                    }
+                                    current_tool_input_buf = ""
+                                    # Tell frontend a tool is being invoked
+                                    yield f"data: {json.dumps({'type': 'tool_use', 'name': block.get('name')})}\n\n"
+
+                            elif et == "content_block_delta":
+                                delta = event.get("delta", {})
+                                dt = delta.get("type", "")
+                                if dt == "text_delta" and current_block and current_block.get("type") == "text":
+                                    text_chunk = delta.get("text", "")
+                                    current_block["text"] += text_chunk
+                                    full_reply_text += text_chunk
+                                    yield f"data: {json.dumps({'type': 'text', 'delta': text_chunk})}\n\n"
+                                elif dt == "input_json_delta" and current_block and current_block.get("type") == "tool_use":
+                                    current_tool_input_buf += delta.get("partial_json", "")
+
+                            elif et == "content_block_stop":
+                                if current_block:
+                                    if current_block.get("type") == "tool_use":
+                                        # Finalize tool input
+                                        try:
+                                            current_block["input"] = json.loads(current_tool_input_buf) if current_tool_input_buf else {}
+                                        except Exception as e:
+                                            print(f"Tool input JSON parse error: {e}, buf={current_tool_input_buf[:200]}")
+                                            current_block["input"] = {}
+                                    # Strip internal index field
+                                    cb = {k: v for k, v in current_block.items() if not k.startswith("_")}
+                                    content_blocks.append(cb)
+                                    current_block = None
+                                    current_tool_input_buf = ""
+
+                            elif et == "message_delta":
+                                delta = event.get("delta", {})
+                                if "stop_reason" in delta:
+                                    stop_reason = delta["stop_reason"]
+
+                            elif et == "message_stop":
+                                pass
+
+                            elif et == "error":
+                                err = event.get("error", {})
+                                msg = err.get("message", str(err))
+                                yield f"data: {json.dumps({'type': 'error', 'message': msg})}\n\n"
+                                return
+
+                # After stream for this iteration ends, decide next step
+                if stop_reason == "tool_use":
+                    # Run all tool_use blocks and loop
+                    tool_results = []
+                    for block in content_blocks:
+                        if block.get("type") == "tool_use":
+                            result = await run_tool(block["name"], block.get("input", {}))
+                            yield f"data: {json.dumps({'type': 'tool_result', 'name': block['name']})}\n\n"
+                            tool_results.append({
+                                "type": "tool_result",
+                                "tool_use_id": block["id"],
+                                "content": result
+                            })
+                    current_messages.append({"role": "assistant", "content": content_blocks})
+                    current_messages.append({"role": "user", "content": tool_results})
+                    # Continue outer for loop for another streaming iteration
+                    continue
+                else:
+                    # Natural stop — we're done
+                    break
+
+            # Persist session
+            if req.session_id and req.user_id:
+                full_history = req.history + [
+                    {"role": "user", "content": req.message},
+                    {"role": "assistant", "content": full_reply_text}
+                ]
+                # Use create_task since BackgroundTasks doesn't run inside StreamingResponse reliably
+                asyncio.create_task(db_save_session(
+                    req.session_id, req.user_id, req.user_name,
+                    req.session_title or req.message[:20], full_history
+                ))
+                if len(full_history) % 8 == 0:
+                    asyncio.create_task(extract_and_update_memory(
+                        req.user_id, req.user_name, full_history
+                    ))
+
+            yield f"data: {json.dumps({'type': 'done'})}\n\n"
+
+        except asyncio.CancelledError:
+            # Client disconnected (Stop button pressed)
+            print(f"Client disconnected mid-stream. Reply so far: {len(full_reply_text)} chars")
+            # Still save partial reply if we got something useful
+            if req.session_id and req.user_id and full_reply_text:
+                full_history = req.history + [
+                    {"role": "user", "content": req.message},
+                    {"role": "assistant", "content": full_reply_text + "\n\n[stopped by user]"}
+                ]
+                asyncio.create_task(db_save_session(
+                    req.session_id, req.user_id, req.user_name,
+                    req.session_title or req.message[:20], full_history
+                ))
+            raise
+        except Exception as e:
+            print(f"Stream error: {e}")
+            yield f"data: {json.dumps({'type': 'error', 'message': str(e)})}\n\n"
+
+    return StreamingResponse(claude_stream(), media_type="text/event-stream", headers={
+        "Cache-Control": "no-cache",
+        "X-Accel-Buffering": "no",  # Disable nginx buffering
+    })
 
 # ─────────────────────────────────────────────
 # Session & Memory API
