@@ -318,7 +318,7 @@ async def extract_text_from_file(file_bytes: bytes, filename: str, mime_type: st
         print(f"Text extraction error {filename}: {e}")
         return ""
 
-async def process_document_to_kb(doc_id: str, doc_name: str, text: str, category: str):
+async def process_document_to_kb(doc_id: str, doc_name: str, text: str, category: str, description: str = ""):
     """Chunk document text and store in knowledge base."""
     if not text.strip():
         return 0
@@ -328,15 +328,18 @@ async def process_document_to_kb(doc_id: str, doc_name: str, text: str, category
         return 0
 
     try:
-        # Delete old chunks for this doc
         await conn.execute("DELETE FROM knowledge_chunks WHERE site_url = $1", f"doc:{doc_id}")
-
         chunks = chunk_text(text, chunk_size=600, overlap=100)
         count = 0
 
-        # First chunk: index chunk with doc name + description + first content
-        # This ensures searching by filename or category always finds this doc
-        index_chunk = f"Document: {doc_name}\nCategory: {category}\n\n{text[:800]}"
+        # Index chunk: filename + category + description (model numbers) + first content
+        # This is the "findability" chunk — searched when user mentions model numbers
+        index_parts = [f"Document: {doc_name}", f"Category: {category}"]
+        if description:
+            index_parts.append(f"Contains: {description}")
+        index_parts.append(text[:800])
+        index_chunk = "\n".join(index_parts)
+
         index_embedding = await get_embedding(index_chunk)
         if index_embedding:
             await conn.execute("""
@@ -1474,9 +1477,25 @@ For questions completely outside work context: politely redirect to work topics
 RESPONSE STYLE:
 - Be concise and direct. Don't repeat the question back.
 - Give the answer first, then explain if needed.
-- For troubleshooting, use numbered steps.
-- Don't over-qualify with "I'm not sure" or "I think" — be confident in your industry knowledge.
+- For troubleshooting, use numbered steps ordered by probability.
 - If you had to web_search, briefly cite the source at the end.
+
+AVOIDING VAGUE ANSWERS (critical — this is where users get frustrated):
+- NEVER say "I'm not sure if the document contains X" — search first, then say what you found
+- NEVER say "you may need to contact support/manufacturer" as a first response — try tools first
+- NEVER say "I cannot access/read/open the file" — use search_knowledge to read the content
+- NEVER give a list of suggestions without first trying to answer from actual data
+- If you searched and genuinely found nothing → say exactly what you searched and what came back, then offer alternatives
+- If the user says "you just found it, give me X" → don't re-search, use what you already have
+
+WHEN UNSURE WHAT THE USER WANTS:
+- Ask ONE specific clarifying question, not a list of options
+- Example: "你是要查 FLM-F3-NG 的troubleshooting步骤，还是需要完整的规格参数？" (not a 5-point menu)
+
+SELF-CHECK before responding:
+- Did I actually search the knowledge base before answering? If not → search first
+- Am I giving a download link when the user wants the actual content? → give the content
+- Am I telling the user to do something they asked ME to do? → do it myself
 
 TECHNICAL TERMS — ALWAYS BILINGUAL (中文 + English):
 When answering in Chinese, attach the English technical term in parentheses on FIRST mention of each part/concept.
@@ -3375,14 +3394,44 @@ async def upload_doc(
         return {"error": str(e)}
 
 async def _process_doc_background(doc_id: str, filename: str, file_bytes: bytes, mime_type: str, category: str):
-    """Background task: extract text and index into knowledge base."""
+    """Background task: extract text, auto-generate description with model numbers, and index."""
     print(f"DOC INDEX START: {filename} ({len(file_bytes)//1024}KB) category={category}")
     text = await extract_text_from_file(file_bytes, filename, mime_type)
-    if text:
-        count = await process_document_to_kb(doc_id, filename, text, category)
-        print(f"DOC INDEX OK: {filename} → {count} chunks")
-    else:
+    if not text:
         print(f"DOC INDEX FAIL: {filename} — no text extracted")
+        return
+
+    # Auto-extract model numbers and keywords from text to enrich description
+    try:
+        async with httpx.AsyncClient(timeout=30) as c:
+            r = await c.post(
+                "https://api.anthropic.com/v1/messages",
+                headers={"x-api-key": ANTHROPIC_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json"},
+                json={
+                    "model": "claude-haiku-4-5-20251001",
+                    "max_tokens": 200,
+                    "messages": [{"role": "user", "content": f"Extract all product model numbers, SKUs, and brand names from this document. Return ONLY a comma-separated list of identifiers, nothing else. Max 20 items.\n\nDocument name: {filename}\n\nContent (first 2000 chars):\n{text[:2000]}"}]
+                }
+            )
+            keywords = r.json().get("content", [{}])[0].get("text", "").strip()
+            if keywords:
+                conn = await get_db_conn()
+                if conn:
+                    try:
+                        # Only update description if it's empty or generic
+                        row = await conn.fetchrow("SELECT description FROM documents WHERE id=$1", doc_id)
+                        existing_desc = (row["description"] or "").strip() if row else ""
+                        if not existing_desc or existing_desc == filename.rsplit(".", 1)[0]:
+                            new_desc = keywords[:500]
+                            await conn.execute("UPDATE documents SET description=$1 WHERE id=$2", new_desc, doc_id)
+                            print(f"DOC AUTO-DESC: {filename} → {new_desc[:100]}")
+                    finally:
+                        await conn.close()
+    except Exception as e:
+        print(f"DOC AUTO-DESC ERROR: {e}")
+
+    count = await process_document_to_kb(doc_id, filename, text, category)
+    print(f"DOC INDEX OK: {filename} → {count} chunks")
 
 @app.get("/admin/documents")
 async def list_documents(admin_key: str = ""):
