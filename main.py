@@ -154,7 +154,7 @@ async def init_db():
 @app.on_event("startup")
 async def startup():
     print("=" * 60)
-    print("CHUMART AI BACKEND — BUILD: reindex-v9 (2026-04-22)")
+    print("CHUMART AI BACKEND — BUILD: search-fix-v10 (2026-04-22)")
     print("=" * 60)
     await init_db()
 
@@ -1661,14 +1661,14 @@ async def run_tool(name, inp, context=None):
         try:
             if category_filter:
                 rows = await conn.fetch("""
-                    SELECT original_name, category, description, public_url, chunk_count, r2_key
+                    SELECT id, original_name, category, description, public_url, chunk_count, r2_key
                     FROM documents
                     WHERE category = $1
                     ORDER BY created_at DESC
                 """, category_filter)
             else:
                 rows = await conn.fetch("""
-                    SELECT original_name, category, description, public_url, chunk_count, r2_key
+                    SELECT id, original_name, category, description, public_url, chunk_count, r2_key
                     FROM documents
                     ORDER BY category, created_at DESC
                 """)
@@ -1689,20 +1689,23 @@ async def run_tool(name, inp, context=None):
             desc = r["description"] or ""
             chunks = r["chunk_count"] or 0
             url = r["public_url"] or ""
-            lines.append(f"• {name_str}" + (f" — {desc}" if desc else "") + f" ({chunks} chunks)" + (f"\n  Download: {url}" if url else ""))
+            backend_url = os.getenv('RAILWAY_PUBLIC_DOMAIN', 'https://chumart-ai.up.railway.app')
+            download_link = f"https://{backend_url}/docs/signed-url/{r['id']}" if r.get('id') else url
+            lines.append(f"• {name_str}" + (f" — {desc}" if desc else "") + f" ({chunks} chunks)" + (f"\n  Download: {download_link}" if download_link else ""))
 
         return "\n".join(lines)
 
+    if name == "search_knowledge":
         query = inp.get("query", "")
-        top_k = min(inp.get("top_k", 10), 20)  # default 10, max 20
-        doc_name = inp.get("doc_name", "")  # optional: filter by document name (partial match)
+        top_k = min(inp.get("top_k", 10), 20)
+        doc_name = inp.get("doc_name", "")
 
         results = await search_knowledge(query, top_k, doc_name_filter=doc_name)
         if not results:
             return "No relevant knowledge found in knowledge base or documents."
         parts = []
         for r in results:
-            if r.get("similarity", 0) > 0.20:  # slightly lower threshold to catch more doc content
+            if r.get("similarity", 0) > 0.20:
                 source = r['site_name']
                 chunk = r['chunk_text']
                 sim = r.get('similarity', 0)
