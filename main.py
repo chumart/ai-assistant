@@ -489,7 +489,7 @@ async def crawl_site(site: dict, log_id: int):
 # Knowledge base search
 # ─────────────────────────────────────────────
 
-async def search_knowledge(query: str, top_k: int = 5, category: str = None) -> list:
+async def search_knowledge(query: str, top_k: int = 10, category: str = None, doc_name_filter: str = None) -> list:
     """Vector similarity search in knowledge base."""
     conn = await get_db_conn()
     if not conn:
@@ -499,7 +499,26 @@ async def search_knowledge(query: str, top_k: int = 5, category: str = None) -> 
         if not embedding:
             return []
 
-        if category:
+        if category and doc_name_filter:
+            rows = await conn.fetch("""
+                SELECT site_name, site_url, page_url, page_title, chunk_text,
+                       1 - (embedding <=> $1::vector) AS similarity
+                FROM knowledge_chunks
+                WHERE (category = $2 OR category = $3)
+                  AND site_name ILIKE $4
+                ORDER BY embedding <=> $1::vector
+                LIMIT $5
+            """, json.dumps(embedding), category, f"doc_{category}", f"%{doc_name_filter}%", top_k)
+        elif doc_name_filter:
+            rows = await conn.fetch("""
+                SELECT site_name, site_url, page_url, page_title, chunk_text,
+                       1 - (embedding <=> $1::vector) AS similarity
+                FROM knowledge_chunks
+                WHERE site_name ILIKE $2
+                ORDER BY embedding <=> $1::vector
+                LIMIT $3
+            """, json.dumps(embedding), f"%{doc_name_filter}%", top_k)
+        elif category:
             rows = await conn.fetch("""
                 SELECT site_name, site_url, page_url, page_title, chunk_text,
                        1 - (embedding <=> $1::vector) AS similarity
@@ -1042,8 +1061,8 @@ TOOLS = [
     },
     {
         "name": "search_knowledge",
-        "description": "Search the internal knowledge base — includes websites (chumartusa.com, polarmanusa.com, flamasterusa.com, chefasstusa.com) AND uploaded internal documents (employee handbook, service manuals, after-sales procedures, warranty docs). ALWAYS use this first for ANY product question, maintenance, repair, troubleshooting, error codes, company policy, or procedures.",
-        "input_schema": {"type":"object","properties":{"query":{"type":"string","description":"Search query"},"top_k":{"type":"integer","default":6,"description":"Number of results"}},"required":["query"]}
+        "description": "Search the internal knowledge base — includes websites AND uploaded documents (service manuals, spec sheets, product manuals, warranty docs, employee handbook). ALWAYS use this first for ANY product question, maintenance, repair, troubleshooting, error codes, procedures, or specs. The results contain the ACTUAL TEXT from the documents — read and use this content directly in your answer. Use doc_name to filter by a specific document when you know which file to look in.",
+        "input_schema": {"type":"object","properties":{"query":{"type":"string","description":"Search query — use specific terms like model number, symptom, part name, procedure"},"top_k":{"type":"integer","default":10,"description":"Number of chunks to retrieve, default 10, max 20"},"doc_name":{"type":"string","description":"Optional: filter by document name (partial match). E.g. 'Gas Fryer' or 'FLM-F3' or 'warranty'"},"category":{"type":"string","description":"Optional: service_manual, product_manual, spec_sheet, employee_handbook, after_sales, warranty, general"}},"required":["query"]}
     },
     {
         "name": "web_search",
@@ -1370,14 +1389,43 @@ SCOPE OF KNOWLEDGE (answer freely and confidently):
 - Food service industry knowledge: NSF standards, health codes, energy efficiency, refrigerant types (R290, R404A, R134a etc.)
 - General business questions related to the industry
 
-TOOL USE WORKFLOW (follow this exactly for any product/industry question):
+DOCUMENT & KNOWLEDGE SEARCH WORKFLOW:
 
-Step 1 — Call search_knowledge(query) FIRST
-Step 2 — Evaluate what came back:
-  - If the results CLEARLY answer the question (contain the specific fact asked about) → answer using those results, cite source briefly
-  - If the results are empty, irrelevant, or only tangentially related → you MUST call web_search(query) next
-  - NEVER skip to answering from training knowledge when search_knowledge returned nothing useful
-Step 3 — After web_search, answer using those results with brief source citation
+When a user mentions a model number, product name, or asks about a topic, follow these steps IN ORDER:
+
+STEP 1 — EXACT SEARCH
+Search for the exact term: search_knowledge(query="[model/topic as given]")
+→ If results contain useful content: answer directly using the chunk text. DONE.
+→ If empty or irrelevant: go to Step 2.
+
+STEP 2 — DOCUMENT SCAN
+Search just the model/product name to find which documents exist:
+search_knowledge(query="[model number]") and search_knowledge(query="[product type]")
+→ If you find a matching document: search WITHIN it using doc_name filter:
+   search_knowledge(query="[the topic/symptom]", doc_name="[document name]")
+→ If results still insufficient: go to Step 3.
+
+STEP 3 — INFER AND BROADEN
+Infer the product category from the model number or name:
+- FLM- prefix → Flamaster brand (gas fryers, griddles, ranges)
+- PLM- prefix → Polarman brand (refrigerators, freezers)
+- CMPC/SLBM etc → Chumart accessories
+- "fryer" / "freezer" / "refrigerator" → search by equipment type
+Then search: search_knowledge(query="[inferred brand] [equipment type] [topic]")
+→ If found: answer and note "I found this in our [document name], which covers similar models"
+→ If still not found: go to Step 4.
+
+STEP 4 — ASK THE USER
+Tell the user specifically what you searched and what's missing. Ask a focused question:
+- "I searched for [X] but didn't find a specific manual for [model]. Is this a [product type]? Do you have a service manual I can add to the knowledge base?"
+- Never just say "not found" — always explain what you tried and what would help.
+
+CRITICAL RULES FOR DOCUMENT CONTENT:
+- The chunk_text in search results IS the actual text from the document — read it and use it directly
+- NEVER say "I cannot open/read the file" or "download to check" — the text is already in the results
+- If a chunk mentions a troubleshooting table, error code, or procedure — quote it directly in your answer
+- Always cite the source document name when using document content
+- If the user asks about content that IS in the results but you're unsure — quote the relevant section verbatim
 
 Judging "clearly answers":
 - ✅ User asks "Polarman PLM-54FS 的制冷剂" and search_knowledge returns "PLM-54FS uses R290 refrigerant..." → answer from KB
@@ -1568,19 +1616,24 @@ async def run_tool(name, inp, context=None):
     if name == "get_missing_tax":
         return json.dumps(await missing_tax(inp["year"], inp["month"]), ensure_ascii=False)
     if name == "search_knowledge":
-        results = await search_knowledge(inp["query"], inp.get("top_k", 6))
+        query = inp.get("query", "")
+        top_k = min(inp.get("top_k", 10), 20)  # default 10, max 20
+        doc_name = inp.get("doc_name", "")  # optional: filter by document name (partial match)
+
+        results = await search_knowledge(query, top_k, doc_name_filter=doc_name)
         if not results:
             return "No relevant knowledge found in knowledge base or documents."
         parts = []
         for r in results:
-            if r.get("similarity", 0) > 0.25:
+            if r.get("similarity", 0) > 0.20:  # slightly lower threshold to catch more doc content
                 source = r['site_name']
-                # Add download link for document sources
+                chunk = r['chunk_text']
+                sim = r.get('similarity', 0)
                 if r.get('site_url', '').startswith('doc:'):
                     doc_id = r['site_url'].replace('doc:', '')
-                    parts.append(f"[📄 {source}]\n{r['chunk_text']}\n[Doc ID: {doc_id}]")
+                    parts.append(f"[📄 {source} | relevance={sim:.2f}]\n{chunk}\n[Doc ID: {doc_id}]")
                 else:
-                    parts.append(f"[{source} | {r['page_title']}]\n{r['chunk_text']}")
+                    parts.append(f"[{source} | {r['page_title']} | relevance={sim:.2f}]\n{chunk}")
         return "\n\n---\n\n".join(parts) if parts else "No sufficiently relevant results found."
 
     if name == "web_search":
