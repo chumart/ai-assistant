@@ -1823,8 +1823,20 @@ async def run_tool(name, inp, context=None):
         date_planned = (datetime.datetime.now() + datetime.timedelta(days=7)).strftime("%Y-%m-%d %H:%M:%S")
         now_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-        # Get one shared session for all Odoo calls
-        cookies = await odoo_get_session()
+        # Get session: prefer logged-in user's cached Odoo session for proper attribution
+        ctx_uid = ctx.get("uid")
+        user_session = USER_ODOO_SESSIONS.get(ctx_uid) if ctx_uid else None
+        if user_session:
+            session_age = (datetime.datetime.now() - user_session["time"]).total_seconds()
+            if session_age < 7200:  # 2 hours max
+                cookies = user_session["cookies"]
+                print(f"BULK PO: using user session (uid={ctx_uid}, age={session_age:.0f}s)")
+            else:
+                cookies = await odoo_get_session()
+                print(f"BULK PO: user session expired, using admin session")
+        else:
+            cookies = await odoo_get_session()
+            print(f"BULK PO: no user session cached, using admin session")
 
         # ─────────────────────────────────────────────────────────────
         # Phase 0: ID rescue — rescue AI-hallucinated product_id / partner_id
@@ -3406,6 +3418,9 @@ async def get_user_role(uid: int, cookies=None) -> str:
         return "guest"
 
 
+# In-memory Odoo session cache per user: uid -> {"cookies": dict, "time": datetime}
+USER_ODOO_SESSIONS: dict = {}
+
 class LoginRequest(BaseModel):
     username: str
     password: str
@@ -3426,7 +3441,12 @@ async def login(req: LoginRequest):
                 return {"success": False, "error": "Invalid username or password"}
 
             uid = result.get("uid")
-            cookies = r.cookies
+
+            # Cache user's Odoo session for write operations
+            USER_ODOO_SESSIONS[uid] = {
+                "cookies": dict(r.cookies),
+                "time": datetime.datetime.now()
+            }
 
             # Detect role (uses admin session internally)
             role = await get_user_role(uid)
