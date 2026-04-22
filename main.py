@@ -154,7 +154,7 @@ async def init_db():
 @app.on_event("startup")
 async def startup():
     print("=" * 60)
-    print("CHUMART AI BACKEND — BUILD: search-fix-v10 (2026-04-22)")
+    print("CHUMART AI BACKEND — BUILD: docfix-v11 (2026-04-22)")
     print("=" * 60)
     await init_db()
 
@@ -1413,6 +1413,14 @@ SCOPE OF KNOWLEDGE (answer freely and confidently):
 
 DOCUMENT & KNOWLEDGE SEARCH WORKFLOW:
 
+DOCUMENT TYPE MATCHING — understand what the user wants:
+- "说明书" / "manual" / "product manual" / "操作手册" → category: product_manual (NOT service_manual)
+- "service manual" / "维修手册" / "服务手册" → category: service_manual
+- "spec sheet" / "规格表" / "规格书" / "参数" → category: spec_sheet
+- "warranty" / "保修" → category: warranty
+When user asks for a specific document type, filter by the correct category using list_documents(category="...") or search_knowledge(category="...")
+NEVER return a service_manual when user asks for product_manual, or spec_sheet when user asks for manual.
+
 When a user mentions a model number, product name, or asks about a topic, follow these steps IN ORDER:
 
 STEP 1 — EXACT SEARCH
@@ -1680,6 +1688,9 @@ async def run_tool(name, inp, context=None):
 
         lines = ["Available documents in knowledge base:\n"]
         current_cat = None
+        backend_url = os.getenv('RAILWAY_PUBLIC_DOMAIN', 'chumart-ai.up.railway.app')
+        # Strip protocol if present
+        backend_url = backend_url.replace("https://", "").replace("http://", "").rstrip("/")
         for r in rows:
             cat = r["category"]
             if cat != current_cat:
@@ -1688,10 +1699,9 @@ async def run_tool(name, inp, context=None):
             name_str = r["original_name"]
             desc = r["description"] or ""
             chunks = r["chunk_count"] or 0
-            url = r["public_url"] or ""
-            backend_url = os.getenv('RAILWAY_PUBLIC_DOMAIN', 'https://chumart-ai.up.railway.app')
-            download_link = f"https://{backend_url}/docs/signed-url/{r['id']}" if r.get('id') else url
-            lines.append(f"• {name_str}" + (f" — {desc}" if desc else "") + f" ({chunks} chunks)" + (f"\n  Download: {download_link}" if download_link else ""))
+            doc_id = r["id"]
+            download_md = f"[📥 Download {name_str}](https://{backend_url}/docs/signed-url/{doc_id})" if doc_id else ""
+            lines.append(f"• **{name_str}**" + (f" — {desc[:80]}" if desc else "") + f" ({chunks} chunks)" + (f"\n  {download_md}" if download_md else ""))
 
         return "\n".join(lines)
 
@@ -3478,8 +3488,9 @@ async def delete_document(doc_id: str, admin_key: str = ""):
 # ─────────────────────────────────────────────
 
 @app.get("/docs/signed-url/{doc_id}")
-async def get_signed_url(doc_id: str):
-    """Generate a time-limited signed URL for secure document download (1 hour expiry)."""
+async def get_signed_url(doc_id: str, download: bool = True):
+    """Generate a time-limited signed URL and redirect directly to the file for download."""
+    from fastapi.responses import RedirectResponse
     conn = await get_db_conn()
     if not conn:
         return {"error": "DB not connected"}
@@ -3488,19 +3499,21 @@ async def get_signed_url(doc_id: str):
         if not row:
             return {"error": "Document not found"}
 
-        import asyncio
         loop = asyncio.get_event_loop()
         client = get_r2_client()
         if not client:
             return {"error": "Storage not configured"}
 
-        # Generate presigned URL valid for 1 hour
+        params = {'Bucket': R2_BUCKET, 'Key': row['r2_key']}
+        if download:
+            # Force browser to download with original filename
+            params['ResponseContentDisposition'] = f"attachment; filename=\"{row['original_name']}\""
+
         signed_url = await loop.run_in_executor(None, lambda: client.generate_presigned_url(
-            'get_object',
-            Params={'Bucket': R2_BUCKET, 'Key': row['r2_key']},
-            ExpiresIn=3600  # 1 hour
+            'get_object', Params=params, ExpiresIn=3600
         ))
-        return {"url": signed_url, "filename": row["original_name"], "expires_in": 3600}
+        # 302 redirect → browser downloads the file directly
+        return RedirectResponse(url=signed_url, status_code=302)
     except Exception as e:
         return {"error": str(e)}
     finally:
