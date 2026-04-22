@@ -154,7 +154,7 @@ async def init_db():
 @app.on_event("startup")
 async def startup():
     print("=" * 60)
-    print("CHUMART AI BACKEND — BUILD: docfix-v11 (2026-04-22)")
+    print("CHUMART AI BACKEND — BUILD: extract-fix-v12 (2026-04-22)")
     print("=" * 60)
     await init_db()
 
@@ -290,33 +290,51 @@ async def extract_text_from_file(file_bytes: bytes, filename: str, mime_type: st
     # Use Claude to extract text from PDF/image/docx
     b64 = base64.standard_b64encode(file_bytes).decode('utf-8')
     print(f"TEXT EXTRACT: {filename} ({len(file_bytes)//1024}KB) via Claude")
-    try:
-        async with httpx.AsyncClient(timeout=300) as c:
-            r = await c.post(
-                "https://api.anthropic.com/v1/messages",
-                headers={"x-api-key": ANTHROPIC_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json"},
-                json={
-                    "model": "claude-haiku-4-5-20251001",
-                    "max_tokens": 16000,
-                    "messages": [{
-                        "role": "user",
-                        "content": [
-                            {"type": doc_type, "source": {"type": "base64", "media_type": media_type, "data": b64}},
-                            {"type": "text", "text": "Extract ALL text content from this document completely. Include every section, table, specification, error code, procedure, and detail. Return raw text only, no commentary."}
-                        ]
-                    }]
-                }
-            )
-            data = r.json()
-            if "error" in data:
-                print(f"TEXT EXTRACT ERROR {filename}: {data['error']}")
-                return ""
-            text = "".join(b.get("text", "") for b in data.get("content", []) if b.get("type") == "text")
-            print(f"TEXT EXTRACT OK: {filename} → {len(text)} chars")
-            return text
-    except Exception as e:
-        print(f"Text extraction error {filename}: {e}")
-        return ""
+
+    # For large PDFs, extract in two passes to avoid token limit truncation
+    # Pass 1: full document extraction
+    # Pass 2: if result seems truncated, extract the second half separately
+    async def extract_pass(prompt_suffix=""):
+        try:
+            async with httpx.AsyncClient(timeout=300) as c:
+                r = await c.post(
+                    "https://api.anthropic.com/v1/messages",
+                    headers={"x-api-key": ANTHROPIC_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json"},
+                    json={
+                        "model": "claude-sonnet-4-5",  # Use Sonnet for better long-doc extraction
+                        "max_tokens": 8000,
+                        "messages": [{
+                            "role": "user",
+                            "content": [
+                                {"type": doc_type, "source": {"type": "base64", "media_type": media_type, "data": b64}},
+                                {"type": "text", "text": f"Extract ALL text content from this document completely. Include every section, table, specification, error code, procedure, troubleshooting steps, parts list, and detail. Do NOT skip or summarize any section. Return raw text only, no commentary.{prompt_suffix}"}
+                            ]
+                        }]
+                    }
+                )
+                data = r.json()
+                if "error" in data:
+                    print(f"TEXT EXTRACT ERROR {filename}: {data['error']}")
+                    return ""
+                text = "".join(b.get("text", "") for b in data.get("content", []) if b.get("type") == "text")
+                return text
+        except Exception as e:
+            print(f"Text extraction error {filename}: {e}")
+            return ""
+
+    text = await extract_pass()
+    print(f"TEXT EXTRACT OK: {filename} → {len(text)} chars")
+
+    # If PDF is large (>100KB) and text seems short (<3000 chars), try a second focused pass
+    if len(file_bytes) > 100_000 and len(text) < 3000 and doc_type == "document":
+        print(f"TEXT EXTRACT: result may be truncated, trying focused pass on later sections...")
+        text2 = await extract_pass(" Focus especially on the LATTER HALF of the document: troubleshooting, service procedures, error codes, parts lists, maintenance sections.")
+        if len(text2) > len(text):
+            # Merge: first pass + second pass (deduplicated roughly)
+            text = text + "\n\n--- [Additional content from second extraction pass] ---\n\n" + text2
+            print(f"TEXT EXTRACT MERGED: {filename} → {len(text)} chars total")
+
+    return text
 
 async def process_document_to_kb(doc_id: str, doc_name: str, text: str, category: str, description: str = ""):
     """Chunk document text and store in knowledge base."""
