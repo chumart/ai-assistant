@@ -78,11 +78,14 @@ async def init_db():
                 created_at  TIMESTAMP DEFAULT NOW()
             )
         """)
+        # Drop old IVFFlat index if exists, replace with HNSW
+        # IVFFlat requires REINDEX after new inserts; HNSW updates automatically
+        await conn.execute("DROP INDEX IF EXISTS knowledge_embedding_idx")
         await conn.execute("""
-            CREATE INDEX IF NOT EXISTS knowledge_embedding_idx
+            CREATE INDEX IF NOT EXISTS knowledge_embedding_hnsw_idx
             ON knowledge_chunks
-            USING ivfflat (embedding vector_cosine_ops)
-            WITH (lists = 100)
+            USING hnsw (embedding vector_cosine_ops)
+            WITH (m = 16, ef_construction = 64)
         """)
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS crawl_log (
@@ -151,7 +154,7 @@ async def init_db():
 @app.on_event("startup")
 async def startup():
     print("=" * 60)
-    print("CHUMART AI BACKEND — BUILD: haiku-default-v8 (2026-04-22)")
+    print("CHUMART AI BACKEND — BUILD: reindex-v9 (2026-04-22)")
     print("=" * 60)
     await init_db()
 
@@ -286,6 +289,7 @@ async def extract_text_from_file(file_bytes: bytes, filename: str, mime_type: st
 
     # Use Claude to extract text from PDF/image/docx
     b64 = base64.standard_b64encode(file_bytes).decode('utf-8')
+    print(f"TEXT EXTRACT: {filename} ({len(file_bytes)//1024}KB) via Claude")
     try:
         async with httpx.AsyncClient(timeout=300) as c:
             r = await c.post(
@@ -293,7 +297,7 @@ async def extract_text_from_file(file_bytes: bytes, filename: str, mime_type: st
                 headers={"x-api-key": ANTHROPIC_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json"},
                 json={
                     "model": "claude-haiku-4-5-20251001",
-                    "max_tokens": 8000,
+                    "max_tokens": 16000,
                     "messages": [{
                         "role": "user",
                         "content": [
@@ -304,9 +308,14 @@ async def extract_text_from_file(file_bytes: bytes, filename: str, mime_type: st
                 }
             )
             data = r.json()
-            return "".join(b.get("text", "") for b in data.get("content", []) if b.get("type") == "text")
+            if "error" in data:
+                print(f"TEXT EXTRACT ERROR {filename}: {data['error']}")
+                return ""
+            text = "".join(b.get("text", "") for b in data.get("content", []) if b.get("type") == "text")
+            print(f"TEXT EXTRACT OK: {filename} → {len(text)} chars")
+            return text
     except Exception as e:
-        print(f"Text extraction error: {e}")
+        print(f"Text extraction error {filename}: {e}")
         return ""
 
 async def process_document_to_kb(doc_id: str, doc_name: str, text: str, category: str):
@@ -3256,13 +3265,13 @@ async def upload_doc(
 
 async def _process_doc_background(doc_id: str, filename: str, file_bytes: bytes, mime_type: str, category: str):
     """Background task: extract text and index into knowledge base."""
-    print(f"Processing document: {filename}")
+    print(f"DOC INDEX START: {filename} ({len(file_bytes)//1024}KB) category={category}")
     text = await extract_text_from_file(file_bytes, filename, mime_type)
     if text:
         count = await process_document_to_kb(doc_id, filename, text, category)
-        print(f"Indexed {count} chunks for {filename}")
+        print(f"DOC INDEX OK: {filename} → {count} chunks")
     else:
-        print(f"No text extracted from {filename}")
+        print(f"DOC INDEX FAIL: {filename} — no text extracted")
 
 @app.get("/admin/documents")
 async def list_documents(admin_key: str = ""):
