@@ -1409,6 +1409,24 @@ GENERAL ODOO RULES:
 - For stock queries always add ["location_id.usage","=","internal"]
 - For product search use ilike on both name and default_code with OR logic
 
+STANDARD QUERY PATTERNS (follow these exactly):
+
+"Which SOs contain SKU X in the last N days?"
+→ Step 1: odoo_search(sale.order.line, [["product_id.default_code","=","SKU"],["order_id.date_order",">=","DATE"],["order_id.company_id","=",1]], ["order_id","product_id","product_uom_qty","price_unit"])
+→ Step 2: From results, extract unique order_id values
+→ Step 3: odoo_search(sale.order, [["id","in",[id1,id2...]]],["name","partner_id","date_order","state","amount_total"])
+→ NEVER search sale.order directly with product filter — always go through sale.order.line first
+
+"Which POs contain SKU X?"
+→ odoo_search(purchase.order.line, [["product_id.default_code","=","SKU"]], ["order_id","product_id","product_qty","price_unit"])
+→ Then fetch purchase.order details by id
+
+"PO from vendor X → what products → which SOs bought them recently?"
+→ Step 1: odoo_search(purchase.order, [["partner_id.name","ilike","Thunder Group"],["date_order",">=","DATE"],["company_id","=",1]], ["name","partner_id","date_order","order_line"])
+→ Step 2: odoo_search(purchase.order.line, [["order_id.partner_id.name","ilike","Thunder Group"],["order_id.date_order",">=","DATE"]], ["product_id","product_qty","order_id"])
+→ Step 3: For each product found, search sale.order.line: [["product_id","in",[pid1,pid2...]],["order_id.date_order",">=","DATE"],["order_id.company_id","=",1]]
+→ Step 4: Fetch sale.order details for matched order_ids
+
 When showing financial data: use $ with commas, be precise.
 When helping sales: be specific, cite model numbers, give concrete talking points.
 Only use markdown tables when data is genuinely tabular (multi-row comparisons, reports, lists with multiple columns). Do NOT use tables for single items, simple answers, or narrative responses.
