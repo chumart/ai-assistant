@@ -14,7 +14,22 @@ from urllib.parse import urljoin, urlparse
 from typing import Optional
 
 app = FastAPI()
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+
+# Only allow requests from your own frontend domains
+ALLOWED_ORIGINS = [
+    "https://chumartai.com",
+    "https://www.chumartai.com",
+    "https://ai-assistant-front-iota.vercel.app",  # Vercel preview
+    os.getenv("FRONTEND_URL", ""),  # Optional extra origin via env var
+]
+ALLOWED_ORIGINS = [o for o in ALLOWED_ORIGINS if o]  # Remove empty strings
+
+app.add_middleware(CORSMiddleware,
+    allow_origins=ALLOWED_ORIGINS,
+    allow_methods=["GET", "POST", "DELETE", "OPTIONS"],
+    allow_headers=["Content-Type", "Authorization", "X-Session-Token"],
+    allow_credentials=False,
+)
 
 ODOO_URL      = os.getenv("ODOO_URL", "")
 ODOO_DB       = os.getenv("ODOO_DB", "")
@@ -33,8 +48,28 @@ R2_PUBLIC_URL = os.getenv("R2_PUBLIC_URL", "")
 VALID_STATES = ["paid", "in_payment", "reversed"]
 CA_STATE_ID  = 13
 
-# In-memory file cache
-FILE_CACHE: dict = {}
+# In-memory file cache with timestamps for TTL cleanup
+FILE_CACHE: dict = {}  # file_id -> {b64, media_type, name, created_at}
+
+# Server-side session store: token -> {uid, role, username, created_at}
+# This prevents clients from forging their own role
+SESSION_STORE: dict = {}
+SESSION_TTL_HOURS = 12  # Sessions expire after 12 hours
+FILE_CACHE_TTL_HOURS = 2  # Uploaded files expire after 2 hours
+
+def cleanup_caches():
+    """Remove expired sessions and file cache entries."""
+    now = datetime.datetime.now()
+    expired_sessions = [t for t, s in SESSION_STORE.items()
+                        if (now - s["created_at"]).total_seconds() > SESSION_TTL_HOURS * 3600]
+    for t in expired_sessions:
+        del SESSION_STORE[t]
+    expired_files = [f for f, v in FILE_CACHE.items()
+                     if (now - v.get("created_at", now)).total_seconds() > FILE_CACHE_TTL_HOURS * 3600]
+    for f in expired_files:
+        del FILE_CACHE[f]
+    if expired_sessions or expired_files:
+        print(f"CACHE CLEANUP: removed {len(expired_sessions)} sessions, {len(expired_files)} files")
 
 # Target websites for knowledge base
 TARGET_SITES = [
@@ -154,7 +189,7 @@ async def init_db():
 @app.on_event("startup")
 async def startup():
     print("=" * 60)
-    print("CHUMART AI BACKEND — BUILD: extract-fix-v12 (2026-04-22)")
+    print("CHUMART AI BACKEND — BUILD: security-v13 (2026-04-22)")
     print("=" * 60)
     await init_db()
 
@@ -2563,18 +2598,19 @@ async def extract_file(file: UploadFile = File(...)):
         filename = file.filename.lower()
         if filename.endswith(('.txt', '.md', '.csv')):
             return {"text": content.decode('utf-8', errors='ignore'), "name": file.filename}
+        cleanup_caches()  # Clean expired entries on each upload
+        now = datetime.datetime.now()
         if filename.endswith('.pdf'):
             b64 = base64.standard_b64encode(content).decode('utf-8')
             fid = str(uuid.uuid4())
-            FILE_CACHE[fid] = {"b64": b64, "media_type": "application/pdf", "name": file.filename}
+            FILE_CACHE[fid] = {"b64": b64, "media_type": "application/pdf", "name": file.filename, "created_at": now}
             return {"text": "", "name": file.filename, "file_id": fid}
         if filename.endswith(('.png', '.jpg', '.jpeg', '.webp')):
             ext = filename.split('.')[-1].replace('jpg', 'jpeg')
             media_type = f"image/{ext}"
             b64 = base64.standard_b64encode(content).decode('utf-8')
             fid = str(uuid.uuid4())
-            FILE_CACHE[fid] = {"b64": b64, "media_type": media_type, "name": file.filename}
-            preview = f"data:{media_type};base64,{b64[:200]}..."  # truncated for transport
+            FILE_CACHE[fid] = {"b64": b64, "media_type": media_type, "name": file.filename, "created_at": now}
             return {"text": "", "name": file.filename, "file_id": fid, "is_image": True, "preview_url": f"data:{media_type};base64,{b64}"}
         return {"text": content.decode('utf-8', errors='ignore'), "name": file.filename}
     except Exception as e:
@@ -2772,17 +2808,41 @@ class ChatRequest(BaseModel):
     file_content: str = ""
     file_name: str = ""
     file_id: str = ""
-    role: str = "guest"
+    role: str = "guest"       # Fallback only — server verifies via session_token
     user_name: str = ""
     user_id: int = 0
     model: str = "claude-haiku-4-5-20251001"
     free_mode: bool = False
     session_id: str = ""
     session_title: str = ""
+    session_token: str = ""   # Server-side session token for role verification
+
+def resolve_session(req: ChatRequest) -> dict:
+    """Resolve uid/role from server-side session token.
+    Falls back to client-supplied values only if token is absent (backward compat).
+    Returns dict with uid, role, user_name."""
+    if req.session_token and req.session_token in SESSION_STORE:
+        s = SESSION_STORE[req.session_token]
+        # Check expiry
+        age = (datetime.datetime.now() - s["created_at"]).total_seconds()
+        if age < SESSION_TTL_HOURS * 3600:
+            return {"uid": s["uid"], "role": s["role"], "user_name": s["name"]}
+        else:
+            del SESSION_STORE[req.session_token]
+    # No valid token — treat as guest (prevents role spoofing)
+    if req.session_token:
+        print(f"SECURITY: invalid/expired session_token, treating as guest")
+        return {"uid": 0, "role": "guest", "user_name": ""}
+    # No token at all — legacy mode (backward compat during transition)
+    return {"uid": req.user_id, "role": req.role, "user_name": req.user_name}
 
 @app.post("/chat")
 async def chat(req: ChatRequest, background_tasks: BackgroundTasks):
-    perms = ROLE_PERMISSIONS.get(req.role, ROLE_PERMISSIONS["guest"])
+    sess = resolve_session(req)
+    verified_role = sess["role"]
+    verified_uid = sess["uid"]
+    verified_name = sess["user_name"]
+    perms = ROLE_PERMISSIONS.get(verified_role, ROLE_PERMISSIONS["guest"])
 
     # Filter tools based on permissions
     allowed_tools = []
@@ -2826,21 +2886,21 @@ async def chat(req: ChatRequest, background_tasks: BackgroundTasks):
     messages = rebuild_history_with_files(req.history) + [{"role": "user", "content": user_message_content}]
     headers = {"x-api-key": ANTHROPIC_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json"}
     memories = []
-    if req.user_id:
-        memories = await db_get_memory(req.user_id)
+    if verified_uid:
+        memories = await db_get_memory(verified_uid)
 
     # Determine model
-    if req.role == "admin" and req.model in ALLOWED_MODELS:
+    if verified_role == "admin" and req.model in ALLOWED_MODELS:
         selected_model = req.model
-    elif req.role != "admin" and req.model in NON_ADMIN_MODELS:
+    elif verified_role != "admin" and req.model in NON_ADMIN_MODELS:
         selected_model = req.model
     else:
         selected_model = "claude-haiku-4-5-20251001"
 
-    system_prompt = get_system_prompt(req.role, req.user_name, req.user_id, req.free_mode, memories)
+    system_prompt = get_system_prompt(verified_role, verified_name, verified_uid, req.free_mode, memories)
 
     # Context passed to tools (for buyer attribution, etc.)
-    tool_context = {"uid": req.user_id, "username": req.user_name, "role": req.role}
+    tool_context = {"uid": verified_uid, "username": verified_name, "role": verified_role}
 
     # Route to OpenAI if selected
     if selected_model in OPENAI_MODELS:
@@ -2916,7 +2976,11 @@ async def chat_stream(req: ChatRequest, background_tasks: BackgroundTasks):
     """
     from fastapi.responses import StreamingResponse
 
-    perms = ROLE_PERMISSIONS.get(req.role, ROLE_PERMISSIONS["guest"])
+    sess = resolve_session(req)
+    verified_role = sess["role"]
+    verified_uid = sess["uid"]
+    verified_name = sess["user_name"]
+    perms = ROLE_PERMISSIONS.get(verified_role, ROLE_PERMISSIONS["guest"])
 
     # Filter tools based on permissions
     allowed_tools = []
@@ -2953,24 +3017,24 @@ async def chat_stream(req: ChatRequest, background_tasks: BackgroundTasks):
 
     # Load memory & build system prompt
     memories = []
-    if req.user_id:
-        memories = await db_get_memory(req.user_id)
+    if verified_uid:
+        memories = await db_get_memory(verified_uid)
 
-    # Determine model — streaming only supports Claude. OpenAI falls back to non-stream.
-    if req.role == "admin" and req.model in ALLOWED_MODELS:
+    # Determine model
+    if verified_role == "admin" and req.model in ALLOWED_MODELS:
         selected_model = req.model
-    elif req.role != "admin" and req.model in NON_ADMIN_MODELS:
+    elif verified_role != "admin" and req.model in NON_ADMIN_MODELS:
         selected_model = req.model
     else:
         selected_model = "claude-haiku-4-5-20251001"
 
     # Context passed to tools (for buyer attribution on PO creation, etc.)
-    tool_context = {"uid": req.user_id, "username": req.user_name, "role": req.role}
+    tool_context = {"uid": verified_uid, "username": verified_name, "role": verified_role}
 
     if selected_model in OPENAI_MODELS:
         # OpenAI streaming path with tool-call support
         openai_key = os.getenv("OPENAI_API_KEY", "")
-        system_prompt = get_system_prompt(req.role, req.user_name, req.user_id, req.free_mode, memories)
+        system_prompt = get_system_prompt(verified_role, verified_name, verified_uid, req.free_mode, memories)
 
         # Build OpenAI-format messages
         if has_file and cached_file:
@@ -3146,7 +3210,7 @@ async def chat_stream(req: ChatRequest, background_tasks: BackgroundTasks):
         })
 
     # Anthropic streaming path
-    system_prompt = get_system_prompt(req.role, req.user_name, req.user_id, req.free_mode, memories)
+    system_prompt = get_system_prompt(verified_role, verified_name, verified_uid, req.free_mode, memories)
     headers = {
         "x-api-key": ANTHROPIC_KEY,
         "anthropic-version": "2023-06-01",
@@ -3545,18 +3609,6 @@ async def get_signed_url(doc_id: str, download: bool = True):
 async def invoice_stats(year: int, month: int):
     return await monthly_tax(year, month)
 
-@app.get("/test-odoo")
-async def test_odoo():
-    try:
-        async with httpx.AsyncClient(timeout=15, follow_redirects=True) as c:
-            r = await c.post(f"{ODOO_URL}/web/session/authenticate", json={
-                "jsonrpc":"2.0","method":"call","id":1,
-                "params":{"db":ODOO_DB,"login":ODOO_USERNAME,"password":ODOO_PASSWORD}
-            })
-            return {"status": r.status_code, "body": r.text[:300]}
-    except Exception as e:
-        return {"error": str(e)}
-
 @app.get("/health")
 async def health():
     conn = await get_db_conn()
@@ -3734,6 +3786,7 @@ async def login(req: LoginRequest):
                 return {"success": False, "error": "Invalid username or password"}
 
             uid = result.get("uid")
+            name = result.get("name", req.username)
 
             # Cache user's Odoo session for write operations
             USER_ODOO_SESSIONS[uid] = {
@@ -3741,18 +3794,32 @@ async def login(req: LoginRequest):
                 "time": datetime.datetime.now()
             }
 
-            # Detect role (uses admin session internally)
+            # Detect role server-side (uses admin session internally)
             role = await get_user_role(uid)
             permissions = ROLE_PERMISSIONS.get(role, ROLE_PERMISSIONS["guest"])
 
+            # Generate server-side session token
+            # Client will send this in X-Session-Token header; backend resolves uid/role from it
+            session_token = str(uuid.uuid4())
+            cleanup_caches()
+            SESSION_STORE[session_token] = {
+                "uid": uid,
+                "username": req.username,
+                "name": name,
+                "role": role,
+                "created_at": datetime.datetime.now()
+            }
+            print(f"LOGIN: uid={uid} name={name} role={role} token={session_token[:8]}...")
+
             return {
-                "success":     True,
-                "uid":         uid,
-                "name":        result.get("name", req.username),
-                "username":    req.username,
-                "role":        role,
-                "role_label":  permissions["label"],
-                "permissions": permissions,
+                "success":       True,
+                "uid":           uid,
+                "name":          name,
+                "username":      req.username,
+                "role":          role,
+                "role_label":    permissions["label"],
+                "permissions":   permissions,
+                "session_token": session_token,  # Frontend stores and sends this
             }
     except Exception as e:
         return {"success": False, "error": str(e)}
