@@ -2308,7 +2308,7 @@ async def kb_status():
     finally:
         await conn.close()
 
-@app.post("/admin/reindex-docs")
+@app.get("/admin/reindex-docs")
 async def reindex_docs(admin_key: str = "", background_tasks: BackgroundTasks = None):
     """Re-extract and re-index all uploaded documents from R2."""
     if admin_key != os.getenv("ADMIN_KEY", "chumart2024"):
