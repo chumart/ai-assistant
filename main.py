@@ -1044,7 +1044,7 @@ TOOLS = [
     {
         "name": "search_documents",
         "description": "Search for specific internal documents by name or category. Use when user asks to find or download a specific file like a service manual, employee handbook, or procedure document. Returns document name, category, and download link.",
-        "input_schema": {"type":"object","properties":{"query":{"type":"string","description":"Document name or keywords"},"category":{"type":"string","description":"Optional: service_manual, employee_handbook, after_sales, warranty, general"}},"required":["query"]}
+        "input_schema": {"type":"object","properties":{"query":{"type":"string","description":"Document name or keywords"},"category":{"type":"string","description":"Optional: service_manual, product_manual, spec_sheet, employee_handbook, after_sales, warranty, general"}},"required":["query"]}
     },
     {
         "name": "odoo_create_record",
@@ -3106,7 +3106,7 @@ async def clear_memory(uid: int):
 # Document Management (Admin)
 # ─────────────────────────────────────────────
 
-ALLOWED_CATEGORIES = ["service_manual", "employee_handbook", "after_sales", "warranty", "general"]
+ALLOWED_CATEGORIES = ["service_manual", "product_manual", "spec_sheet", "employee_handbook", "after_sales", "warranty", "general"]
 
 @app.post("/admin/upload-doc")
 async def upload_doc(
