@@ -2293,13 +2293,78 @@ async def kb_status():
         total = await conn.fetchval("SELECT COUNT(*) FROM knowledge_chunks")
         by_site = await conn.fetch("SELECT site_name, COUNT(*) as chunks FROM knowledge_chunks GROUP BY site_name ORDER BY chunks DESC")
         logs = await conn.fetch("SELECT site_url, status, pages, chunks, started_at, finished_at FROM crawl_log ORDER BY started_at DESC LIMIT 10")
+        # Also show doc chunks breakdown
+        doc_chunks = await conn.fetch("""
+            SELECT site_name, category, COUNT(*) as chunks
+            FROM knowledge_chunks WHERE site_url LIKE 'doc:%'
+            GROUP BY site_name, category ORDER BY chunks DESC
+        """)
         return {
             "total_chunks": total,
             "by_site": [dict(r) for r in by_site],
+            "doc_chunks": [dict(r) for r in doc_chunks],
             "recent_crawls": [dict(r) for r in logs]
         }
     finally:
         await conn.close()
+
+@app.post("/admin/reindex-docs")
+async def reindex_docs(admin_key: str = "", background_tasks: BackgroundTasks = None):
+    """Re-extract and re-index all uploaded documents from R2."""
+    if admin_key != os.getenv("ADMIN_KEY", "chumart2024"):
+        return {"error": "Invalid admin key"}
+    conn = await get_db_conn()
+    if not conn:
+        return {"error": "DB not connected"}
+    try:
+        rows = await conn.fetch("""
+            SELECT id, filename, original_name, category, mime_type, r2_key
+            FROM documents ORDER BY created_at DESC
+        """)
+    finally:
+        await conn.close()
+
+    if not rows:
+        return {"status": "no documents found"}
+
+    async def do_reindex():
+        ok_count = 0
+        fail_count = 0
+        for row in rows:
+            try:
+                doc_id = row["id"]
+                r2_key = row["r2_key"]
+                category = row["category"]
+                mime_type = row["mime_type"]
+                original_name = row["original_name"]
+                # Fetch file bytes from R2
+                url = f"{R2_PUBLIC_URL}/{r2_key}"
+                async with httpx.AsyncClient(timeout=60) as c:
+                    r = await c.get(url)
+                    if r.status_code != 200:
+                        print(f"REINDEX FAIL fetch {original_name}: HTTP {r.status_code}")
+                        fail_count += 1
+                        continue
+                    file_bytes = r.content
+                text = await extract_text_from_file(file_bytes, original_name, mime_type)
+                if text:
+                    count = await process_document_to_kb(doc_id, original_name, text, category)
+                    print(f"REINDEX OK: {original_name} → {count} chunks")
+                    ok_count += 1
+                else:
+                    print(f"REINDEX SKIP {original_name}: no text extracted")
+                    fail_count += 1
+            except Exception as e:
+                print(f"REINDEX ERROR {row.get('original_name')}: {e}")
+                fail_count += 1
+        print(f"REINDEX DONE: {ok_count} ok, {fail_count} failed")
+
+    background_tasks.add_task(do_reindex)
+    return {
+        "status": "reindex started",
+        "documents": len(rows),
+        "message": f"Re-indexing {len(rows)} documents in background. Check Railway logs for progress."
+    }
 
 @app.delete("/admin/kb-clear")
 async def kb_clear(site_url: str = "", admin_key: str = ""):
