@@ -1843,59 +1843,56 @@ async def run_tool(name, inp, context=None):
         # by falling back to SKU / product_name / partner_name lookup.
         # ─────────────────────────────────────────────────────────────
 
-        # (A) Batch-validate all product_ids the AI passed
-        all_pids = list({l.get("product_id") for po in orders
-                         for l in po.get("lines", []) if l.get("product_id")})
-        valid_pids = set()
-        if all_pids:
-            r = json.loads(await odoo_query("product.product",
-                [["id","in",all_pids],["active","=",True]],
-                ["id"], limit=1000, cookies=cookies))
-            if isinstance(r, list):
-                valid_pids = {p["id"] for p in r}
-        print(f"ID RESCUE: {len(valid_pids)}/{len(all_pids)} product_ids valid as-is")
+        # (A) SKU-FIRST product resolution — completely ignore AI's product_id when SKU is available
+        # AI hallucinates product_ids that happen to be valid but belong to WRONG products.
+        # The only trustworthy identifier is the SKU string.
+        sku_cache = {}  # sku -> product_id (batch lookup)
 
-        # (B) For invalid product_ids, try SKU → exact name → prefix name
+        # Collect all SKUs first for batch query
+        all_skus = list({(l.get("sku") or "").strip().upper()
+                         for po in orders for l in po.get("lines", [])
+                         if (l.get("sku") or "").strip()})
+        if all_skus:
+            for sku in all_skus:
+                r = json.loads(await odoo_query("product.product",
+                    [["default_code","=ilike",sku],["active","=",True]],
+                    ["id","default_code"], limit=3, cookies=cookies))
+                if isinstance(r, list) and r:
+                    # Prefer exact match
+                    exact = [p for p in r if (p.get("default_code") or "").upper() == sku]
+                    p = exact[0] if exact else r[0]
+                    sku_cache[sku] = p["id"]
+
+        print(f"ID RESCUE: {len(sku_cache)}/{len(all_skus)} SKUs resolved via batch lookup")
+
+        # (B) Apply: for each line, if SKU available → use SKU-resolved id; else fallback to name
         for po in orders:
             for line in po.get("lines", []):
+                sku = (line.get("sku") or "").strip().upper()
                 pid = line.get("product_id")
-                if pid and pid in valid_pids:
-                    continue
-                sku = (line.get("sku") or "").strip()
                 pname = (line.get("product_name") or "").strip()
-                resolved = None
-                via = None
 
-                if sku:
-                    r = json.loads(await odoo_query("product.product",
-                        [["default_code","=",sku],["active","=",True]],
-                        ["id"], limit=1, cookies=cookies))
-                    if isinstance(r, list) and r:
-                        resolved, via = r[0]["id"], f"SKU={sku}"
+                if sku and sku in sku_cache:
+                    correct_id = sku_cache[sku]
+                    if pid != correct_id:
+                        print(f"ID RESCUE: SKU={sku} → product_id {pid} → {correct_id} (SKU override)")
+                    line["product_id"] = correct_id
+                    continue
 
-                if not resolved and pname:
-                    r = json.loads(await odoo_query("product.product",
-                        [["name","=",pname],["active","=",True]],
-                        ["id"], limit=1, cookies=cookies))
-                    if isinstance(r, list) and r:
-                        resolved, via = r[0]["id"], "exact name"
-
-                if not resolved and pname:
-                    # Use the first distinctive chunk of name (before first comma)
-                    prefix = pname.split(",")[0].strip()[:60]
-                    if len(prefix) >= 10:
+                # No SKU or SKU not found — try by name
+                if not pid:
+                    resolved = None
+                    if pname:
                         r = json.loads(await odoo_query("product.product",
-                            [["name","ilike",prefix],["active","=",True]],
+                            [["name","ilike",pname.split(",")[0].strip()[:60]],["active","=",True]],
                             ["id","name"], limit=3, cookies=cookies))
                         if isinstance(r, list) and len(r) == 1:
-                            resolved, via = r[0]["id"], f"prefix match '{prefix[:30]}'"
-
-                if resolved:
-                    print(f"ID RESCUE: product_id {pid} → {resolved} (via {via})")
-                    line["product_id"] = resolved
-                    valid_pids.add(resolved)
-                else:
-                    print(f"ID RESCUE FAIL: pid={pid} sku='{sku}' name='{pname[:60]}'")
+                            resolved = r[0]["id"]
+                    if resolved:
+                        print(f"ID RESCUE: no SKU, product_id None → {resolved} (by name)")
+                        line["product_id"] = resolved
+                    else:
+                        print(f"ID RESCUE FAIL: no SKU, pid={pid}, name='{pname[:60]}'")
 
         # (C) Validate partner_ids; rescue via partner_name
         all_partner_ids = list({po.get("partner_id") for po in orders if po.get("partner_id")})
