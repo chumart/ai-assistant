@@ -1428,9 +1428,14 @@ GENERAL ODOO RULES:
 
 STANDARD QUERY PATTERNS (follow these exactly):
 
-"Show PO X details" / "PO X 的产品" / "PO X related SOs" / "which customers bought from PO X":
-→ ALWAYS use get_po_with_so_links(po_name="P00461") — do NOT manually query purchase.order + purchase.order.line + sale.order.line
-→ This tool handles id/name mapping and all table joins correctly
+"Show PO X details" / "查下PO X的清单" / "PO X 的产品":
+→ Step 1 ONLY: Use odoo_search to query PO header + PO lines + product details (SKU, name, qty, price)
+→ Show the product list in a clean table
+→ At the end, ASK the user: "需要查一下这些产品最近的相关销售订单吗？"
+→ Do NOT automatically query SOs — wait for user to ask
+
+"PO X related SOs" / "查下这些产品的SO" / "which customers bought from PO X" / user says yes to SO query:
+→ NOW use get_po_with_so_links(po_name="P00461") — this handles all table joins correctly
 → Adjust days_back if user specifies a time range (e.g. "last 7 days" → days_back=7)
 → Use include_all_so=true if user wants all historical SOs
 
