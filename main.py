@@ -1460,6 +1460,7 @@ CALCULATION RULES: When summing financial data from tool results, always use the
 
 DATA ACCURACY RULES (CRITICAL — violations damage user trust):
 - NEVER invent, guess, or fill in ANY field value — customer names, order numbers, SKUs, prices, addresses, phone numbers, etc.
+- If a tool returns an error → tell the user "查询出错" and show the error message. NEVER fabricate data to fill in for a failed query.
 - If a field is empty or null in the tool result → say "not found" or "not set in Odoo", do NOT substitute a plausible-sounding value
 - Customer names MUST come from the actual tool query result (partner_id field in sale.order/purchase.order). Never use a company name you "think" is the customer.
 - If the first query doesn't return the expected field, run another query with the correct fields — do NOT guess
@@ -2084,9 +2085,10 @@ async def run_tool(name, inp, context=None):
 
     if name == "get_po_with_so_links":
         """Get a PO's product lines and find matching SO records within a date range."""
-        po_name = inp.get("po_name", "").strip()       # e.g. "P00461"
-        days_back = inp.get("days_back", 30)            # how far back to look for SOs
-        include_all_so = inp.get("include_all_so", False)  # if True, no date filter on SOs
+        import datetime as dt
+        po_name = inp.get("po_name", "").strip()
+        days_back = inp.get("days_back", 30)
+        include_all_so = inp.get("include_all_so", False)
 
         if not po_name:
             return json.dumps({"error": "po_name is required (e.g. 'P00461')"})
@@ -2119,7 +2121,7 @@ async def run_tool(name, inp, context=None):
             prod_map = {p["id"]: p for p in prod_r} if isinstance(prod_r, list) else {}
 
             # Step 4: Find SOs containing these products
-            date_from = (datetime.datetime.now() - datetime.timedelta(days=days_back)).strftime("%Y-%m-%d")
+            date_from = (dt.datetime.now() - dt.timedelta(days=days_back)).strftime("%Y-%m-%d")
             sol_r = json.loads(await odoo_query("sale.order.line",
                 [["product_id", "in", product_ids]],
                 ["order_id", "product_id", "product_uom_qty", "price_unit"],
@@ -2195,7 +2197,6 @@ async def run_tool(name, inp, context=None):
         orders = inp.get("purchase_orders", [])
         created = []
         errors = []
-        import datetime
         date_planned = (datetime.datetime.now() + datetime.timedelta(days=7)).strftime("%Y-%m-%d %H:%M:%S")
         now_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
