@@ -896,7 +896,7 @@ async def fetch_moves(move_type, date_from, date_to):
          ["company_id","=",1],["payment_state","in",VALID_STATES]],
         ["name", "invoice_partner_display_name", "partner_id", "invoice_user_id",
          "invoice_date", "invoice_origin", "amount_untaxed", "amount_untaxed_signed",
-         "amount_tax", "amount_tax_signed", "amount_total", "amount_total_signed",
+         "amount_tax", "amount_tax_signed", "amount_total", "amount_total_signed", "move_type",
          "payment_state", "ref", "source_id", "x_payment_method", "tag_ids"],
         limit=2000
     )
@@ -914,7 +914,7 @@ async def fetch_credits(date_from, date_to):
          ["company_id","=",1],["payment_state","in",VALID_STATES]],
         ["name", "invoice_partner_display_name", "partner_id", "invoice_user_id",
          "invoice_date", "invoice_origin", "amount_untaxed", "amount_untaxed_signed",
-         "amount_tax", "amount_tax_signed", "amount_total", "amount_total_signed",
+         "amount_tax", "amount_tax_signed", "amount_total", "amount_total_signed", "move_type",
          "payment_state", "ref", "source_id", "x_payment_method", "tag_ids"],
         limit=2000
     )
@@ -926,17 +926,13 @@ async def fetch_credits(date_from, date_to):
 def summarize_moves(records, is_credit=False):
     by_state = {"paid":0,"in_payment":0,"reversed":0}
     total_untaxed = total_tax = total_amount = 0
-    sign = -1 if is_credit else 1
     for r in records:
         state = r.get("payment_state","")
         if state in by_state: by_state[state] += 1
-        # Prefer Odoo's pre-computed signed fields for consistency
-        untaxed_signed = r.get("amount_untaxed_signed")
-        total_untaxed += untaxed_signed if untaxed_signed is not None else r.get("amount_untaxed", 0) * sign
-        tax_signed = r.get("amount_tax_signed")
-        total_tax += tax_signed if tax_signed is not None else r.get("amount_tax", 0) * sign
-        total_signed = r.get("amount_total_signed")
-        total_amount += total_signed if total_signed is not None else r.get("amount_total", 0) * sign
+        # Odoo 17: use _signed fields directly (already have correct sign for credits)
+        total_untaxed += r.get("amount_untaxed_signed", 0)
+        total_tax     += r.get("amount_tax_signed", 0)
+        total_amount  += r.get("amount_total_signed", 0)
     return {"count":len(records),"by_payment_state":by_state,
             "total_untaxed":round(total_untaxed,2),"total_tax":round(total_tax,2),"total_amount":round(total_amount,2)}
 
@@ -1021,20 +1017,16 @@ async def monthly_sales(year: int, month: int):
     # Group by salesperson for summary
     def group_by_salesperson(records, is_credit=False):
         by_person = {}
-        sign = -1 if is_credit else 1
         for r in records:
             name = get_salesperson(r)
             if name not in by_person:
                 by_person[name] = {"salesperson": name, "count": 0,
                                    "amount_untaxed": 0, "amount_tax": 0, "amount_total": 0}
             by_person[name]["count"] += 1
-            # Use Odoo's signed fields consistently for all amounts
-            untaxed_signed = r.get("amount_untaxed_signed")
-            by_person[name]["amount_untaxed"] += untaxed_signed if untaxed_signed is not None else r.get("amount_untaxed", 0) * sign
-            tax_signed = r.get("amount_tax_signed")
-            by_person[name]["amount_tax"] += tax_signed if tax_signed is not None else r.get("amount_tax", 0) * sign
-            total_signed = r.get("amount_total_signed")
-            by_person[name]["amount_total"] += total_signed if total_signed is not None else r.get("amount_total", 0) * sign
+            # Odoo 17: _signed fields already have correct sign
+            by_person[name]["amount_untaxed"] += r.get("amount_untaxed_signed", 0)
+            by_person[name]["amount_tax"]     += r.get("amount_tax_signed", 0)
+            by_person[name]["amount_total"]   += r.get("amount_total_signed", 0)
         for p in by_person.values():
             p["amount_untaxed"] = round(p["amount_untaxed"], 2)
             p["amount_tax"]     = round(p["amount_tax"], 2)
@@ -1325,25 +1317,18 @@ Do NOT show detail rows in the chat — too many records. Only provide the downl
 
 === SPECIFIC SALESPERSON (e.g. "Gene的4月commission") ===
 
-Filter by_salesperson and detail_rows to show ONLY that person's data:
+Filter by_salesperson to show ONLY that person's data:
 
 PART A — 该销售员汇总:
 Show only that salesperson's row: 发票数, 退款数, 发票金额, 退款金额, 净销售额(税前)
 
-PART B — 发票明细 (Invoices):
-| 客户名称 | 日期 | 发票号 | SO单号 | 金额(税前) | 付款方式 |
-Show only invoices (positive amounts) for this person, sorted by date desc.
-
-PART C — 退款明细 (Credit Notes):
-| 客户名称 | 日期 | 发票号 | SO单号 | 金额(税前) | 付款方式 |
-Show only credit notes (negative amounts) for this person, sorted by date desc.
-If no credit notes, say "本月无退款记录".
-
-PART D — Export Excel:
-[📥 Export Excel](BACKEND_URL/export/commission?year=YYYY&month=MM)
+PART B — Export Excel (该销售员完整明细在下载文件里):
+Do NOT show detail rows in the chat — only provide the download link.
+[📥 Export Excel](BACKEND_URL/export/commission?year=YYYY&month=MM&salesperson=NAME)
 
 Replace BACKEND_URL with: {os.getenv('RAILWAY_PUBLIC_DOMAIN', 'https://chumart-ai.up.railway.app')}
-Replace YYYY and MM with the actual year and month numbers."""
+Replace YYYY and MM with the actual year and month numbers.
+Replace NAME with the salesperson's exact name (URL-encoded)."""
     else:
         finance_rules = """
 FINANCIAL RULES (NO ACCESS):
@@ -1462,7 +1447,7 @@ STANDARD QUERY PATTERNS (follow these exactly):
 → Adjust days_back if user specifies a time range (e.g. "last 7 days" → days_back=7)
 → Use include_all_so=true if user wants all historical SOs
 
-CRITICAL: Odoo 14 does NOT support 2-level relational filters like "order_id.date_order" or "order_id.company_id" on order lines — these silently return wrong/empty results. Always filter dates at the order level in a separate query.
+CRITICAL: Odoo 17 does NOT reliably support 2-level relational filters like "order_id.date_order" or "order_id.company_id" on order lines — these may silently return wrong/empty results. Always filter dates at the order level in a separate query.
 CRITICAL: NEVER use "order_id.id" as a filter — use "order_id" directly. Example: [["order_id","in",[453,447]]] NOT [["order_id.id","in",[453,447]]]
 
 "Which SOs contain SKU X in the last N days?"
@@ -3099,17 +3084,16 @@ async def chat(req: ChatRequest, background_tasks: BackgroundTasks):
     if verified_uid:
         memories = await db_get_memory(verified_uid)
 
-    # Determine model
+    # Determine model — admin/finance default to Sonnet, others to Haiku
+    default_model = "claude-sonnet-4-5" if verified_role in ("admin", "finance") else "claude-haiku-4-5-20251001"
     if verified_role == "admin" and req.model in ALLOWED_MODELS:
         selected_model = req.model
     elif verified_role != "admin" and req.model in NON_ADMIN_MODELS:
         selected_model = req.model
     else:
-        selected_model = "claude-haiku-4-5-20251001"
+        selected_model = default_model
 
     system_prompt = get_system_prompt(verified_role, verified_name, verified_uid, req.free_mode, memories)
-
-    # Context passed to tools (for buyer attribution, etc.)
     tool_context = {"uid": verified_uid, "username": verified_name, "role": verified_role}
 
     # Route to OpenAI if selected
@@ -3230,13 +3214,14 @@ async def chat_stream(req: ChatRequest, background_tasks: BackgroundTasks):
     if verified_uid:
         memories = await db_get_memory(verified_uid)
 
-    # Determine model
+    # Determine model — admin/finance default to Sonnet, others to Haiku
+    default_model = "claude-sonnet-4-5" if verified_role in ("admin", "finance") else "claude-haiku-4-5-20251001"
     if verified_role == "admin" and req.model in ALLOWED_MODELS:
         selected_model = req.model
     elif verified_role != "admin" and req.model in NON_ADMIN_MODELS:
         selected_model = req.model
     else:
-        selected_model = "claude-haiku-4-5-20251001"
+        selected_model = default_model
 
     # Context passed to tools (for buyer attribution on PO creation, etc.)
     tool_context = {"uid": verified_uid, "username": verified_name, "role": verified_role}
@@ -4040,9 +4025,8 @@ async def login(req: LoginRequest):
 # ─────────────────────────────────────────────
 
 @app.get("/export/commission")
-async def export_commission(year: int, month: int):
-    """Export commission data as Excel matching Odoo SALE COMMISSION NEW template exactly.
-    Format: Header → [Salesperson Group Header (name + count, total)] → detail rows by date desc."""
+async def export_commission(year: int, month: int, salesperson: str = ""):
+    """Export commission data as Excel. Optional salesperson filter."""
     from fastapi.responses import StreamingResponse
     import openpyxl
     from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
@@ -4108,6 +4092,16 @@ async def export_commission(year: int, month: int):
     for sp in by_person:
         by_person[sp].sort(key=lambda x: x["Invoice/Bill Date"] or "", reverse=True)
 
+    # Filter by salesperson if specified
+    if salesperson:
+        filtered = {}
+        for sp, rows in by_person.items():
+            if salesperson.lower() in sp.lower():
+                filtered[sp] = rows
+        if filtered:
+            by_person = filtered
+        # If no match, keep all (fallback)
+
     # Sort salespersons by total amount descending
     sp_totals = {sp: sum(r["Untaxed Amount Signed"] for r in rows) for sp, rows in by_person.items()}
     sorted_persons = sorted(by_person.keys(), key=lambda sp: sp_totals[sp], reverse=True)
@@ -4161,4 +4155,5 @@ async def export_commission(year: int, month: int):
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         headers={"Content-Disposition": f"attachment; filename={filename}"}
     )
+
 
