@@ -1304,8 +1304,11 @@ FINANCIAL REPORT RULES (you have access):
 COMMISSION REPORT RULES (IMPORTANT — follow this exactly):
 When user mentions "commission", "提成", "销售提成", "佣金", or any combination like "X月commission", "commission统计":
 1. Extract year and month from the request (e.g. "26年3月" = 2026-03, "3月" = current year March)
-2. Call get_monthly_sales with the correct year and month
-3. Present results in this format:
+2. Check if user is asking for a SPECIFIC salesperson (e.g. "Gene的4月commission", "查下Alex的提成")
+3. Call get_monthly_sales with the correct year and month
+4. Present results based on whether it's for ALL salespeople or ONE specific person:
+
+=== ALL SALESPEOPLE (default) ===
 
 PART A — 销售员销售统计（按销售员）:
 | 销售员 | 发票数 | 退款数 | 发票金额 | 退款金额 | 净销售额(税前) |
@@ -1316,23 +1319,31 @@ Use $ with commas for all amounts. Copy numbers directly from tool response.
 PART B — Commission Base 汇总:
 Show commission_base values: net_sales_excl_tax (净销售额税前), net_tax (销售税), net_sales_incl_tax (净销售额税后), invoice_count (发票总数), credit_note_count (退款单总数).
 
-PART C — 明细表 (Grouped by Salesperson):
-For EACH salesperson, show a group header and detail table matching this Odoo template format:
-**销售员名 (发票数)**
-| 客户名称 | 日期 | 发票号 | SO单号 | 金额(税前) | 来源 | 付款方式 | 标签 |
-List all invoices+credit notes for this person, sorted by date descending.
-Credit notes should show negative amounts.
-
-PART D — Excel export button:
-Always end with this exact markdown link for Excel download:
+PART C — Export Excel (明细在下载文件里):
+Do NOT show detail rows in the chat — too many records. Only provide the download link.
 [📥 Export Excel](BACKEND_URL/export/commission?year=YYYY&month=MM)
+
+=== SPECIFIC SALESPERSON (e.g. "Gene的4月commission") ===
+
+Filter by_salesperson and detail_rows to show ONLY that person's data:
+
+PART A — 该销售员汇总:
+Show only that salesperson's row: 发票数, 退款数, 发票金额, 退款金额, 净销售额(税前)
+
+PART B — 发票明细 (Invoices):
+| 客户名称 | 日期 | 发票号 | SO单号 | 金额(税前) | 付款方式 |
+Show only invoices (positive amounts) for this person, sorted by date desc.
+
+PART C — 退款明细 (Credit Notes):
+| 客户名称 | 日期 | 发票号 | SO单号 | 金额(税前) | 付款方式 |
+Show only credit notes (negative amounts) for this person, sorted by date desc.
+If no credit notes, say "本月无退款记录".
+
+PART D — Export Excel:
+[📥 Export Excel](BACKEND_URL/export/commission?year=YYYY&month=MM)
+
 Replace BACKEND_URL with: {os.getenv('RAILWAY_PUBLIC_DOMAIN', 'https://chumart-ai.up.railway.app')}
-Replace YYYY and MM with the actual year and month numbers.
-
-Example: user says "3月commission" in 2026 → call get_monthly_sales(year=2026, month=3) → show PART A summary → PART B totals → PART C details grouped by salesperson → PART D export link
-
-The Excel export follows the SALE COMMISSION NEW template with fields:
-Invoice Partner Display Name, Invoice/Bill Date, Number, Origin, Untaxed Amount Signed, Reference, Source, Payment Method, Tags, Salesperson, Payment Status"""
+Replace YYYY and MM with the actual year and month numbers."""
     else:
         finance_rules = """
 FINANCIAL RULES (NO ACCESS):
@@ -4150,3 +4161,4 @@ async def export_commission(year: int, month: int):
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         headers={"Content-Disposition": f"attachment; filename={filename}"}
     )
+
