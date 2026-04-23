@@ -926,13 +926,19 @@ async def fetch_credits(date_from, date_to):
 def summarize_moves(records, is_credit=False):
     by_state = {"paid":0,"in_payment":0,"reversed":0}
     total_untaxed = total_tax = total_amount = 0
+    sign = -1 if is_credit else 1
     for r in records:
         state = r.get("payment_state","")
         if state in by_state: by_state[state] += 1
-        # Odoo 17: use _signed fields directly (already have correct sign for credits)
+        # amount_untaxed_signed: reliable in Odoo 17 (negative for credits)
         total_untaxed += r.get("amount_untaxed_signed", 0)
-        total_tax     += r.get("amount_tax_signed", 0)
-        total_amount  += r.get("amount_total_signed", 0)
+        # amount_tax and amount_total: use manual sign (Odoo 17 _signed tax fields may have unexpected signs for credits)
+        total_tax    += r.get("amount_tax", 0) * sign
+        total_amount += r.get("amount_total", 0) * sign
+    if is_credit and records:
+        # Debug: log first credit note's values to verify signs
+        r0 = records[0]
+        print(f"CREDIT DEBUG: name={r0.get('name')} untaxed_signed={r0.get('amount_untaxed_signed')} tax={r0.get('amount_tax')} tax_signed={r0.get('amount_tax_signed')} total={r0.get('amount_total')} total_signed={r0.get('amount_total_signed')}")
     return {"count":len(records),"by_payment_state":by_state,
             "total_untaxed":round(total_untaxed,2),"total_tax":round(total_tax,2),"total_amount":round(total_amount,2)}
 
@@ -1017,16 +1023,16 @@ async def monthly_sales(year: int, month: int):
     # Group by salesperson for summary
     def group_by_salesperson(records, is_credit=False):
         by_person = {}
+        sign = -1 if is_credit else 1
         for r in records:
             name = get_salesperson(r)
             if name not in by_person:
                 by_person[name] = {"salesperson": name, "count": 0,
                                    "amount_untaxed": 0, "amount_tax": 0, "amount_total": 0}
             by_person[name]["count"] += 1
-            # Odoo 17: _signed fields already have correct sign
             by_person[name]["amount_untaxed"] += r.get("amount_untaxed_signed", 0)
-            by_person[name]["amount_tax"]     += r.get("amount_tax_signed", 0)
-            by_person[name]["amount_total"]   += r.get("amount_total_signed", 0)
+            by_person[name]["amount_tax"]     += r.get("amount_tax", 0) * sign
+            by_person[name]["amount_total"]   += r.get("amount_total", 0) * sign
         for p in by_person.values():
             p["amount_untaxed"] = round(p["amount_untaxed"], 2)
             p["amount_tax"]     = round(p["amount_tax"], 2)
@@ -4147,5 +4153,3 @@ async def export_commission(year: int, month: int, salesperson: str = ""):
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         headers={"Content-Disposition": f"attachment; filename={filename}"}
     )
-
-
