@@ -1436,6 +1436,8 @@ GENERAL ODOO RULES:
 - For product.product, stock.quant: do NOT add company_id filter
 - For stock queries always add ["location_id.usage","=","internal"]
 - For product search use ilike on both name and default_code with OR logic
+- CONTEXT LIMIT: Never set limit > 200 on any query. If you need more data, break into multiple smaller queries (e.g. by date range or by product batch). Large result sets will crash the system.
+- When comparing a PDF/file with Odoo data: extract the specific SKUs from the file FIRST, then query Odoo using only those SKUs. Do NOT pull all records from a vendor and try to match — that will exceed context limits.
 
 STANDARD QUERY PATTERNS (follow these exactly):
 
