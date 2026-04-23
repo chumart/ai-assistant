@@ -1174,13 +1174,14 @@ TOOLS = [
     },
     {
         "name": "odoo_add_order_line",
-        "description": "Add a product line to an existing purchase.order or sale.order. Call after odoo_create_record to add products. Requires order_id, product_id, quantity, and price_unit.",
+        "description": "Add a product line to an existing purchase.order or sale.order. ALWAYS include the sku field — it is used to verify/correct the product_id.",
         "input_schema": {
             "type": "object",
             "properties": {
                 "order_type": {"type": "string", "description": "purchase or sale"},
                 "order_id": {"type": "integer", "description": "The ID of the order"},
                 "product_id": {"type": "integer", "description": "Product ID from Odoo"},
+                "sku": {"type": "string", "description": "Product SKU/default_code — REQUIRED for ID verification"},
                 "quantity": {"type": "number", "description": "Quantity to order"},
                 "price_unit": {"type": "number", "description": "Unit price (optional, will use product default if 0)"}
             },
@@ -1928,9 +1929,23 @@ async def run_tool(name, inp, context=None):
     if name == "odoo_add_order_line":
         line_model = "purchase.order.line" if inp["order_type"] == "purchase" else "sale.order.line"
         order_field = "order_id"
+
+        # SKU-FIRST: if SKU is provided, resolve product_id from it (AI often gives wrong product_id)
+        sku = inp.get("sku", "")
+        product_id = inp["product_id"]
+        if sku:
+            sku_r = json.loads(await odoo_query("product.product",
+                [["default_code", "=", sku], ["active", "=", True]],
+                ["id", "name", "default_code"], limit=1))
+            if isinstance(sku_r, list) and sku_r:
+                resolved_id = sku_r[0]["id"]
+                if resolved_id != product_id:
+                    print(f"ADD_LINE ID RESCUE: SKU={sku} → product_id {product_id} → {resolved_id} (SKU override)")
+                    product_id = resolved_id
+
         vals = {
             order_field: inp["order_id"],
-            "product_id": inp["product_id"],
+            "product_id": product_id,
             "product_qty" if inp["order_type"] == "purchase" else "product_uom_qty": inp["quantity"],
         }
         if inp.get("price_unit"):
