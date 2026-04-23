@@ -1219,7 +1219,8 @@ TOOLS = [
             "properties": {
                 "po_name": {"type": "string", "description": "PO number exactly as shown (e.g. 'P00461')"},
                 "days_back": {"type": "integer", "default": 30, "description": "How many days back to look for related SOs (default 30)"},
-                "include_all_so": {"type": "boolean", "default": False, "description": "If true, find all SOs ever, no date filter"}
+                "include_all_so": {"type": "boolean", "default": False, "description": "If true, find all SOs ever, no date filter"},
+                "salesperson": {"type": "string", "default": "", "description": "Filter SOs by salesperson name (e.g. 'Alex'). Empty = all salespeople."}
             },
             "required": ["po_name"]
         }
@@ -2098,6 +2099,7 @@ async def run_tool(name, inp, context=None):
         po_name = inp.get("po_name", "").strip()
         days_back = inp.get("days_back", 30)
         include_all_so = inp.get("include_all_so", False)
+        salesperson_filter = inp.get("salesperson", "").strip()  # optional: filter SOs by salesperson name
 
         if not po_name:
             return json.dumps({"error": "po_name is required (e.g. 'P00461')"})
@@ -2141,9 +2143,11 @@ async def run_tool(name, inp, context=None):
             so_domain = [["id", "in", so_ids], ["company_id", "=", 1]]
             if not include_all_so:
                 so_domain.append(["date_order", ">=", date_from])
+            if salesperson_filter:
+                so_domain.append(["user_id.name", "ilike", salesperson_filter])
             so_r = json.loads(await odoo_query("sale.order",
                 so_domain,
-                ["id", "name", "partner_id", "date_order", "state", "amount_total"],
+                ["id", "name", "partner_id", "date_order", "state", "amount_total", "user_id"],
                 limit=200, order="date_order desc"))
             so_map = {s["id"]: s for s in so_r} if isinstance(so_r, list) else {}
 
@@ -2170,6 +2174,7 @@ async def run_tool(name, inp, context=None):
                             matching_sos.append({
                                 "so_name": so.get("name"),
                                 "customer": so["partner_id"][1] if so.get("partner_id") else "",
+                                "salesperson": so["user_id"][1] if so.get("user_id") else "",
                                 "date": so.get("date_order", "")[:10],
                                 "state": so.get("state"),
                                 "qty_sold": sol.get("product_uom_qty"),
@@ -4135,3 +4140,4 @@ async def export_commission(year: int, month: int):
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         headers={"Content-Disposition": f"attachment; filename={filename}"}
     )
+
