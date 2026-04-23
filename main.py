@@ -1311,9 +1311,7 @@ Use $ with commas for all amounts. Copy numbers directly from tool response.
 PART B — Commission Base 汇总:
 Show commission_base values: net_sales_excl_tax (净销售额税前), net_tax (销售税), net_sales_incl_tax (净销售额税后), invoice_count (发票总数), credit_note_count (退款单总数).
 
-PART C — Export Excel (明细在下载文件里):
-Do NOT show detail rows in the chat — too many records. Only provide the download link.
-[📥 Export Excel](BACKEND_URL/export/commission?year=YYYY&month=MM)
+Do NOT output any download links or export buttons in your response — the frontend automatically generates a Download Excel button when it detects commission data. Just end with the data.
 
 === SPECIFIC SALESPERSON (e.g. "Gene的4月commission") ===
 
@@ -1322,13 +1320,7 @@ Filter by_salesperson to show ONLY that person's data:
 PART A — 该销售员汇总:
 Show only that salesperson's row: 发票数, 退款数, 发票金额, 退款金额, 净销售额(税前)
 
-PART B — Export Excel (该销售员完整明细在下载文件里):
-Do NOT show detail rows in the chat — only provide the download link.
-[📥 Export Excel](BACKEND_URL/export/commission?year=YYYY&month=MM&salesperson=NAME)
-
-Replace BACKEND_URL with: {os.getenv('RAILWAY_PUBLIC_DOMAIN', 'https://chumart-ai.up.railway.app')}
-Replace YYYY and MM with the actual year and month numbers.
-Replace NAME with the salesperson's exact name (URL-encoded)."""
+Do NOT output any download links — the frontend auto-generates them."""
     else:
         finance_rules = """
 FINANCIAL RULES (NO ACCESS):
