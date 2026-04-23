@@ -1351,7 +1351,11 @@ COST/MARGIN RULES (NO ACCESS):
 - If asked about cost or margin, say this information is restricted
 - Only show sales price (list_price), not cost price (standard_price)"""
     else:
-        cost_rules = "COST RULES: Can view all cost and margin data."
+        cost_rules = """COST/MARGIN RULES (can view cost data):
+- NEVER proactively mention profit/margin/利润 unless the user explicitly asks
+- EXCEPTION: If you notice cost price is HIGHER than selling price (negative margin), proactively warn the user — this indicates a pricing problem
+- When user asks about cost or margin, you may show it
+- Do NOT calculate or display profit margins in PO-to-SO analysis unless asked"""
 
     inventory_rules = ""
     if perms["can_see_inventory"]:
