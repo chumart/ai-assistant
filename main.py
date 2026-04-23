@@ -3728,11 +3728,10 @@ ODOO_GROUP_ROLE_MAP = [
     # Admin / Settings
     ("base.group_system",                  "admin"),
     ("base.group_erp_manager",             "admin"),
-    # Finance / Accounting
+    # Finance / Accounting — only real accountants, NOT invoice users
     ("account.group_account_manager",      "finance"),
     ("account.group_account_user",         "finance"),
-    ("account.group_account_invoice",      "finance"),
-    # Sales
+    # Sales — checked BEFORE account_invoice so salespeople aren't misclassified
     ("sales_team.group_sale_manager",      "sales"),
     ("sales_team.group_sale_salesman",     "sales"),
     ("base.group_sale_salesman",           "sales"),
@@ -3740,6 +3739,8 @@ ODOO_GROUP_ROLE_MAP = [
     ("stock.group_stock_manager",          "warehouse"),
     ("stock.group_stock_user",             "warehouse"),
     ("purchase.group_purchase_manager",    "warehouse"),
+    # Invoice users — salespeople who can create invoices, treated as sales not finance
+    ("account.group_account_invoice",      "sales"),
 ]
 
 async def get_user_role(uid: int, cookies=None) -> str:
