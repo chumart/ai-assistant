@@ -896,8 +896,8 @@ async def fetch_moves(move_type, date_from, date_to):
          ["company_id","=",1],["payment_state","in",VALID_STATES]],
         ["name", "invoice_partner_display_name", "partner_id", "invoice_user_id",
          "invoice_date", "invoice_origin", "amount_untaxed", "amount_untaxed_signed",
-         "amount_tax", "amount_total", "payment_state",
-         "ref", "source_id", "x_payment_method", "tag_ids"],
+         "amount_tax", "amount_tax_signed", "amount_total", "amount_total_signed",
+         "payment_state", "ref", "source_id", "x_payment_method", "tag_ids"],
         limit=2000
     )
     records = json.loads(result)
@@ -914,8 +914,8 @@ async def fetch_credits(date_from, date_to):
          ["company_id","=",1],["payment_state","in",VALID_STATES]],
         ["name", "invoice_partner_display_name", "partner_id", "invoice_user_id",
          "invoice_date", "invoice_origin", "amount_untaxed", "amount_untaxed_signed",
-         "amount_tax", "amount_total", "payment_state",
-         "ref", "source_id", "x_payment_method", "tag_ids"],
+         "amount_tax", "amount_tax_signed", "amount_total", "amount_total_signed",
+         "payment_state", "ref", "source_id", "x_payment_method", "tag_ids"],
         limit=2000
     )
     records = json.loads(result)
@@ -930,13 +930,13 @@ def summarize_moves(records, is_credit=False):
     for r in records:
         state = r.get("payment_state","")
         if state in by_state: by_state[state] += 1
+        # Prefer Odoo's pre-computed signed fields for consistency
         untaxed_signed = r.get("amount_untaxed_signed")
-        if untaxed_signed is not None:
-            total_untaxed += untaxed_signed
-        else:
-            total_untaxed += r.get("amount_untaxed", 0) * sign
-        total_tax    += r.get("amount_tax", 0) * sign
-        total_amount += r.get("amount_total", 0) * sign
+        total_untaxed += untaxed_signed if untaxed_signed is not None else r.get("amount_untaxed", 0) * sign
+        tax_signed = r.get("amount_tax_signed")
+        total_tax += tax_signed if tax_signed is not None else r.get("amount_tax", 0) * sign
+        total_signed = r.get("amount_total_signed")
+        total_amount += total_signed if total_signed is not None else r.get("amount_total", 0) * sign
     return {"count":len(records),"by_payment_state":by_state,
             "total_untaxed":round(total_untaxed,2),"total_tax":round(total_tax,2),"total_amount":round(total_amount,2)}
 
@@ -1028,10 +1028,13 @@ async def monthly_sales(year: int, month: int):
                 by_person[name] = {"salesperson": name, "count": 0,
                                    "amount_untaxed": 0, "amount_tax": 0, "amount_total": 0}
             by_person[name]["count"] += 1
+            # Use Odoo's signed fields consistently for all amounts
             untaxed_signed = r.get("amount_untaxed_signed")
             by_person[name]["amount_untaxed"] += untaxed_signed if untaxed_signed is not None else r.get("amount_untaxed", 0) * sign
-            by_person[name]["amount_tax"]     += r.get("amount_tax", 0) * sign
-            by_person[name]["amount_total"]   += r.get("amount_total", 0) * sign
+            tax_signed = r.get("amount_tax_signed")
+            by_person[name]["amount_tax"] += tax_signed if tax_signed is not None else r.get("amount_tax", 0) * sign
+            total_signed = r.get("amount_total_signed")
+            by_person[name]["amount_total"] += total_signed if total_signed is not None else r.get("amount_total", 0) * sign
         for p in by_person.values():
             p["amount_untaxed"] = round(p["amount_untaxed"], 2)
             p["amount_tax"]     = round(p["amount_tax"], 2)
@@ -1302,23 +1305,31 @@ COMMISSION REPORT RULES (IMPORTANT — follow this exactly):
 When user mentions "commission", "提成", "销售提成", "佣金", or any combination like "X月commission", "commission统计":
 1. Extract year and month from the request (e.g. "26年3月" = 2026-03, "3月" = current year March)
 2. Call get_monthly_sales with the correct year and month
-3. Present results in TWO parts:
+3. Present results in this format:
 
-PART A — Summary table (by salesperson):
+PART A — 销售员销售统计（按销售员）:
 | 销售员 | 发票数 | 退款数 | 发票金额 | 退款金额 | 净销售额(税前) |
 Use the by_salesperson data from the tool result. Show ALL salespeople. Add a total row at the bottom.
-Use $ with commas for all amounts. Copy numbers directly from tool response — never recalculate.
+The "合计" row MUST use commission_base values directly — NEVER sum up individual rows yourself (rounding errors).
+Use $ with commas for all amounts. Copy numbers directly from tool response.
 
-PART B — Commission base totals:
-Show commission_base values: net_sales_excl_tax, net_tax, net_sales_incl_tax, invoice_count, credit_note_count.
+PART B — Commission Base 汇总:
+Show commission_base values: net_sales_excl_tax (净销售额税前), net_tax (销售税), net_sales_incl_tax (净销售额税后), invoice_count (发票总数), credit_note_count (退款单总数).
 
-PART C — Excel export button:
+PART C — 明细表 (Grouped by Salesperson):
+For EACH salesperson, show a group header and detail table matching this Odoo template format:
+**销售员名 (发票数)**
+| 客户名称 | 日期 | 发票号 | SO单号 | 金额(税前) | 来源 | 付款方式 | 标签 |
+List all invoices+credit notes for this person, sorted by date descending.
+Credit notes should show negative amounts.
+
+PART D — Excel export button:
 Always end with this exact markdown link for Excel download:
 [📥 Export Excel](BACKEND_URL/export/commission?year=YYYY&month=MM)
 Replace BACKEND_URL with: {os.getenv('RAILWAY_PUBLIC_DOMAIN', 'https://chumart-ai.up.railway.app')}
 Replace YYYY and MM with the actual year and month numbers.
 
-Example: user says "3月commission" in 2026 → call get_monthly_sales(year=2026, month=3) → show table → show [📥 Export Excel](https://chumart-ai.up.railway.app/export/commission?year=2026&month=3)
+Example: user says "3月commission" in 2026 → call get_monthly_sales(year=2026, month=3) → show PART A summary → PART B totals → PART C details grouped by salesperson → PART D export link
 
 The Excel export follows the SALE COMMISSION NEW template with fields:
 Invoice Partner Display Name, Invoice/Bill Date, Number, Origin, Untaxed Amount Signed, Reference, Source, Payment Method, Tags, Salesperson, Payment Status"""
@@ -1467,6 +1478,8 @@ When showing financial data: use $ with commas, be precise.
 When helping sales: be specific, cite model numbers, give concrete talking points.
 Only use markdown tables when data is genuinely tabular (multi-row comparisons, reports, lists with multiple columns). Do NOT use tables for single items, simple answers, or narrative responses.
 CALCULATION RULES: When summing financial data from tool results, always use the exact numbers returned by the tool. Never recalculate totals yourself — use the pre-calculated values from the data (commission_base.net_sales_excl_tax etc). If showing a summary, copy the numbers directly from the tool response.
+- For commission reports: the "合计" row MUST use commission_base values directly, NOT sum up the by_salesperson rows yourself. Your arithmetic may have rounding errors.
+- credit_amount and net_amount_untaxed come from the tool — display them as-is, never recalculate.
 
 DATA ACCURACY RULES (CRITICAL — violations damage user trust):
 - NEVER invent, guess, or fill in ANY field value — customer names, order numbers, SKUs, prices, addresses, phone numbers, etc.
@@ -4017,7 +4030,8 @@ async def login(req: LoginRequest):
 
 @app.get("/export/commission")
 async def export_commission(year: int, month: int):
-    """Export full commission data as Excel matching SALE COMMISSION NEW template."""
+    """Export commission data as Excel matching Odoo SALE COMMISSION NEW template exactly.
+    Format: Header → [Salesperson Group Header (name + count, total)] → detail rows by date desc."""
     from fastapi.responses import StreamingResponse
     import openpyxl
     from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
@@ -4032,103 +4046,99 @@ async def export_commission(year: int, month: int):
     if err1 or err2:
         return {"error": err1 or err2}
 
+    all_records = invoices + credits
+
     def get_salesperson(r):
         user = r.get("invoice_user_id")
         if user and isinstance(user, (list, tuple)) and len(user) > 1:
             return user[1]
         return "Unassigned"
 
-    def make_row(r, is_credit=False):
-        source = r.get("source_id")
-        sign = -1 if is_credit else 1
-        return {
-            "Invoice Partner Display Name": r.get("invoice_partner_display_name") or (r["partner_id"][1] if r.get("partner_id") else ""),
-            "Invoice/Bill Date":            r.get("invoice_date", ""),
-            "Number":                       r.get("name", ""),
-            "Origin":                       r.get("invoice_origin", "") or "",
-            "Untaxed Amount Signed":        round((r.get("amount_untaxed_signed") or r.get("amount_untaxed", 0) * sign), 2),
-            "Reference":                    r.get("ref", "") or "",
-            "Source":                       (source[1] if source and isinstance(source,(list,tuple)) and len(source)>1 else ""),
-            "Payment Method":               r.get("x_payment_method", "") or "",
-            "Tags":                         "",
-            "Salesperson":                  get_salesperson(r),
-            "Payment Status":               r.get("payment_state", ""),
-        }
+    # COLUMNS: exactly matching Odoo template (9 columns)
+    headers = [
+        "Invoice Partner Display Name",
+        "Invoice/Bill Date",
+        "Number",
+        "Origin",
+        "Untaxed Amount Signed",
+        "Reference",
+        "Source",
+        "Payment Method",
+        "Tags",
+    ]
 
-    all_rows = (
-        [make_row(r, False) for r in invoices] +
-        [make_row(r, True)  for r in credits]
-    )
-    all_rows.sort(key=lambda x: (x["Salesperson"], x["Invoice/Bill Date"]))
+    # Group all records by salesperson
+    by_person = {}
+    for r in all_records:
+        sp = get_salesperson(r)
+        if sp not in by_person:
+            by_person[sp] = []
+        source = r.get("source_id")
+        tags = r.get("tag_ids", [])
+        is_credit = r.get("move_type") == "out_refund"
+        sign = -1 if is_credit else 1
+        untaxed = r.get("amount_untaxed_signed")
+        if untaxed is None:
+            untaxed = r.get("amount_untaxed", 0) * sign
+
+        by_person[sp].append({
+            "Invoice Partner Display Name": r.get("invoice_partner_display_name") or (r["partner_id"][1] if r.get("partner_id") else ""),
+            "Invoice/Bill Date": r.get("invoice_date", ""),
+            "Number": r.get("name", ""),
+            "Origin": r.get("invoice_origin", "") or "",
+            "Untaxed Amount Signed": round(untaxed, 2),
+            "Reference": r.get("ref", "") or "",
+            "Source": (source[1] if source and isinstance(source, (list, tuple)) and len(source) > 1 else "") if source else "",
+            "Payment Method": r.get("x_payment_method", "") or "",
+            "Tags": ", ".join(str(t) for t in tags) if tags else "",
+        })
+
+    # Sort each group by date descending
+    for sp in by_person:
+        by_person[sp].sort(key=lambda x: x["Invoice/Bill Date"] or "", reverse=True)
+
+    # Sort salespersons by total amount descending
+    sp_totals = {sp: sum(r["Untaxed Amount Signed"] for r in rows) for sp, rows in by_person.items()}
+    sorted_persons = sorted(by_person.keys(), key=lambda sp: sp_totals[sp], reverse=True)
 
     # Build Excel
     wb = openpyxl.Workbook()
     ws = wb.active
-    ws.title = f"{year}-{month:02d} Commission"
+    ws.title = "Sheet1"
 
-    headers = ["Invoice Partner Display Name","Invoice/Bill Date","Number","Origin",
-               "Untaxed Amount Signed","Reference","Source","Payment Method","Tags",
-               "Salesperson","Payment Status"]
-
-    # Header style
-    header_fill = PatternFill("solid", fgColor="1F4E79")
-    header_font = Font(bold=True, color="FFFFFF", size=11)
-    thin = Side(style="thin", color="CCCCCC")
-    border = Border(left=thin, right=thin, top=thin, bottom=thin)
-
+    # Row 1: Headers
     for ci, h in enumerate(headers, 1):
-        cell = ws.cell(row=1, column=ci, value=h)
-        cell.fill = header_fill
-        cell.font = header_font
-        cell.alignment = Alignment(horizontal="center", vertical="center")
-        cell.border = border
+        ws.cell(row=1, column=ci, value=h)
 
-    ws.row_dimensions[1].height = 20
+    row_num = 2
+    group_font = Font(bold=True)
 
-    # Data rows
-    for ri, row in enumerate(all_rows, 2):
-        for ci, h in enumerate(headers, 1):
-            val = row.get(h, "")
-            cell = ws.cell(row=ri, column=ci, value=val)
-            cell.border = border
-            cell.alignment = Alignment(vertical="center")
-            # Format amount column
-            if h == "Untaxed Amount Signed":
-                cell.number_format = '#,##0.00'
-                cell.alignment = Alignment(horizontal="right", vertical="center")
-            # Alternate row color
-            if ri % 2 == 0:
-                cell.fill = PatternFill("solid", fgColor="F2F7FF")
+    for sp in sorted_persons:
+        rows = by_person[sp]
+        count = len(rows)
+        total = round(sp_totals[sp], 2)
 
-    # Auto column widths
-    col_widths = [30, 14, 18, 20, 18, 15, 20, 16, 12, 16, 14]
+        # Group header row: "Name (count)" in col A, total in col E (Untaxed Amount Signed)
+        ws.cell(row=row_num, column=1, value=f"{sp} ({count})")
+        ws.cell(row=row_num, column=1).font = group_font
+        ws.cell(row=row_num, column=5, value=total)
+        ws.cell(row=row_num, column=5).font = group_font
+        ws.cell(row=row_num, column=5).number_format = '#,##0.00'
+        row_num += 1
+
+        # Detail rows
+        for r in rows:
+            for ci, h in enumerate(headers, 1):
+                val = r[h]
+                cell = ws.cell(row=row_num, column=ci, value=val)
+                if h == "Untaxed Amount Signed":
+                    cell.number_format = '#,##0.00'
+            row_num += 1
+
+    # Column widths
+    col_widths = [35, 16, 18, 25, 20, 20, 20, 18, 12]
     for ci, w in enumerate(col_widths, 1):
         ws.column_dimensions[ws.cell(row=1, column=ci).column_letter].width = w
-
-    ws.freeze_panes = "A2"
-
-    # Summary sheet
-    ws2 = wb.create_sheet("Summary")
-    ws2.append(["Salesperson", "Invoice Count", "Credit Count", "Net Sales (Excl Tax)"])
-    by_person = {}
-    for r in all_rows:
-        sp = r["Salesperson"]
-        if sp not in by_person:
-            by_person[sp] = {"inv": 0, "crd": 0, "net": 0}
-        if r["Payment Status"] in VALID_STATES:
-            amt = r["Untaxed Amount Signed"]
-            if amt < 0:
-                by_person[sp]["crd"] += 1
-            else:
-                by_person[sp]["inv"] += 1
-            by_person[sp]["net"] += amt
-    for sp, v in sorted(by_person.items(), key=lambda x: -x[1]["net"]):
-        ws2.append([sp, v["inv"], v["crd"], round(v["net"], 2)])
-
-    # Style summary header
-    for cell in ws2[1]:
-        cell.font = Font(bold=True, color="FFFFFF")
-        cell.fill = PatternFill("solid", fgColor="1F4E79")
 
     output = BytesIO()
     wb.save(output)
@@ -4140,4 +4150,3 @@ async def export_commission(year: int, month: int):
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         headers={"Content-Disposition": f"attachment; filename={filename}"}
     )
-
