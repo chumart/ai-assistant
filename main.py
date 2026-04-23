@@ -1321,12 +1321,14 @@ Do NOT output any download links or export buttons in your response — the fron
 
 === SPECIFIC SALESPERSON (e.g. "Gene的4月commission") ===
 
-Filter by_salesperson to show ONLY that person's data:
+IMPORTANT: Still call get_monthly_sales(year, month) — do NOT query sale.order or account.move directly.
+Then filter the by_salesperson array from the result to find that person's data.
 
 PART A — 该销售员汇总:
 Show only that salesperson's row: 发票数, 退款数, 发票金额, 退款金额, 净销售额(税前)
 
-Do NOT output any download links — the frontend auto-generates them."""
+Do NOT output any download links — the frontend auto-generates them.
+Do NOT use odoo_search to query sale.order or account.move for commission data — always use get_monthly_sales."""
     else:
         finance_rules = """
 FINANCIAL RULES (NO ACCESS):
@@ -4153,3 +4155,4 @@ async def export_commission(year: int, month: int, salesperson: str = ""):
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         headers={"Content-Disposition": f"attachment; filename={filename}"}
     )
+
