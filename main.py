@@ -1411,21 +1411,28 @@ GENERAL ODOO RULES:
 
 STANDARD QUERY PATTERNS (follow these exactly):
 
+CRITICAL: Odoo 14 does NOT support 2-level relational filters like "order_id.date_order" or "order_id.company_id" on order lines — these silently return wrong/empty results. Always filter dates at the order level in a separate query.
+CRITICAL: NEVER use "order_id.id" as a filter — use "order_id" directly. Example: [["order_id","in",[453,447]]] NOT [["order_id.id","in",[453,447]]]
+
 "Which SOs contain SKU X in the last N days?"
-→ Step 1: odoo_search(sale.order.line, [["product_id.default_code","=","SKU"],["order_id.date_order",">=","DATE"],["order_id.company_id","=",1]], ["order_id","product_id","product_uom_qty","price_unit"])
-→ Step 2: From results, extract unique order_id values
-→ Step 3: odoo_search(sale.order, [["id","in",[id1,id2...]]],["name","partner_id","date_order","state","amount_total"])
-→ NEVER search sale.order directly with product filter — always go through sale.order.line first
+→ Step 1: Get product_id: odoo_search(product.product, [["default_code","=","SKU"]], ["id","name"])
+→ Step 2: odoo_search(sale.order.line, [["product_id","in",[pid]]], ["order_id","product_id","product_uom_qty","price_unit"], limit=500)
+→ Step 3: Extract order_ids from step 2, then filter by date:
+   odoo_search(sale.order, [["id","in",[order_ids]],["date_order",">=","DATE"],["company_id","=",1]], ["name","partner_id","date_order","state","amount_total"])
+→ If step 3 returns empty → say "no SOs found in this period" — NEVER invent results
 
 "Which POs contain SKU X?"
-→ odoo_search(purchase.order.line, [["product_id.default_code","=","SKU"]], ["order_id","product_id","product_qty","price_unit"])
-→ Then fetch purchase.order details by id
+→ Step 1: odoo_search(product.product, [["default_code","=","SKU"]], ["id"])
+→ Step 2: odoo_search(purchase.order.line, [["product_id","in",[pid]]], ["order_id","product_id","product_qty","price_unit"])
+→ Step 3: odoo_search(purchase.order, [["id","in",[order_ids]],["company_id","=",1]], ["name","partner_id","date_order","state"])
 
 "PO from vendor X → what products → which SOs bought them recently?"
-→ Step 1: odoo_search(purchase.order, [["partner_id.name","ilike","Thunder Group"],["date_order",">=","DATE"],["company_id","=",1]], ["name","partner_id","date_order","order_line"])
-→ Step 2: odoo_search(purchase.order.line, [["order_id.partner_id.name","ilike","Thunder Group"],["order_id.date_order",">=","DATE"]], ["product_id","product_qty","order_id"])
-→ Step 3: For each product found, search sale.order.line: [["product_id","in",[pid1,pid2...]],["order_id.date_order",">=","DATE"],["order_id.company_id","=",1]]
-→ Step 4: Fetch sale.order details for matched order_ids
+→ Step 1: odoo_search(purchase.order, [["partner_id.name","ilike","Thunder Group"],["date_order",">=","DATE"],["company_id","=",1]], ["name","partner_id","date_order","id"])
+→ Step 2: odoo_search(purchase.order.line, [["order_id","in",[po_ids]]], ["product_id","product_qty","order_id"])
+→ Step 3: Collect all product_ids from step 2
+→ Step 4: odoo_search(sale.order.line, [["product_id","in",[pid_list]]], ["order_id","product_id","product_uom_qty"], limit=500)
+→ Step 5: odoo_search(sale.order, [["id","in",[so_ids]],["date_order",">=","DATE"],["company_id","=",1]], ["name","partner_id","date_order","state","amount_total"])
+→ If steps 4/5 return empty → "no matching SOs found" — do NOT fabricate data
 
 When showing financial data: use $ with commas, be precise.
 When helping sales: be specific, cite model numbers, give concrete talking points.
