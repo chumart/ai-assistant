@@ -1212,6 +1212,19 @@ TOOLS = [
         }
     },
     {
+        "name": "get_po_with_so_links",
+        "description": "Get a Purchase Order's product lines AND find all related Sales Orders containing those products. Use this for ANY question like 'show me PO X and its related SOs', 'which customers bought products from PO X', 'PO to SO analysis'. This tool handles all the table joins correctly — do NOT use odoo_search manually for this type of query.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "po_name": {"type": "string", "description": "PO number exactly as shown (e.g. 'P00461')"},
+                "days_back": {"type": "integer", "default": 30, "description": "How many days back to look for related SOs (default 30)"},
+                "include_all_so": {"type": "boolean", "default": False, "description": "If true, find all SOs ever, no date filter"}
+            },
+            "required": ["po_name"]
+        }
+    },
+    {
         "name": "odoo_search_products_by_sku",
         "description": "Search multiple products by SKU (default_code) in one batch call. Returns product ID, name, SKU, price for each. Use when user provides a list of SKUs to build purchase orders.",
         "input_schema": {
@@ -1411,6 +1424,12 @@ GENERAL ODOO RULES:
 
 STANDARD QUERY PATTERNS (follow these exactly):
 
+"Show PO X details" / "PO X 的产品" / "PO X related SOs" / "which customers bought from PO X":
+→ ALWAYS use get_po_with_so_links(po_name="P00461") — do NOT manually query purchase.order + purchase.order.line + sale.order.line
+→ This tool handles id/name mapping and all table joins correctly
+→ Adjust days_back if user specifies a time range (e.g. "last 7 days" → days_back=7)
+→ Use include_all_so=true if user wants all historical SOs
+
 CRITICAL: Odoo 14 does NOT support 2-level relational filters like "order_id.date_order" or "order_id.company_id" on order lines — these silently return wrong/empty results. Always filter dates at the order level in a separate query.
 CRITICAL: NEVER use "order_id.id" as a filter — use "order_id" directly. Example: [["order_id","in",[453,447]]] NOT [["order_id.id","in",[453,447]]]
 
@@ -1445,6 +1464,7 @@ DATA ACCURACY RULES (CRITICAL — violations damage user trust):
 - Customer names MUST come from the actual tool query result (partner_id field in sale.order/purchase.order). Never use a company name you "think" is the customer.
 - If the first query doesn't return the expected field, run another query with the correct fields — do NOT guess
 - When showing order details: ONLY show fields that were actually returned by the tool. If you didn't query for a field, don't show it.
+- CRITICAL — id vs name: The database "id" (integer like 461) is NOT the same as the order "name" (like P00461 or S04270). NEVER assume id=461 means the order is named "P00461". Always query the "name" field explicitly and use that. When user says "P00461", search by [["name","=","P00461"]] not by id.
 
 WRITE OPERATION RULES:
 - Roles that CAN write to Odoo: admin, purchase
@@ -2061,6 +2081,115 @@ async def run_tool(name, inp, context=None):
                 "no_vendor": len(vendors) == 0
             })
         return json.dumps(result, ensure_ascii=False)
+
+    if name == "get_po_with_so_links":
+        """Get a PO's product lines and find matching SO records within a date range."""
+        po_name = inp.get("po_name", "").strip()       # e.g. "P00461"
+        days_back = inp.get("days_back", 30)            # how far back to look for SOs
+        include_all_so = inp.get("include_all_so", False)  # if True, no date filter on SOs
+
+        if not po_name:
+            return json.dumps({"error": "po_name is required (e.g. 'P00461')"})
+
+        try:
+            # Step 1: Get PO by NAME (not id) to avoid id/name confusion
+            po_r = json.loads(await odoo_query("purchase.order",
+                [["name", "=", po_name], ["company_id", "=", 1]],
+                ["id", "name", "partner_id", "date_order", "state", "amount_total"],
+                limit=1))
+            if not po_r or isinstance(po_r, dict):
+                return json.dumps({"error": f"PO '{po_name}' not found"})
+            po = po_r[0]
+            po_id = po["id"]
+            print(f"GET_PO_SO: found {po_name} (db_id={po_id})")
+
+            # Step 2: Get PO lines by po_id
+            lines_r = json.loads(await odoo_query("purchase.order.line",
+                [["order_id", "=", po_id]],
+                ["id", "product_id", "product_qty", "price_unit", "product_uom"],
+                limit=200))
+            if not lines_r or isinstance(lines_r, dict):
+                return json.dumps({"error": f"No lines found for {po_name}", "po": po})
+
+            # Step 3: Get product details (id + default_code + name)
+            product_ids = list({l["product_id"][0] for l in lines_r if l.get("product_id")})
+            prod_r = json.loads(await odoo_query("product.product",
+                [["id", "in", product_ids]],
+                ["id", "name", "default_code"], limit=200))
+            prod_map = {p["id"]: p for p in prod_r} if isinstance(prod_r, list) else {}
+
+            # Step 4: Find SOs containing these products
+            date_from = (datetime.datetime.now() - datetime.timedelta(days=days_back)).strftime("%Y-%m-%d")
+            sol_r = json.loads(await odoo_query("sale.order.line",
+                [["product_id", "in", product_ids]],
+                ["order_id", "product_id", "product_uom_qty", "price_unit"],
+                limit=1000))
+            so_ids = list({l["order_id"][0] for l in sol_r if l.get("order_id")}) if isinstance(sol_r, list) else []
+
+            # Step 5: Filter SOs by date at sale.order level
+            so_domain = [["id", "in", so_ids], ["company_id", "=", 1]]
+            if not include_all_so:
+                so_domain.append(["date_order", ">=", date_from])
+            so_r = json.loads(await odoo_query("sale.order",
+                so_domain,
+                ["id", "name", "partner_id", "date_order", "state", "amount_total"],
+                limit=200, order="date_order desc"))
+            so_map = {s["id"]: s for s in so_r} if isinstance(so_r, list) else {}
+
+            # Step 6: Build SOL map for matched SOs
+            matched_so_ids = list(so_map.keys())
+            sol_filtered = [l for l in (sol_r if isinstance(sol_r, list) else [])
+                           if l.get("order_id") and l["order_id"][0] in matched_so_ids]
+
+            # Build result: PO lines with matching SOs per product
+            result_lines = []
+            for line in lines_r:
+                pid = line["product_id"][0] if line.get("product_id") else None
+                prod = prod_map.get(pid, {})
+                sku = prod.get("default_code", "")
+                prod_name = prod.get("name", line["product_id"][1] if line.get("product_id") else "")
+
+                # Find SOs that contain this product
+                matching_sos = []
+                for sol in sol_filtered:
+                    if sol.get("product_id") and sol["product_id"][0] == pid:
+                        so_id = sol["order_id"][0]
+                        so = so_map.get(so_id, {})
+                        if so:
+                            matching_sos.append({
+                                "so_name": so.get("name"),
+                                "customer": so["partner_id"][1] if so.get("partner_id") else "",
+                                "date": so.get("date_order", "")[:10],
+                                "state": so.get("state"),
+                                "qty_sold": sol.get("product_uom_qty"),
+                                "price_sold": sol.get("price_unit"),
+                            })
+
+                result_lines.append({
+                    "sku": sku,
+                    "product_name": prod_name,
+                    "po_qty": line.get("product_qty"),
+                    "po_price": line.get("price_unit"),
+                    "so_count": len(matching_sos),
+                    "recent_sos": matching_sos[:10],  # max 10 per product
+                })
+
+            vendor = po["partner_id"][1] if po.get("partner_id") else ""
+            return json.dumps({
+                "po_name": po["name"],
+                "po_db_id": po_id,
+                "vendor": vendor,
+                "po_date": po.get("date_order", "")[:10],
+                "po_state": po.get("state"),
+                "po_total": po.get("amount_total"),
+                "so_date_from": date_from if not include_all_so else "all time",
+                "lines": result_lines,
+                "summary": f"{po_name}: {len(result_lines)} products, {len(matched_so_ids)} related SOs found since {date_from}"
+            }, ensure_ascii=False, default=str)
+
+        except Exception as e:
+            print(f"GET_PO_SO error: {e}")
+            return json.dumps({"error": str(e)})
 
     if name == "odoo_create_bulk_po":
         orders = inp.get("purchase_orders", [])
