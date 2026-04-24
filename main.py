@@ -1350,6 +1350,33 @@ TOOLS = [
         }
     },
     {
+        "name": "odoo_find_recent_purchases_by_skus",
+        "description": "BATCH TOOL — USE THIS for any question about 'which of these SKUs have we purchased recently / at what prices / from which vendors'. Takes up to 500 SKUs and a date window, returns per-SKU purchase stats in ONE tool call (replaces the old pattern of chaining 5-8 odoo_search calls). Returned per-SKU info: purchase_count, total_qty, vendors, min/max/last price, last_po, last_date, all_po_names. Plus an overall summary: total_skus_with_purchases, total_pos_involved, total_amount. Cancelled POs excluded by default. CALL THIS INSTEAD OF manually searching purchase.order and purchase.order.line for SKU-based purchase history questions.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "skus": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "List of SKUs / default_codes to look up (1-500)"
+                },
+                "days_back": {
+                    "type": "integer",
+                    "description": "How many days back from today to search (default 120). Ignored if since_date is provided."
+                },
+                "since_date": {
+                    "type": "string",
+                    "description": "Explicit cutoff date YYYY-MM-DD (e.g. '2025-12-31'). Overrides days_back if given."
+                },
+                "include_cancelled": {
+                    "type": "boolean",
+                    "description": "Include cancelled POs. Default false — cancelled POs are normally excluded."
+                }
+            },
+            "required": ["skus"]
+        }
+    },
+    {
         "name": "odoo_create_bulk_po",
         "description": "Create multiple purchase orders at once, one per vendor. Only call after user has confirmed the full plan. Each PO has one vendor and multiple product lines. CRITICAL: partner_id MUST come from odoo_get_product_vendors' vendor_id field (never user ID, never partner_name string). product_id MUST come from odoo_search_products_by_sku's product_id field (never invented, never product_tmpl_id).",
         "input_schema": {
@@ -1710,6 +1737,36 @@ Workflow:
     (Do not fetch current prices first — odoo_update_vendor_price will return old vs new in the result.)
   STEP 3 — After user confirms, call odoo_update_vendor_price ONCE with {{vendor_name, updates: [...]}}. Do NOT call odoo_search_products_by_sku or odoo_get_product_vendors first — the tool does all lookups internally.
   STEP 4 — Report results from the returned summary + per-SKU results. For each SKU show: status (updated / created / unchanged / not_found / error), old_price → new_price.
+
+SKU PURCHASE HISTORY QUERIES (CRITICAL PERFORMANCE RULE):
+When the user asks something like "have we purchased any of these SKUs recently", "what did we pay for these products", "compare PDF prices with our actual PO prices", "these SKUs in our purchase history", or uploads a price sheet / product list and asks about purchases — ALWAYS use odoo_find_recent_purchases_by_skus INSTEAD OF manually chaining odoo_search calls.
+
+RULE — When the question involves "SKUs + purchase history":
+  ✅ CORRECT: odoo_find_recent_purchases_by_skus({{"skus": [...], "since_date": "..."}})     — one call, fast
+  ❌ WRONG:   odoo_search(purchase.order, ...) + odoo_search(purchase.order.line, ...)   — 5-8 calls, slow, fragile
+
+The batch tool returns everything you need:
+  - Which SKUs were bought vs not
+  - How many times each was bought
+  - From which vendors
+  - Price statistics (min/max/last)
+  - Last PO name + date for each SKU
+  - Overall totals (PO count, $ amount)
+
+USE IT WHEN:
+  - User uploads a file with SKUs and asks about purchases/prices
+  - User asks "X 个 SKU 最近有没有采购过"
+  - User asks "我们最近采购了哪些 [category]"
+  - Cross-reference: file price vs Odoo PO price for multiple SKUs
+  - "Which vendors sold us [list of SKUs]"
+
+DATE WINDOW:
+  - If user specifies a date ("25年12月31日以来", "since Dec 31 2025"): pass since_date: "2025-12-31"
+  - If user says "最近" / "recent" without a date: pass days_back: 120 (default, 4 months)
+  - If user says "本年" / "this year": since_date: "2026-01-01"
+  - If user says "去年" / "last year": since_date: "2025-01-01"
+
+DO NOT chain this with odoo_search for the same purpose. Call it once, use the result. If you need PO line details for ONE specific PO, then use odoo_search, but for SKU-centric questions this tool is always the answer.
 
 LARGE RESULT SETS — SUMMARY-FIRST RULE (APPLIES TO ALL REPLIES):
 This rule applies to EVERY reply you produce, for EVERY type of query — searches, reports, lookups, cross-references, anything. Before dumping data, check how much you are about to output.
@@ -2641,6 +2698,254 @@ async def run_tool(name, inp, context=None):
             "summary": summary,
             "results": results
         }, ensure_ascii=False)
+
+    if name == "odoo_find_recent_purchases_by_skus":
+        """
+        Batch: given a list of SKUs and a date window, find which were purchased
+        recently. Returns per-SKU purchase stats (count, total_qty, vendors,
+        min/max/last price, last PO name, last date) AND an overall summary.
+
+        Replaces a pattern where the AI would otherwise need 5-8 chained
+        odoo_search calls (PO list → PO lines → filter → group). Here we do
+        exactly 2 XML-RPC calls: one for PO headers, one for PO lines.
+
+        Input:
+          {
+            "skus": ["CMEC072", "ALFN001", ...],     # required, 1-500 items
+            "days_back": 120,                         # optional, default 120
+            "since_date": "2025-12-31",               # optional; if provided, overrides days_back
+            "include_cancelled": false                # optional, default false
+          }
+
+        Output JSON:
+          {
+            "since_date": "2025-12-31",
+            "total_skus_requested": 50,
+            "total_skus_with_purchases": 18,
+            "total_pos_involved": 9,
+            "total_amount": 12430.50,
+            "results": [
+              {
+                "sku": "CMEC072",
+                "product_id": 8397,
+                "product_name": "74\" Post with Leveling Foot, Green Epoxy",
+                "purchase_count": 3,        # number of POs that contain this SKU
+                "total_qty": 48,            # sum of qty across those POs
+                "vendors": ["Thunder Group"],
+                "min_price": 4.50,
+                "max_price": 9.27,
+                "last_price": 9.27,         # price on most recent PO
+                "last_po": "P00463",
+                "last_po_id": 468,
+                "last_date": "2026-04-23",
+                "all_po_names": ["P00463", "P00435", "P00430"]
+              },
+              ...
+              {"sku": "XYZ999", "product_id": null, "status": "sku_not_found"},
+              ...
+            ]
+          }
+        """
+        import datetime as dt
+
+        skus_in = inp.get("skus") or []
+        if not isinstance(skus_in, list) or not skus_in:
+            return json.dumps({"error": "skus must be a non-empty list of SKU strings"})
+        if len(skus_in) > 500:
+            return json.dumps({"error": f"Too many SKUs ({len(skus_in)}); max 500 per call"})
+
+        # Normalize SKU input
+        skus_clean = []
+        for s in skus_in:
+            if isinstance(s, str) and s.strip():
+                skus_clean.append(s.strip())
+        skus_clean = list(dict.fromkeys(skus_clean))  # dedupe, preserve order
+
+        # Determine date cutoff
+        since_date = (inp.get("since_date") or "").strip()
+        if not since_date:
+            days_back = int(inp.get("days_back") or 120)
+            cutoff = dt.datetime.now() - dt.timedelta(days=days_back)
+            since_date = cutoff.strftime("%Y-%m-%d")
+
+        include_cancelled = bool(inp.get("include_cancelled", False))
+
+        print(f"[FIND_PURCHASES] skus={len(skus_clean)} since={since_date} "
+              f"include_cancelled={include_cancelled}")
+
+        # --- Step 1: resolve SKUs → product IDs (1 XML-RPC call, bulk 'in') ---
+        prod_r = json.loads(await odoo_query(
+            "product.product",
+            [["default_code", "in", skus_clean], ["active", "=", True]],
+            ["id", "name", "default_code"],
+            limit=2000
+        ))
+        prod_r = prod_r if isinstance(prod_r, list) else []
+
+        # Map SKU (uppercase) → product row; keep first match for each
+        sku_to_prod = {}
+        for p in prod_r:
+            code = (p.get("default_code") or "").strip().upper()
+            if code and code not in sku_to_prod:
+                sku_to_prod[code] = p
+
+        # SKUs not found
+        not_found_skus = [s for s in skus_clean if s.upper() not in sku_to_prod]
+
+        product_ids = [p["id"] for p in sku_to_prod.values()]
+        if not product_ids:
+            return json.dumps({
+                "since_date": since_date,
+                "total_skus_requested": len(skus_clean),
+                "total_skus_with_purchases": 0,
+                "total_pos_involved": 0,
+                "total_amount": 0,
+                "results": [{"sku": s, "status": "sku_not_found"} for s in not_found_skus]
+            }, ensure_ascii=False)
+
+        # --- Step 2: fetch PO lines for these products since cutoff (1 XML-RPC call) ---
+        # We query purchase.order.line directly, using its related fields:
+        #   order_id.date_order, order_id.state, order_id.name, order_id.partner_id
+        # This is 1 request that returns exactly what we need.
+        po_state_filter = []
+        if not include_cancelled:
+            po_state_filter = [["order_id.state", "!=", "cancel"]]
+
+        pol_domain = (
+            [["product_id", "in", product_ids]]
+            + [["order_id.date_order", ">=", since_date]]
+            + [["order_id.company_id", "=", 1]]
+            + po_state_filter
+        )
+        pol_fields = [
+            "id", "order_id", "product_id", "product_qty", "price_unit",
+            "price_subtotal", "date_planned"
+        ]
+        pol_r = json.loads(await odoo_query(
+            "purchase.order.line",
+            pol_domain,
+            pol_fields,
+            limit=5000,
+            order="id desc"
+        ))
+        pol_r = pol_r if isinstance(pol_r, list) else []
+        print(f"[FIND_PURCHASES] got {len(pol_r)} PO lines")
+
+        # --- Step 3: enrich with PO header info (1 more XML-RPC call) ---
+        order_ids = list({ln["order_id"][0] for ln in pol_r if ln.get("order_id")})
+        po_headers = {}
+        if order_ids:
+            po_r = json.loads(await odoo_query(
+                "purchase.order",
+                [["id", "in", order_ids]],
+                ["id", "name", "date_order", "state", "partner_id"],
+                limit=len(order_ids) + 10
+            ))
+            po_r = po_r if isinstance(po_r, list) else []
+            for po in po_r:
+                po_headers[po["id"]] = po
+
+        # --- Step 4: group PO lines by product_id, compute stats ---
+        by_product = {}  # product_id → { po_names: set, qtys: list, prices: list, vendors: set, last_{date,price,po}: ... }
+        for ln in pol_r:
+            pid = ln["product_id"][0] if ln.get("product_id") else None
+            oid = ln["order_id"][0] if ln.get("order_id") else None
+            if not pid or not oid:
+                continue
+            po = po_headers.get(oid)
+            if not po:
+                continue
+            entry = by_product.setdefault(pid, {
+                "po_names": [],
+                "po_ids": [],
+                "qtys": [],
+                "prices": [],
+                "subtotals": [],
+                "vendors": set(),
+                "last_date": None,
+                "last_price": None,
+                "last_po": None,
+                "last_po_id": None,
+            })
+            po_name = po.get("name") or ""
+            if po_name not in entry["po_names"]:
+                entry["po_names"].append(po_name)
+                entry["po_ids"].append(oid)
+            entry["qtys"].append(float(ln.get("product_qty") or 0))
+            entry["prices"].append(float(ln.get("price_unit") or 0))
+            entry["subtotals"].append(float(ln.get("price_subtotal") or 0))
+            if po.get("partner_id"):
+                entry["vendors"].add(po["partner_id"][1])
+            po_date = (po.get("date_order") or "")[:10]
+            if po_date and (entry["last_date"] is None or po_date > entry["last_date"]):
+                entry["last_date"] = po_date
+                entry["last_price"] = float(ln.get("price_unit") or 0)
+                entry["last_po"] = po_name
+                entry["last_po_id"] = oid
+
+        # --- Step 5: build per-SKU result rows ---
+        results = []
+        all_po_ids = set()
+        total_amount = 0.0
+        skus_with_purchases = 0
+        for sku in skus_clean:
+            prod = sku_to_prod.get(sku.upper())
+            if not prod:
+                results.append({"sku": sku, "status": "sku_not_found"})
+                continue
+            pid = prod["id"]
+            entry = by_product.get(pid)
+            if not entry:
+                results.append({
+                    "sku": sku,
+                    "product_id": pid,
+                    "product_name": prod.get("name"),
+                    "status": "no_purchases_in_window",
+                    "purchase_count": 0,
+                    "total_qty": 0,
+                    "vendors": [],
+                    "min_price": None,
+                    "max_price": None,
+                    "last_price": None,
+                    "last_po": None,
+                    "last_po_id": None,
+                    "last_date": None,
+                    "all_po_names": []
+                })
+                continue
+            skus_with_purchases += 1
+            all_po_ids.update(entry["po_ids"])
+            total_amount += sum(entry["subtotals"])
+            results.append({
+                "sku": sku,
+                "product_id": pid,
+                "product_name": prod.get("name"),
+                "status": "found",
+                "purchase_count": len(entry["po_names"]),
+                "total_qty": sum(entry["qtys"]),
+                "vendors": sorted(entry["vendors"]),
+                "min_price": min(entry["prices"]) if entry["prices"] else None,
+                "max_price": max(entry["prices"]) if entry["prices"] else None,
+                "last_price": entry["last_price"],
+                "last_po": entry["last_po"],
+                "last_po_id": entry["last_po_id"],
+                "last_date": entry["last_date"],
+                "all_po_names": entry["po_names"]
+            })
+
+        output = {
+            "since_date": since_date,
+            "include_cancelled": include_cancelled,
+            "total_skus_requested": len(skus_clean),
+            "total_skus_with_purchases": skus_with_purchases,
+            "total_skus_not_found_in_odoo": len(not_found_skus),
+            "total_pos_involved": len(all_po_ids),
+            "total_amount": round(total_amount, 2),
+            "results": results
+        }
+        print(f"[FIND_PURCHASES] done: {skus_with_purchases}/{len(skus_clean)} skus "
+              f"have purchases in {len(all_po_ids)} POs, total ${round(total_amount,2)}")
+        return json.dumps(output, ensure_ascii=False)
 
     if name == "get_po_with_so_links":
         """Get a PO's product lines and find matching SO records within a date range."""
@@ -3639,11 +3944,15 @@ async def chat(req: ChatRequest, background_tasks: BackgroundTasks):
     allowed_tools = []
     finance_tools = {"get_monthly_tax", "get_quarterly_tax", "get_monthly_sales", "get_missing_tax"}
     write_tools = {"odoo_create_record", "odoo_add_order_line", "odoo_confirm_order", "odoo_update_record", "odoo_update_vendor_price"}
+    # Tools that expose vendor names, prices, PO costs — only admin / finance / purchase should see these
+    cost_tools = {"odoo_find_recent_purchases_by_skus", "odoo_get_product_vendors", "odoo_create_bulk_po", "get_po_with_so_links"}
     for tool in TOOLS:
         tname = tool["name"]
         if tname in finance_tools and not perms.get("can_see_finance"):
             continue
         if tname in write_tools and not perms.get("can_write_odoo"):
+            continue
+        if tname in cost_tools and not perms.get("can_see_cost"):
             continue
         allowed_tools.append(tool)
 
@@ -3761,10 +4070,43 @@ async def chat_stream(req: ChatRequest, background_tasks: BackgroundTasks):
       - {type: "text", delta: "..."}        incremental text
       - {type: "tool_use", name: "..."}     tool being invoked
       - {type: "tool_result", name: "..."}  tool finished
+      - {type: "ping"}                      heartbeat (keep connection alive)
       - {type: "done"}                      stream complete
       - {type: "error", message: "..."}     error occurred
     """
     from fastapi.responses import StreamingResponse
+    import asyncio as _asyncio
+
+    # Heartbeat wrapper: interleaves {"type":"ping"} into an SSE generator every
+    # `interval` seconds of silence, so CDNs/proxies/browsers don't kill an idle
+    # connection during long tool calls. The frontend ignores ping events
+    # but uses them to know the server is still alive.
+    async def with_heartbeat(inner_gen, interval: float = 10.0):
+        ping_payload = f"data: {json.dumps({'type': 'ping'})}\n\n"
+        it = inner_gen.__aiter__()
+        next_task = None
+        try:
+            while True:
+                if next_task is None:
+                    next_task = _asyncio.ensure_future(it.__anext__())
+                try:
+                    chunk = await _asyncio.wait_for(_asyncio.shield(next_task), timeout=interval)
+                    next_task = None
+                    yield chunk
+                except _asyncio.TimeoutError:
+                    # No event from inner generator in `interval` seconds → send ping.
+                    # Keep next_task alive to consume its eventual value on the next loop.
+                    yield ping_payload
+                except StopAsyncIteration:
+                    next_task = None
+                    break
+        finally:
+            if next_task is not None and not next_task.done():
+                next_task.cancel()
+                try:
+                    await next_task
+                except BaseException:
+                    pass
 
     sess = resolve_session(req)
     verified_role = sess["role"]
@@ -3776,11 +4118,15 @@ async def chat_stream(req: ChatRequest, background_tasks: BackgroundTasks):
     allowed_tools = []
     finance_tools = {"get_monthly_tax", "get_quarterly_tax", "get_monthly_sales", "get_missing_tax"}
     write_tools = {"odoo_create_record", "odoo_add_order_line", "odoo_confirm_order", "odoo_update_record", "odoo_update_vendor_price"}
+    # Tools that expose vendor names, prices, PO costs — only admin / finance / purchase should see these
+    cost_tools = {"odoo_find_recent_purchases_by_skus", "odoo_get_product_vendors", "odoo_create_bulk_po", "get_po_with_so_links"}
     for tool in TOOLS:
         tname = tool["name"]
         if tname in finance_tools and not perms.get("can_see_finance"):
             continue
         if tname in write_tools and not perms.get("can_write_odoo"):
+            continue
+        if tname in cost_tools and not perms.get("can_see_cost"):
             continue
         allowed_tools.append(tool)
 
@@ -3995,7 +4341,7 @@ async def chat_stream(req: ChatRequest, background_tasks: BackgroundTasks):
                 print(f"OpenAI stream error: {e}")
                 yield f"data: {json.dumps({'type': 'error', 'message': str(e)})}\n\n"
 
-        return StreamingResponse(openai_stream(), media_type="text/event-stream", headers={
+        return StreamingResponse(with_heartbeat(openai_stream()), media_type="text/event-stream", headers={
             "Cache-Control": "no-cache",
             "X-Accel-Buffering": "no",
         })
@@ -4160,7 +4506,7 @@ async def chat_stream(req: ChatRequest, background_tasks: BackgroundTasks):
             print(f"Stream error: {e}")
             yield f"data: {json.dumps({'type': 'error', 'message': str(e)})}\n\n"
 
-    return StreamingResponse(claude_stream(), media_type="text/event-stream", headers={
+    return StreamingResponse(with_heartbeat(claude_stream()), media_type="text/event-stream", headers={
         "Cache-Control": "no-cache",
         "X-Accel-Buffering": "no",  # Disable nginx buffering
     })
