@@ -1045,7 +1045,7 @@ async def odoo_call_method(model: str, record_id: int, method: str) -> dict:
 # Odoo helpers (unchanged)
 # ─────────────────────────────────────────────
 
-async def odoo_query(model, domain, fields, limit=2000, order="id desc", cookies=None):
+async def odoo_query(model, domain, fields, limit=2000, order="id desc", cookies=None, offset=0):
     last_error = None
     for attempt in range(3):  # Auto-retry up to 3 times
         try:
@@ -1061,7 +1061,7 @@ async def odoo_query(model, domain, fields, limit=2000, order="id desc", cookies
                     "params": {
                         "model": model, "method": "search_read",
                         "args": [domain],
-                        "kwargs": {"fields": fields, "limit": limit, "order": order}
+                        "kwargs": {"fields": fields, "limit": limit, "order": order, "offset": offset}
                     }
                 }, cookies=cookies)
                 data = r.json()
