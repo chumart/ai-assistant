@@ -1521,7 +1521,7 @@ TOOLS = [
     },
     {
         "name": "odoo_match_payment_to_customer",
-        "description": "MATCH A RECEIVED PAYMENT to customer invoices/SOs. USE THIS for any question like '我收到一笔 $X 的钱 不知道是哪个客户 / 哪个发票对应', 'which customer sent $X', 'find invoice for this payment', 'who paid $X on [date]'. Searches account.payment and account.move (invoices, by both total AND residual for partial-payment cases) in parallel. Does NOT search bank.statement.line — the user typically asks this WHILE LOOKING at a bank line, so matching against itself would be noise. Amount tolerance is strict: $2 only — card payments already sync with exact net amount, and the real use case here is partial payments where amounts match exactly against amount_residual. Returns ranked candidates with match_score. ALWAYS use this INSTEAD OF multiple manual odoo_search calls on payment/invoice models. Read-only.",
+        "description": "MATCH A RECEIVED PAYMENT to customer invoices/SOs. USE THIS for any question like '我收到一笔 $X 的钱 不知道是哪个客户 / 哪个发票对应', 'which customer sent $X', 'find invoice for this payment', 'who paid $X on [date]'. Multi-phase search: (1) account.payment + in_payment/partial invoices, (2) in_payment invoices checking total/residual/paid-portion, (3) uninvoiced SOs (customer paid before invoice created, or shipping supplement), (4) paid invoices (possible mis-reconciliation). Amount tolerance $20 covering tax fluctuations. Returns ranked candidates with match_score. ALWAYS use this INSTEAD OF multiple manual odoo_search calls. Read-only.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -1948,7 +1948,12 @@ RULE — When the question is "received money → which invoice/customer/SO":
   ✅ CORRECT: odoo_match_payment_to_customer(amount=X, date="YYYY-MM-DD", customer_hint="NAME")
   ❌ WRONG:   odoo_search(account.payment, ...) + odoo_search(account.move, ...) + ...
 
-The tool searches payments and invoices (by total AND by residual — for partial payments) in parallel. It does NOT search bank.statement.line (users are typically asking this question while looking at a bank line, and matching a bank line against itself is noise). Amount tolerance is strict ($2 only): card payments auto-sync with exact net amounts in Odoo and full payments get auto-linked by invoice_origin — so when we DO have to search, it's usually for partial payments where amounts match exactly against amount_residual. Candidates are ranked by match_score considering amount closeness, date proximity, and customer name match.
+The tool searches in multiple phases (mirrors real reconciliation workflow):
+  Phase 1: account.payment + account.move (not_paid/partial/in_payment invoices by total AND residual)
+  Phase 2A: in_payment invoices — checks if total, residual, or already-paid portion matches the received amount
+  Phase 2B: uninvoiced SOs — customer may have paid before invoice was created (e.g. shipping supplement)
+  Phase 2C: paid invoices — possible earlier mis-reconciliation (amount close but already marked paid)
+Amount tolerance is $20 to cover tax rate fluctuations and small shipping additions. Candidates are ranked by match_score considering amount closeness, date proximity, and customer name match.
 
 EXTRACTING INPUTS FROM USER MESSAGE:
   - amount (required): the USD amount mentioned
@@ -3190,13 +3195,18 @@ async def run_tool(name, inp, context=None):
           }
 
         Tolerance for amount matching:
-          $2 absolute, no percentage. Card payments auto-match in Odoo; the
-          use case is partial payments where amount equals amount_residual
-          exactly.
+          $20 absolute — covers tax rate fluctuations and small shipping additions.
+
+        Search priority (mirrors real reconciliation workflow):
+          Phase 1: account.payment + account.move (in_payment/not_paid/partial invoices)
+          Phase 2A: in_payment invoices — check total/residual/paid-portion against amount
+          Phase 2B: uninvoiced SOs — customer may have paid before invoice was created
+          Phase 2C: paid invoices — possible mis-reconciliation from earlier
 
         Returns candidates sorted by match_score (high → low), each with type
-        (payment/invoice_total/invoice_residual), amount, date, partner,
-        linked SO if any, and match_reasons. Plus a best_candidate and summary.
+        (payment/invoice_total/invoice_residual/invoice_in_payment/uninvoiced_so/
+        invoice_paid_check), amount, date, partner, linked SO if any, and
+        match_reasons. Plus a best_candidate and summary.
         """
         import datetime as dt
 
@@ -3223,19 +3233,15 @@ async def run_tool(name, inp, context=None):
         customer_hint = (inp.get("customer_hint") or "").strip()
         max_candidates = int(inp.get("max_candidates") or 10)
 
-        # Amount tolerance: just $2 absolute. No percentage tolerance.
-        # Reason: card payments auto-sync into Odoo with net amount and match
-        # automatically; full payments get auto-linked via invoice_origin. The
-        # cases we actually have to resolve here are partial payments, Zelle/
-        # Wire with unclear memos, split payments — all of which have EXACT
-        # amounts matching either invoice total or amount_residual. A $2 floor
-        # only covers tiny bank-line rounding, nothing else.
-        tolerance = 2.0
+        # Amount tolerance: $20 to cover tax rate fluctuations.
+        # Real-world scenario: invoice is $165 but customer paid $155 or $175
+        # because tax was calculated differently, or customer added shipping.
+        tolerance = 20.0
         amount_low = round(amount - tolerance, 2)
         amount_high = round(amount + tolerance, 2)
 
-        # Also compute a "near-exact" band for scoring.
-        near_exact_tol = 0.5  # strict — anything within 50 cents is a strong match
+        # Scoring bands for amount closeness
+        near_exact_tol = 1.0  # within $1 = very strong match
 
         print(f"[MATCH_PAYMENT] amount={amount} tolerance=±${tolerance:.2f} "
               f"window=±{date_window}d hint='{customer_hint}' date={received_date_str}")
@@ -3348,19 +3354,124 @@ async def run_tool(name, inp, context=None):
         # so we only search account.payment and account.move.
         print(f"[MATCH_PAYMENT] (bank.statement.line search intentionally skipped)")
 
+        # ── 4a) Phase 2: in_payment invoices — check their linked payments ──
+        # User's real workflow: "我收到一笔钱，先看 in_payment 的发票里有没有对应的"
+        # We query in_payment invoices (broader date range), then check if their
+        # associated payment amounts match.
+        inv_inpayment_domain = [
+            ["payment_state", "=", "in_payment"],
+            ["company_id", "=", 1],
+            ["state", "=", "posted"],
+            ["move_type", "in", ["out_invoice"]],
+        ]
+        if date_from:
+            inv_inpayment_domain.append(["invoice_date", ">=", date_from])
+        if date_to:
+            inv_inpayment_domain.append(["invoice_date", "<=", date_to])
+        inv_inpayment_r = json.loads(await odoo_query(
+            "account.move",
+            inv_inpayment_domain,
+            ["id", "name", "amount_total", "amount_residual", "invoice_date",
+             "partner_id", "payment_state", "invoice_origin", "ref", "move_type"],
+            limit=200, order="invoice_date desc"
+        ))
+        inv_inpayment_r = inv_inpayment_r if isinstance(inv_inpayment_r, list) else []
+
+        # For in_payment invoices, check if any associated payment amount matches
+        # (the payment amount might differ from invoice total due to tax/shipping)
+        inpayment_matches = []
+        for inv in inv_inpayment_r:
+            inv_total = float(inv.get("amount_total") or 0)
+            inv_residual = float(inv.get("amount_residual") or 0)
+            inv_paid = inv_total - inv_residual  # how much has been paid so far
+            # Check: does the received amount match either total, residual, or paid portion?
+            for check_amt, label in [
+                (inv_total, "发票总额"),
+                (inv_residual, "未付余额"),
+                (inv_paid, "已付部分"),
+            ]:
+                diff = abs(check_amt - amount)
+                if diff <= tolerance and check_amt > 0:
+                    inpayment_matches.append({
+                        **inv,
+                        "_match_amount": check_amt,
+                        "_match_label": label,
+                        "_match_diff": diff,
+                    })
+                    break  # only keep the best match per invoice
+        print(f"[MATCH_PAYMENT] in_payment invoices checked: {len(inv_inpayment_r)} total, "
+              f"{len(inpayment_matches)} amount-matched")
+
+        # ── 4b) Phase 2: uninvoiced SOs — customer may have paid without invoice ──
+        # Scenario: customer paid for shipping supplement, or paid before invoice was created
+        so_domain = [
+            ["amount_total", ">=", amount_low],
+            ["amount_total", "<=", amount_high],
+            ["company_id", "=", 1],
+            ["state", "in", ["sale", "done"]],
+            ["invoice_status", "in", ["no", "to invoice"]],  # no invoice created yet
+        ]
+        if date_from:
+            so_domain.append(["date_order", ">=", date_from])
+        if date_to:
+            so_domain.append(["date_order", "<=", date_to])
+        try:
+            so_r = json.loads(await odoo_query(
+                "sale.order",
+                so_domain,
+                ["id", "name", "amount_total", "date_order", "partner_id",
+                 "state", "invoice_status", "user_id"],
+                limit=100, order="date_order desc"
+            ))
+            so_r = so_r if isinstance(so_r, list) else []
+        except Exception as e:
+            print(f"[MATCH_PAYMENT] SO query error: {e}")
+            so_r = []
+        print(f"[MATCH_PAYMENT] uninvoiced SOs: {len(so_r)} candidates")
+
+        # ── 4c) Phase 2: paid invoices — might be a reconciliation error ──
+        # Scenario: this payment was already matched to the wrong invoice.
+        # "paid" invoices that are close in amount might be the real match.
+        inv_paid_domain = [
+            ["payment_state", "=", "paid"],
+            ["company_id", "=", 1],
+            ["state", "=", "posted"],
+            ["move_type", "in", ["out_invoice"]],
+            ["amount_total", ">=", amount_low],
+            ["amount_total", "<=", amount_high],
+        ]
+        if date_from:
+            inv_paid_domain.append(["invoice_date", ">=", date_from])
+        if date_to:
+            inv_paid_domain.append(["invoice_date", "<=", date_to])
+        inv_paid_r = json.loads(await odoo_query(
+            "account.move",
+            inv_paid_domain,
+            ["id", "name", "amount_total", "amount_residual", "invoice_date",
+             "partner_id", "payment_state", "invoice_origin", "ref", "move_type"],
+            limit=100, order="invoice_date desc"
+        ))
+        inv_paid_r = inv_paid_r if isinstance(inv_paid_r, list) else []
+        # Dedupe: exclude any already found in inv_r_total
+        seen_inv = {inv["id"] for inv in inv_r_total} | {inv["id"] for inv in inv_r_residual}
+        inv_paid_r = [inv for inv in inv_paid_r if inv["id"] not in seen_inv]
+        print(f"[MATCH_PAYMENT] paid invoices (possible mis-reconciliation): {len(inv_paid_r)} candidates")
+
         # ── 5) Score and build candidates ──────────────────────
         candidates = []
 
         def amount_score(cand_amount):
             """Score based on how close the candidate amount is to the target.
-            Strict: amounts should match exactly or be within $2 (bank rounding)."""
+            $20 tolerance covers tax rate fluctuations and small shipping additions."""
             diff = abs(cand_amount - amount)
             if diff <= near_exact_tol:
                 return 60, "金额精确匹配"
-            elif diff <= 1.0:
-                return 45, f"金额差 ${diff:.2f} (四舍五入)"
+            elif diff <= 5.0:
+                return 45, f"金额差 ${diff:.2f} (小幅差异)"
+            elif diff <= 10.0:
+                return 35, f"金额差 ${diff:.2f} (可能是税率差异)"
             elif diff <= tolerance:
-                return 25, f"金额差 ${diff:.2f} (在 ${tolerance:.0f} 容差内)"
+                return 20, f"金额差 ${diff:.2f} (在 ${tolerance:.0f} 容差内，可能含运费/税差)"
             return 0, f"金额差 ${diff:.2f}"
 
         def date_score(cand_date_str):
@@ -3520,6 +3631,122 @@ async def run_tool(name, inp, context=None):
 
         # (bank.statement.line branch removed — see note above about not
         # echoing the user's own input as an answer.)
+
+        # -- 5d. in_payment invoice matches (Phase 2A) --
+        for inv in inpayment_matches:
+            c_amt = float(inv.get("_match_amount") or 0)
+            c_date = inv.get("invoice_date") or ""
+            partner = inv.get("partner_id")
+            partner_id = partner[0] if partner else None
+            partner_name = partner[1] if partner else ""
+            reasons = []
+            a_score, a_reason = amount_score(c_amt)
+            if a_score == 0: continue
+            reasons.append(a_reason + f" ({inv['_match_label']})")
+            d_score, d_reason = date_score(c_date)
+            if d_reason: reasons.append(d_reason)
+            cu_score, cu_reason = customer_score(partner_id, partner_name)
+            if cu_reason: reasons.append(cu_reason)
+            type_bonus = 8  # in_payment invoices are the PRIMARY search target
+            reasons.append(f"in_payment 发票 — 优先匹配")
+
+            total_score = a_score + d_score + cu_score + type_bonus
+            # Avoid duplicate if same invoice already in candidates
+            if inv["id"] not in {c.get("record_id") for c in candidates if c.get("type","").startswith("invoice")}:
+                candidates.append({
+                    "type": "invoice_in_payment",
+                    "match_score": total_score,
+                    "record_id": inv["id"],
+                    "name": inv.get("name"),
+                    "amount": round(float(inv.get("amount_total") or 0), 2),
+                    "amount_residual": round(float(inv.get("amount_residual") or 0), 2),
+                    "matched_on": inv["_match_label"],
+                    "matched_amount": round(c_amt, 2),
+                    "date": c_date,
+                    "partner_id": partner_id,
+                    "partner_name": partner_name,
+                    "payment_state": inv.get("payment_state"),
+                    "linked_so": inv.get("invoice_origin") or "",
+                    "ref": inv.get("ref") or "",
+                    "match_reasons": reasons,
+                    "odoo_link": f"{odoo_web_base}/odoo/account-move/{inv['id']}",
+                })
+
+        # -- 5e. uninvoiced SOs (Phase 2B) --
+        for so in so_r:
+            c_amt = float(so.get("amount_total") or 0)
+            c_date = so.get("date_order") or ""
+            partner = so.get("partner_id")
+            partner_id = partner[0] if partner else None
+            partner_name = partner[1] if partner else ""
+            reasons = []
+            a_score, a_reason = amount_score(c_amt)
+            if a_score == 0: continue
+            reasons.append(a_reason)
+            d_score, d_reason = date_score(c_date[:10] if c_date else "")
+            if d_reason: reasons.append(d_reason)
+            cu_score, cu_reason = customer_score(partner_id, partner_name)
+            if cu_reason: reasons.append(cu_reason)
+            type_bonus = 2
+            salesperson = so["user_id"][1] if so.get("user_id") else ""
+            inv_status = so.get("invoice_status") or ""
+            reasons.append(f"未开票 SO (invoice_status={inv_status})")
+            if salesperson:
+                reasons.append(f"销售员: {salesperson}")
+
+            total_score = a_score + d_score + cu_score + type_bonus
+            candidates.append({
+                "type": "uninvoiced_so",
+                "match_score": total_score,
+                "record_id": so["id"],
+                "name": so.get("name"),
+                "amount": round(c_amt, 2),
+                "date": c_date[:10] if c_date else "",
+                "partner_id": partner_id,
+                "partner_name": partner_name,
+                "so_state": so.get("state"),
+                "invoice_status": inv_status,
+                "salesperson": salesperson,
+                "match_reasons": reasons,
+                "odoo_link": f"{odoo_web_base}/odoo/sales/{so['id']}",
+            })
+
+        # -- 5f. paid invoices — possible mis-reconciliation (Phase 2C) --
+        for inv in inv_paid_r:
+            c_amt = float(inv.get("amount_total") or 0)
+            c_date = inv.get("invoice_date") or ""
+            partner = inv.get("partner_id")
+            partner_id = partner[0] if partner else None
+            partner_name = partner[1] if partner else ""
+            reasons = []
+            a_score, a_reason = amount_score(c_amt)
+            if a_score == 0: continue
+            reasons.append(a_reason)
+            d_score, d_reason = date_score(c_date)
+            if d_reason: reasons.append(d_reason)
+            cu_score, cu_reason = customer_score(partner_id, partner_name)
+            if cu_reason: reasons.append(cu_reason)
+            type_bonus = -3  # lower priority: already paid, might be wrong reconciliation
+            reasons.append("已付清发票 — 可能对账对错")
+
+            total_score = a_score + d_score + cu_score + type_bonus
+            if total_score > 0:
+                candidates.append({
+                    "type": "invoice_paid_check",
+                    "match_score": total_score,
+                    "record_id": inv["id"],
+                    "name": inv.get("name"),
+                    "amount": round(c_amt, 2),
+                    "amount_residual": round(float(inv.get("amount_residual") or 0), 2),
+                    "date": c_date,
+                    "partner_id": partner_id,
+                    "partner_name": partner_name,
+                    "payment_state": inv.get("payment_state"),
+                    "linked_so": inv.get("invoice_origin") or "",
+                    "ref": inv.get("ref") or "",
+                    "match_reasons": reasons,
+                    "odoo_link": f"{odoo_web_base}/odoo/account-move/{inv['id']}",
+                })
 
         # ── 6) Sort, dedupe, pick top ──────────────────────────
         candidates.sort(key=lambda c: c["match_score"], reverse=True)
