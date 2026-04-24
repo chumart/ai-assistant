@@ -3299,7 +3299,7 @@ async def run_tool(name, inp, context=None):
             "account.payment",
             pay_domain,
             ["id", "name", "amount", "date", "partner_id", "state",
-             "ref", "reconciled_invoice_ids", "payment_type"],
+             "ref", "reconciled_invoice_ids", "payment_type", "journal_id"],
             limit=100, order="date desc"
         ))
         pay_r = pay_r if isinstance(pay_r, list) else []
@@ -3320,7 +3320,7 @@ async def run_tool(name, inp, context=None):
             "account.move",
             inv_total_domain,
             ["id", "name", "amount_total", "amount_residual", "invoice_date",
-             "partner_id", "payment_state", "invoice_origin", "ref", "move_type"],
+             "partner_id", "payment_state", "invoice_origin", "ref", "move_type", "x_payment_method"],
             limit=100, order="invoice_date desc"
         ))
         inv_r_total = inv_r_total if isinstance(inv_r_total, list) else []
@@ -3339,7 +3339,7 @@ async def run_tool(name, inp, context=None):
             "account.move",
             inv_residual_domain,
             ["id", "name", "amount_total", "amount_residual", "invoice_date",
-             "partner_id", "payment_state", "invoice_origin", "ref", "move_type"],
+             "partner_id", "payment_state", "invoice_origin", "ref", "move_type", "x_payment_method"],
             limit=100, order="invoice_date desc"
         ))
         inv_r_residual = inv_r_residual if isinstance(inv_r_residual, list) else []
@@ -3372,7 +3372,7 @@ async def run_tool(name, inp, context=None):
             "account.move",
             inv_inpayment_domain,
             ["id", "name", "amount_total", "amount_residual", "invoice_date",
-             "partner_id", "payment_state", "invoice_origin", "ref", "move_type"],
+             "partner_id", "payment_state", "invoice_origin", "ref", "move_type", "x_payment_method"],
             limit=200, order="invoice_date desc"
         ))
         inv_inpayment_r = inv_inpayment_r if isinstance(inv_inpayment_r, list) else []
@@ -3448,7 +3448,7 @@ async def run_tool(name, inp, context=None):
             "account.move",
             inv_paid_domain,
             ["id", "name", "amount_total", "amount_residual", "invoice_date",
-             "partner_id", "payment_state", "invoice_origin", "ref", "move_type"],
+             "partner_id", "payment_state", "invoice_origin", "ref", "move_type", "x_payment_method"],
             limit=100, order="invoice_date desc"
         ))
         inv_paid_r = inv_paid_r if isinstance(inv_paid_r, list) else []
@@ -3513,6 +3513,27 @@ async def run_tool(name, inp, context=None):
                     return 10, f"客户名部分包含 '{partner_name}'"
             return 0, ""
 
+        def payment_method_score(x_payment_method_val):
+            """Score based on invoice's x_payment_method field.
+            When user mentions Zelle/Wire/bank transfer, Zelle-method invoices
+            get a boost; Cash-method invoices get a penalty."""
+            if not x_payment_method_val:
+                return 0, ""
+            pm = str(x_payment_method_val).lower()
+            if "zelle" in pm:
+                return 10, "付款方式: Zelle"
+            elif "ach" in pm:
+                return 8, "付款方式: ACH"
+            elif "check" in pm:
+                return 5, "付款方式: Check"
+            elif "stripe" in pm:
+                return 0, "付款方式: Stripe (刷卡)"
+            elif "cash" in pm:
+                return -10, "付款方式: Cash (非 Zelle/Wire)"
+            elif "amazon" in pm or "ebay" in pm or "shopify" in pm or "walmart" in pm:
+                return -8, f"付款方式: {x_payment_method_val} (平台收款)"
+            return 0, f"付款方式: {x_payment_method_val}"
+
         odoo_web_base = ODOO_URL.rstrip("/")
 
         # -- 5a. account.payment candidates --
@@ -3530,13 +3551,30 @@ async def run_tool(name, inp, context=None):
             if d_reason: reasons.append(d_reason)
             cu_score, cu_reason = customer_score(partner_id, partner_name)
             if cu_reason: reasons.append(cu_reason)
+            pm_score, pm_reason = payment_method_score(inv.get("x_payment_method"))
+            if pm_reason: reasons.append(pm_reason)
             type_bonus = 5  # payment record is the most direct evidence
+
+            # Journal-based scoring: if user mentions "zelle/wire/bank transfer",
+            # penalize Cash journal payments and boost Bank journal payments.
+            journal = p.get("journal_id")
+            journal_name = (journal[1] if journal else "").lower()
+            journal_bonus = 0
+            if "cash" in journal_name:
+                journal_bonus = -15  # Cash payment cannot be Zelle/Wire
+                reasons.append(f"⚠ Cash journal (非 Zelle/Wire)")
+            elif "bank" in journal_name:
+                journal_bonus = 5
+                reasons.append(f"Bank journal")
+            else:
+                reasons.append(f"Journal: {journal[1] if journal else '?'}")
+
             reasons.append("付款单记录")
 
             # Get linked invoices
             linked_inv = p.get("reconciled_invoice_ids") or []
 
-            total_score = a_score + d_score + cu_score + type_bonus
+            total_score = a_score + d_score + cu_score + pm_score + type_bonus + journal_bonus
             candidates.append({
                 "type": "payment",
                 "match_score": total_score,
@@ -3547,6 +3585,7 @@ async def run_tool(name, inp, context=None):
                 "partner_id": partner_id,
                 "partner_name": partner_name,
                 "state": p.get("state"),
+                "journal": journal[1] if journal else "",
                 "payment_ref": p.get("ref") or "",
                 "linked_invoice_ids": linked_inv,
                 "match_reasons": reasons,
@@ -3570,10 +3609,12 @@ async def run_tool(name, inp, context=None):
             if d_reason: reasons.append(d_reason)
             cu_score, cu_reason = customer_score(partner_id, partner_name)
             if cu_reason: reasons.append(cu_reason)
+            pm_score, pm_reason = payment_method_score(inv.get("x_payment_method"))
+            if pm_reason: reasons.append(pm_reason)
             type_bonus = 0
             reasons.append(f"发票 ({inv.get('payment_state','?')})")
 
-            total_score = a_score + d_score + cu_score + type_bonus
+            total_score = a_score + d_score + cu_score + pm_score + type_bonus
             candidates.append({
                 "type": "invoice_total",
                 "match_score": total_score,
@@ -3585,6 +3626,7 @@ async def run_tool(name, inp, context=None):
                 "partner_id": partner_id,
                 "partner_name": partner_name,
                 "payment_state": inv.get("payment_state"),
+                "payment_method": inv.get("x_payment_method") or "",
                 "linked_so": inv.get("invoice_origin") or "",
                 "ref": inv.get("ref") or "",
                 "match_reasons": reasons,
@@ -3608,10 +3650,12 @@ async def run_tool(name, inp, context=None):
             if d_reason: reasons.append(d_reason)
             cu_score, cu_reason = customer_score(partner_id, partner_name)
             if cu_reason: reasons.append(cu_reason)
+            pm_score, pm_reason = payment_method_score(inv.get("x_payment_method"))
+            if pm_reason: reasons.append(pm_reason)
             type_bonus = 3  # residual-match often indicates partial payment flow
             reasons.append(f"分期付款发票 ({inv.get('payment_state','?')})")
 
-            total_score = a_score + d_score + cu_score + type_bonus
+            total_score = a_score + d_score + cu_score + pm_score + type_bonus
             candidates.append({
                 "type": "invoice_residual",
                 "match_score": total_score,
@@ -3647,10 +3691,12 @@ async def run_tool(name, inp, context=None):
             if d_reason: reasons.append(d_reason)
             cu_score, cu_reason = customer_score(partner_id, partner_name)
             if cu_reason: reasons.append(cu_reason)
+            pm_score, pm_reason = payment_method_score(inv.get("x_payment_method"))
+            if pm_reason: reasons.append(pm_reason)
             type_bonus = 8  # in_payment invoices are the PRIMARY search target
             reasons.append(f"in_payment 发票 — 优先匹配")
 
-            total_score = a_score + d_score + cu_score + type_bonus
+            total_score = a_score + d_score + cu_score + pm_score + type_bonus
             # Avoid duplicate if same invoice already in candidates
             if inv["id"] not in {c.get("record_id") for c in candidates if c.get("type","").startswith("invoice")}:
                 candidates.append({
@@ -3687,6 +3733,7 @@ async def run_tool(name, inp, context=None):
             if d_reason: reasons.append(d_reason)
             cu_score, cu_reason = customer_score(partner_id, partner_name)
             if cu_reason: reasons.append(cu_reason)
+            pm_score = 0  # SOs don't have x_payment_method
             type_bonus = 2
             salesperson = so["user_id"][1] if so.get("user_id") else ""
             inv_status = so.get("invoice_status") or ""
@@ -3694,7 +3741,7 @@ async def run_tool(name, inp, context=None):
             if salesperson:
                 reasons.append(f"销售员: {salesperson}")
 
-            total_score = a_score + d_score + cu_score + type_bonus
+            total_score = a_score + d_score + cu_score + pm_score + type_bonus
             candidates.append({
                 "type": "uninvoiced_so",
                 "match_score": total_score,
@@ -3726,10 +3773,12 @@ async def run_tool(name, inp, context=None):
             if d_reason: reasons.append(d_reason)
             cu_score, cu_reason = customer_score(partner_id, partner_name)
             if cu_reason: reasons.append(cu_reason)
+            pm_score, pm_reason = payment_method_score(inv.get("x_payment_method"))
+            if pm_reason: reasons.append(pm_reason)
             type_bonus = -3  # lower priority: already paid, might be wrong reconciliation
             reasons.append("已付清发票 — 可能对账对错")
 
-            total_score = a_score + d_score + cu_score + type_bonus
+            total_score = a_score + d_score + cu_score + pm_score + type_bonus
             if total_score > 0:
                 candidates.append({
                     "type": "invoice_paid_check",
