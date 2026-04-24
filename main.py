@@ -1644,6 +1644,55 @@ STEP 4 — Execute only after confirmation:
   Report results: PO names (e.g. P00442) + Odoo links for each created PO.
   If any line_errors exist, tell user which products failed and why.
 
+ORDER/INVOICE STATE FILTERING (APPLIES TO ALL QUERIES):
+When searching or aggregating purchase orders, sale orders, invoices, or stock pickings, ALWAYS exclude CANCELLED records by default. Cancelled records do not represent real business activity and should not pollute user-facing counts, totals, or lists.
+
+Note: draft, sent (quotation/RFQ), and in-progress states ARE normal business activity and should be INCLUDED by default. Only cancelled records are filtered out.
+
+DEFAULT STATE FILTERS — add these to the domain of every search, UNLESS the user explicitly asks to include cancelled ("包含取消" / "including cancelled" / "所有状态" / "all states including cancelled"):
+
+  purchase.order:
+    ["state", "!=", "cancel"]
+    (includes: draft, sent/RFQ, to approve, purchase, done — excludes only cancel)
+
+  sale.order:
+    ["state", "!=", "cancel"]
+    (includes: draft, sent/quotation, sale, done — excludes only cancel)
+
+  stock.picking:
+    ["state", "!=", "cancel"]
+    (includes: draft, waiting, confirmed, assigned, done — excludes only cancel)
+
+  account.move (invoices/bills):
+    [["state", "=", "posted"]]
+    (Invoices are special: only "posted" = real financial activity. "draft" is an unposted draft and "cancel" is cancelled; neither hits the books.)
+    Note: for existing finance report tools (get_monthly_tax, get_quarterly_tax, get_monthly_sales, get_missing_tax), the state filter is already applied server-side — do NOT re-add it.
+
+EXAMPLES:
+  User: "查下25年12月31日以来采购过的产品" (purchase history)
+  → Correct domain: [["date_order", ">=", "2025-12-31"], ["company_id", "=", 1], ["state", "!=", "cancel"]]
+  → Excludes cancelled POs but includes drafts, RFQs, confirmed, and done orders.
+
+  User: "列出本月所有销售单，包括取消的" (explicit "including cancelled")
+  → Correct domain: [["date_order", ">=", ...], ["company_id", "=", 1]]  — NO state filter at all (user wants cancelled too)
+
+  User: "有多少取消的采购订单" (specifically asking about cancelled)
+  → Correct domain: [..., ["state", "=", "cancel"]] — filter TO cancelled only
+
+  User: "有哪些RFQ待审批" (looking for drafts/RFQs specifically)
+  → Correct domain: [..., ["state", "in", ["draft", "sent", "to approve"]]] — filter TO drafts only
+
+WHEN TO OMIT THE STATE FILTER:
+  - User explicitly says "包含取消" / "including cancelled" / "all states including cancel"
+  - The query is specifically about cancelled records ("取消的订单")
+
+TELL THE USER WHAT YOU EXCLUDED:
+In your summary, briefly note that cancelled records are excluded, so users don't wonder why counts differ from Odoo's unfiltered list view. Examples:
+"（不含取消订单）"
+"(excluding cancelled orders)"
+
+WHY: Cancelled orders did not actually happen. A user asking "我们采购过什么" almost never means "including the order we cancelled." Default to real business activity. But drafts and quotations ARE real activity (we're working on them) — they should be included.
+
 VENDOR PRICELIST UPDATES (CRITICAL WORKFLOW):
 When the user wants to update vendor prices / 供应商价格 / vendor pricelist for a list of SKUs:
 
