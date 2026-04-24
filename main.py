@@ -1379,7 +1379,7 @@ TOOLS = [
     },
     {
         "name": "odoo_match_payment_to_customer",
-        "description": "MATCH A RECEIVED PAYMENT to customer invoices/SOs. USE THIS for any question like '我收到一笔 $X 的钱 不知道是哪个客户 / 哪个发票对应', 'which customer sent $X', 'find invoice for this payment', 'who paid $X on [date]'. Searches account.payment, account.move (invoices, by both total AND residual for partial-payment cases), and bank.statement.line in parallel. Amount tolerance is strict: $2 only — card payments already sync with exact net amount, and the real use case here is partial payments where amounts match exactly against amount_residual. Returns ranked candidates with match_score. ALWAYS use this INSTEAD OF multiple manual odoo_search calls on payment/invoice models. Read-only.",
+        "description": "MATCH A RECEIVED PAYMENT to customer invoices/SOs. USE THIS for any question like '我收到一笔 $X 的钱 不知道是哪个客户 / 哪个发票对应', 'which customer sent $X', 'find invoice for this payment', 'who paid $X on [date]'. Searches account.payment and account.move (invoices, by both total AND residual for partial-payment cases) in parallel. Does NOT search bank.statement.line — the user typically asks this WHILE LOOKING at a bank line, so matching against itself would be noise. Amount tolerance is strict: $2 only — card payments already sync with exact net amount, and the real use case here is partial payments where amounts match exactly against amount_residual. Returns ranked candidates with match_score. ALWAYS use this INSTEAD OF multiple manual odoo_search calls on payment/invoice models. Read-only.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -1791,7 +1791,7 @@ DATE WINDOW:
 DO NOT chain this with odoo_search for the same purpose. Call it once, use the result. If you need PO line details for ONE specific PO, then use odoo_search, but for SKU-centric questions this tool is always the answer.
 
 PAYMENT MATCHING QUERIES (CRITICAL PERFORMANCE RULE):
-When the user asks any of the following patterns — ALWAYS use odoo_match_payment_to_customer INSTEAD OF chaining odoo_search calls on account.payment / account.move / bank.statement.line:
+When the user asks any of the following patterns — ALWAYS use odoo_match_payment_to_customer INSTEAD OF chaining odoo_search calls on account.payment / account.move:
   - "我收到一笔 $X 的钱 不知道是哪个客户 / 哪个发票 / 哪个 SO"
   - "上个月收到 $X 查下对应哪张发票"
   - "这笔 $X 来自哪个客户"
@@ -1803,7 +1803,7 @@ RULE — When the question is "received money → which invoice/customer/SO":
   ✅ CORRECT: odoo_match_payment_to_customer(amount=X, date="YYYY-MM-DD", customer_hint="NAME")
   ❌ WRONG:   odoo_search(account.payment, ...) + odoo_search(account.move, ...) + ...
 
-The tool searches payments, invoices (by total AND by residual — for partial payments), and bank statement lines in parallel. Amount tolerance is strict ($2 only): card payments auto-sync with exact net amounts in Odoo and full payments get auto-linked by invoice_origin — so when we DO have to search, it's usually for partial payments where amounts match exactly against amount_residual. Candidates are ranked by match_score considering amount closeness, date proximity, and customer name match.
+The tool searches payments and invoices (by total AND by residual — for partial payments) in parallel. It does NOT search bank.statement.line (users are typically asking this question while looking at a bank line, and matching a bank line against itself is noise). Amount tolerance is strict ($2 only): card payments auto-sync with exact net amounts in Odoo and full payments get auto-linked by invoice_origin — so when we DO have to search, it's usually for partial payments where amounts match exactly against amount_residual. Candidates are ranked by match_score considering amount closeness, date proximity, and customer name match.
 
 EXTRACTING INPUTS FROM USER MESSAGE:
   - amount (required): the USD amount mentioned
@@ -1818,6 +1818,16 @@ INTERPRETING RESULTS:
   - 0 candidates → say "未在 Odoo 中找到金额 $X 附近、日期 [range] 的记录"
 
 DO NOT fabricate matches. If no candidates returned, say so clearly. Do not invent invoice numbers or customer names.
+
+WHEN 0 CANDIDATES RETURNED (total_candidates_found = 0):
+This is a meaningful answer, not a failure. Tell the user something like:
+  "在 Odoo 中没有找到金额 $X 附近、日期 ±14 天内的客户付款单或发票记录。这笔钱可能：
+   1) 还没有被录入 Odoo (通常 Zelle/Wire 手工入账需要财务补录)
+   2) 客户还没开发票
+   3) 日期或金额和实际有偏差"
+Then ask: "你能提供更多信息吗？比如客户名、准确的金额或日期。"
+
+DO NOT say "我找到一条银行对账记录" as an answer — the user is usually asking this FROM the bank line view, so that would just echo their input.
 
 LARGE RESULT SETS — SUMMARY-FIRST RULE (APPLIES TO ALL REPLIES):
 This rule applies to EVERY reply you produce, for EVERY type of query — searches, reports, lookups, cross-references, anything. Before dumping data, check how much you are about to output.
@@ -3026,7 +3036,7 @@ async def run_tool(name, inp, context=None):
           exactly.
 
         Returns candidates sorted by match_score (high → low), each with type
-        (payment/invoice/invoice_residual/bank_line), amount, date, partner,
+        (payment/invoice_total/invoice_residual), amount, date, partner,
         linked SO if any, and match_reasons. Plus a best_candidate and summary.
         """
         import datetime as dt
@@ -3171,27 +3181,13 @@ async def run_tool(name, inp, context=None):
         print(f"[MATCH_PAYMENT] account.move: {len(inv_r_total)} by total, "
               f"{len(inv_r_residual)} by residual")
 
-        # ── 4) Search account.bank.statement.line ──────────────
-        # Bank reconciliation entries — raw bank transactions
-        try:
-            bank_r = json.loads(await odoo_query(
-                "account.bank.statement.line",
-                [
-                    ["amount", ">=", amount_low],
-                    ["amount", "<=", amount_high],
-                    ["date", ">=", date_from],
-                    ["date", "<=", date_to],
-                    ["company_id", "=", 1],
-                ],
-                ["id", "date", "amount", "partner_id", "payment_ref", "ref",
-                 "is_reconciled"],
-                limit=100, order="date desc"
-            ))
-            bank_r = bank_r if isinstance(bank_r, list) else []
-        except Exception as e:
-            print(f"[MATCH_PAYMENT] bank line query failed (may not exist in this DB): {e}")
-            bank_r = []
-        print(f"[MATCH_PAYMENT] bank.statement.line: {len(bank_r)} candidates")
+        # NOTE: We intentionally do NOT search account.bank.statement.line.
+        # The user is typically asking this question WHILE LOOKING AT a bank
+        # statement line — matching a bank line against itself just echoes
+        # their input back as the "answer". The real question is "which
+        # invoice / SO / payment_record does this money correspond to" —
+        # so we only search account.payment and account.move.
+        print(f"[MATCH_PAYMENT] (bank.statement.line search intentionally skipped)")
 
         # ── 5) Score and build candidates ──────────────────────
         candidates = []
@@ -3363,46 +3359,8 @@ async def run_tool(name, inp, context=None):
                 "odoo_link": f"{odoo_web_base}/odoo/account-move/{inv['id']}",
             })
 
-        # -- 5d. bank.statement.line candidates --
-        for b in bank_r:
-            c_amt = float(b.get("amount") or 0)
-            c_date = b.get("date") or ""
-            partner = b.get("partner_id")
-            partner_id = partner[0] if partner else None
-            partner_name = partner[1] if partner else ""
-            reasons = []
-            a_score, a_reason = amount_score(c_amt)
-            if a_score == 0: continue
-            reasons.append(a_reason)
-            d_score, d_reason = date_score(c_date)
-            if d_reason: reasons.append(d_reason)
-            cu_score, cu_reason = customer_score(partner_id, partner_name)
-            if cu_reason: reasons.append(cu_reason)
-            type_bonus = 2
-            payment_ref = b.get("payment_ref") or b.get("ref") or ""
-            reasons.append(f"银行对账行 ('{payment_ref[:60]}')" if payment_ref else "银行对账行")
-
-            # If customer_hint was given and bank memo contains it, big bonus
-            if customer_hint and payment_ref:
-                if customer_hint.strip().lower() in payment_ref.lower():
-                    cu_score = max(cu_score, 20)
-                    reasons.append(f"银行备注包含 '{customer_hint}'")
-
-            total_score = a_score + d_score + cu_score + type_bonus
-            candidates.append({
-                "type": "bank_line",
-                "match_score": total_score,
-                "record_id": b["id"],
-                "name": payment_ref[:80] or f"Bank line #{b['id']}",
-                "amount": round(c_amt, 2),
-                "date": c_date,
-                "partner_id": partner_id,
-                "partner_name": partner_name,
-                "is_reconciled": b.get("is_reconciled"),
-                "payment_ref": payment_ref,
-                "match_reasons": reasons,
-                "odoo_link": f"{odoo_web_base}/odoo/action-account.action_bank_statement_tree",
-            })
+        # (bank.statement.line branch removed — see note above about not
+        # echoing the user's own input as an answer.)
 
         # ── 6) Sort, dedupe, pick top ──────────────────────────
         candidates.sort(key=lambda c: c["match_score"], reverse=True)
@@ -3415,7 +3373,12 @@ async def run_tool(name, inp, context=None):
 
         # ── 8) Build human-readable summary line ───────────────
         if not candidates:
-            summary_line = f"未找到金额在 ${amount_low} ~ ${amount_high} 之间的候选记录（日期 {date_from} ~ {date_to}）。可能这笔款项尚未在 Odoo 中记录，或者金额/日期与实际偏差较大。"
+            summary_line = (
+                f"在 Odoo 中未找到金额 ${amount_low:.2f} ~ ${amount_high:.2f}、"
+                f"日期 {date_from} ~ {date_to} 的客户付款单或发票。"
+                f"这笔钱可能还没被录入 Odoo（Zelle/Wire 常需财务手工补录），"
+                f"或者金额/日期有偏差。建议提供客户名或确认一下金额日期。"
+            )
         elif best["match_score"] >= 80:
             summary_line = (f"最可能: {best['partner_name']} 的 {best['name']} "
                             f"(${best['amount']}, {best['date']}, 分数 {best['match_score']})。"
