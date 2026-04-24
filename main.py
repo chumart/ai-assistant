@@ -1292,14 +1292,15 @@ TOOLS = [
     },
     {
         "name": "get_po_with_so_links",
-        "description": "Get a Purchase Order's product lines AND find all related Sales Orders containing those products. Use this for ANY question like 'show me PO X and its related SOs', 'which customers bought products from PO X', 'PO to SO analysis'. This tool handles all the table joins correctly — do NOT use odoo_search manually for this type of query.",
+        "description": "Get a Purchase Order's product lines AND find all related Sales Orders containing those products. Use this for ANY question like 'show me PO X and its related SOs', 'which customers bought products from PO X', 'PO to SO analysis'. This tool handles all the table joins correctly — do NOT use odoo_search manually for this type of query. When the user asks about a specific salesperson's related SOs or 'what sold' from a PO, pass only_with_so=true to hide product lines that had no matching SO (cleaner output).",
         "input_schema": {
             "type": "object",
             "properties": {
                 "po_name": {"type": "string", "description": "PO number exactly as shown (e.g. 'P00461')"},
                 "days_back": {"type": "integer", "default": 30, "description": "How many days back to look for related SOs (default 30)"},
                 "include_all_so": {"type": "boolean", "default": False, "description": "If true, find all SOs ever, no date filter"},
-                "salesperson": {"type": "string", "default": "", "description": "Filter SOs by salesperson name (e.g. 'Alex'). Empty = all salespeople."}
+                "salesperson": {"type": "string", "default": "", "description": "Filter SOs by salesperson name (e.g. 'Alex'). Empty = all salespeople."},
+                "only_with_so": {"type": "boolean", "default": False, "description": "If true, only return product lines that have at least one matching SO. Set to true when the user is asking about what actually sold, or about a specific salesperson's related SOs — this avoids cluttering the output with products that had no sales activity."}
             },
             "required": ["po_name"]
         }
@@ -1578,6 +1579,12 @@ STANDARD QUERY PATTERNS (follow these exactly):
 → NOW use get_po_with_so_links(po_name="P00461") — this handles all table joins correctly
 → Adjust days_back if user specifies a time range (e.g. "last 7 days" → days_back=7)
 → Use include_all_so=true if user wants all historical SOs
+→ IMPORTANT — use only_with_so=true when:
+    - User mentions a specific salesperson ("Alex相关的 SO", "what Alex sold", "Mike 卖过的")
+    - User asks "what sold from this PO" / "哪些卖出去了" / "实际成交的"
+    - User is doing PO-to-SO conversion analysis
+  When only_with_so=true is used, the tool hides products that had zero matching SOs (reduces noise). Display only the returned rows — do NOT separately list the products that were filtered out. The summary line already tells you how many were hidden.
+→ Leave only_with_so=false (default) ONLY when user explicitly wants the full PO breakdown including unsold items.
 
 CRITICAL: Odoo 17 does NOT reliably support 2-level relational filters like "order_id.date_order" or "order_id.company_id" on order lines — these may silently return wrong/empty results. Always filter dates at the order level in a separate query.
 CRITICAL: NEVER use "order_id.id" as a filter — use "order_id" directly. Example: [["order_id","in",[453,447]]] NOT [["order_id.id","in",[453,447]]]
@@ -2954,6 +2961,7 @@ async def run_tool(name, inp, context=None):
         days_back = inp.get("days_back", 30)
         include_all_so = inp.get("include_all_so", False)
         salesperson_filter = inp.get("salesperson", "").strip()  # optional: filter SOs by salesperson name
+        only_with_so = bool(inp.get("only_with_so", False))  # hide products that had no matching SO
 
         if not po_name:
             return json.dumps({"error": "po_name is required (e.g. 'P00461')"})
@@ -3044,6 +3052,14 @@ async def run_tool(name, inp, context=None):
                     "recent_sos": matching_sos[:10],  # max 10 per product
                 })
 
+            # Optional: drop products that had no matching SO (when user only cares
+            # about "what sold", not "every line of the PO"). Default off to keep
+            # backward compatibility.
+            total_products_in_po = len(result_lines)
+            if only_with_so:
+                result_lines = [r for r in result_lines if r.get("so_count", 0) > 0]
+            products_shown = len(result_lines)
+
             vendor = po["partner_id"][1] if po.get("partner_id") else ""
             return json.dumps({
                 "po_name": po["name"],
@@ -3053,8 +3069,16 @@ async def run_tool(name, inp, context=None):
                 "po_state": po.get("state"),
                 "po_total": po.get("amount_total"),
                 "so_date_from": date_from if not include_all_so else "all time",
+                "filter_only_with_so": only_with_so,
+                "total_products_in_po": total_products_in_po,
+                "products_shown": products_shown,
                 "lines": result_lines,
-                "summary": f"{po_name}: {len(result_lines)} products, {len(matched_so_ids)} related SOs found since {date_from}"
+                "summary": (
+                    f"{po_name}: {products_shown} of {total_products_in_po} products "
+                    f"had matching SOs, {len(matched_so_ids)} related SOs found since {date_from}"
+                    if only_with_so else
+                    f"{po_name}: {len(result_lines)} products, {len(matched_so_ids)} related SOs found since {date_from}"
+                )
             }, ensure_ascii=False, default=str)
 
         except Exception as e:
