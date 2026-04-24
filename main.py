@@ -45,6 +45,9 @@ R2_SECRET_KEY = os.getenv("R2_SECRET_KEY", "")
 R2_BUCKET     = os.getenv("R2_BUCKET", "chumart-docs")
 R2_PUBLIC_URL = os.getenv("R2_PUBLIC_URL", "")
 
+# MinerU Cloud API (PDF OCR)
+MINERU_API_TOKEN = os.getenv("MINERU_API_TOKEN", "")
+
 VALID_STATES = ["paid", "in_payment", "reversed"]
 CA_STATE_ID  = 13
 
@@ -369,23 +372,35 @@ async def r2_delete(r2_key: str) -> bool:
 # ─────────────────────────────────────────────
 
 async def extract_text_from_file(file_bytes: bytes, filename: str, mime_type: str) -> str:
-    """Extract text from PDF, Word, image, or plain text files."""
+    """Extract text from PDF, Word, image, or plain text files.
+    PDF: MinerU Cloud API (OCR + layout-aware), fallback to Claude Vision.
+    Image: Claude Vision.
+    Word: python-docx, fallback to Claude Vision.
+    """
     fname = filename.lower()
 
     # Plain text
     if fname.endswith(('.txt', '.md', '.csv')):
         return file_bytes.decode('utf-8', errors='ignore')
 
-    # PDF or image — use Claude vision
+    # PDF — use MinerU Cloud API (with Claude Vision fallback)
     if fname.endswith('.pdf'):
-        doc_type = "document"
-        media_type = "application/pdf"
-    elif fname.endswith(('.png', '.jpg', '.jpeg', '.webp')):
+        if MINERU_API_TOKEN:
+            text = await _extract_pdf_mineru(file_bytes, filename)
+            if text:
+                return text
+            print(f"MINERU FAILED for {filename}, falling back to Claude Vision")
+        else:
+            print(f"MINERU_API_TOKEN not set, using Claude Vision for {filename}")
+        return await _extract_via_claude_vision(file_bytes, filename, "document", "application/pdf")
+
+    # Image — Claude Vision
+    if fname.endswith(('.png', '.jpg', '.jpeg', '.webp')):
         ext = fname.split('.')[-1].replace('jpg', 'jpeg')
-        doc_type = "image"
-        media_type = f"image/{ext}"
-    elif fname.endswith(('.docx', '.doc')):
-        # Try python-docx first
+        return await _extract_via_claude_vision(file_bytes, filename, "image", f"image/{ext}")
+
+    # Word — python-docx first, then Claude Vision fallback
+    if fname.endswith(('.docx', '.doc')):
         try:
             import io
             from docx import Document as DocxDocument
@@ -393,19 +408,147 @@ async def extract_text_from_file(file_bytes: bytes, filename: str, mime_type: st
             text = "\n".join(p.text for p in doc.paragraphs if p.text.strip())
             return text
         except Exception:
-            # Fallback to Claude
-            doc_type = "document"
-            media_type = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
-    else:
-        return file_bytes.decode('utf-8', errors='ignore')
+            return await _extract_via_claude_vision(
+                file_bytes, filename, "document",
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+            )
 
-    # Use Claude to extract text from PDF/image/docx
+    # Unknown format — try as text
+    return file_bytes.decode('utf-8', errors='ignore')
+
+
+async def _extract_pdf_mineru(file_bytes: bytes, filename: str) -> str:
+    """Extract text from PDF using MinerU Cloud API.
+    Flow: request upload URL → PUT file → poll for result → download zip → extract markdown.
+    """
+    import zipfile, io
+
+    data_id = str(uuid.uuid4())[:8]
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {MINERU_API_TOKEN}"
+    }
+
+    print(f"MINERU START: {filename} ({len(file_bytes)//1024}KB)")
+
+    try:
+        # Step 1: Request upload URL
+        async with httpx.AsyncClient(timeout=60) as c:
+            r = await c.post(
+                "https://mineru.net/api/v4/file-urls/batch",
+                headers=headers,
+                json={
+                    "files": [{"name": filename, "data_id": data_id}],
+                    "model_version": "vlm",
+                    "is_ocr": True,
+                    "enable_table": True,
+                    "language": "en"
+                }
+            )
+            result = r.json()
+            if result.get("code") != 0:
+                print(f"MINERU UPLOAD-URL FAIL: {result.get('msg', result)}")
+                return ""
+
+            batch_id = result["data"]["batch_id"]
+            upload_url = result["data"]["file_urls"][0]
+            print(f"MINERU BATCH: {batch_id}, uploading file...")
+
+        # Step 2: PUT file bytes to the upload URL
+        async with httpx.AsyncClient(timeout=300) as c:
+            r = await c.put(upload_url, content=file_bytes)
+            if r.status_code not in (200, 201):
+                print(f"MINERU UPLOAD FAIL: HTTP {r.status_code}")
+                return ""
+            print(f"MINERU UPLOAD OK")
+
+        # Step 3: Poll for result (max 10 min, check every 10s)
+        max_wait = 600
+        interval = 10
+        elapsed = 0
+        full_zip_url = None
+
+        async with httpx.AsyncClient(timeout=30) as c:
+            while elapsed < max_wait:
+                await asyncio.sleep(interval)
+                elapsed += interval
+
+                r = await c.get(
+                    f"https://mineru.net/api/v4/extract-results/batch/{batch_id}",
+                    headers=headers
+                )
+                poll = r.json()
+                if poll.get("code") != 0:
+                    print(f"MINERU POLL ERROR [{elapsed}s]: {poll.get('msg', poll)}")
+                    continue
+
+                results = poll.get("data", {}).get("extract_result", [])
+                if not results:
+                    print(f"MINERU POLL [{elapsed}s]: no results yet")
+                    continue
+
+                item = results[0]
+                state = item.get("state", "unknown")
+
+                if state == "done":
+                    full_zip_url = item.get("full_zip_url", "")
+                    print(f"MINERU DONE [{elapsed}s]: {full_zip_url[:80]}...")
+                    break
+                elif state in ("failed", "error"):
+                    print(f"MINERU FAILED [{elapsed}s]: {item.get('err_msg', 'unknown error')}")
+                    return ""
+                else:
+                    progress = item.get("extract_progress", {})
+                    pages_done = progress.get("extracted_pages", "?")
+                    pages_total = progress.get("total_pages", "?")
+                    print(f"MINERU POLL [{elapsed}s]: state={state} pages={pages_done}/{pages_total}")
+
+        if not full_zip_url:
+            print(f"MINERU TIMEOUT after {max_wait}s")
+            return ""
+
+        # Step 4: Download zip and extract markdown
+        async with httpx.AsyncClient(timeout=120) as c:
+            r = await c.get(full_zip_url)
+            if r.status_code != 200:
+                print(f"MINERU ZIP DOWNLOAD FAIL: HTTP {r.status_code}")
+                return ""
+
+            zip_bytes = r.content
+            print(f"MINERU ZIP: {len(zip_bytes)//1024}KB downloaded")
+
+        # Extract .md file from zip
+        text = ""
+        with zipfile.ZipFile(io.BytesIO(zip_bytes), 'r') as zf:
+            md_files = [n for n in zf.namelist() if n.endswith('.md')]
+            # Prefer full.md or the largest .md file
+            target = None
+            for n in md_files:
+                if 'full' in n.lower():
+                    target = n
+                    break
+            if not target and md_files:
+                # Pick the largest .md file
+                target = max(md_files, key=lambda n: zf.getinfo(n).file_size)
+
+            if target:
+                text = zf.read(target).decode('utf-8', errors='ignore')
+                print(f"MINERU EXTRACT: {target} → {len(text)} chars")
+            else:
+                print(f"MINERU: no .md file found in zip. Contents: {zf.namelist()[:10]}")
+
+        return text
+
+    except Exception as e:
+        print(f"MINERU EXCEPTION: {e}")
+        return ""
+
+
+async def _extract_via_claude_vision(file_bytes: bytes, filename: str, doc_type: str, media_type: str) -> str:
+    """Extract text from PDF/image/docx using Claude Vision (legacy fallback)."""
     b64 = base64.standard_b64encode(file_bytes).decode('utf-8')
-    print(f"TEXT EXTRACT: {filename} ({len(file_bytes)//1024}KB) via Claude")
+    print(f"TEXT EXTRACT: {filename} ({len(file_bytes)//1024}KB) via Claude Vision")
 
-    # For large PDFs, extract in two passes to avoid token limit truncation
-    # Pass 1: full document extraction
-    # Pass 2: if result seems truncated, extract the second half separately
     async def extract_pass(prompt_suffix=""):
         try:
             async with httpx.AsyncClient(timeout=300) as c:
@@ -413,7 +556,7 @@ async def extract_text_from_file(file_bytes: bytes, filename: str, mime_type: st
                     "https://api.anthropic.com/v1/messages",
                     headers={"x-api-key": ANTHROPIC_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json"},
                     json={
-                        "model": "claude-sonnet-4-5",  # Use Sonnet for better long-doc extraction
+                        "model": "claude-sonnet-4-5",
                         "max_tokens": 8000,
                         "messages": [{
                             "role": "user",
@@ -442,7 +585,6 @@ async def extract_text_from_file(file_bytes: bytes, filename: str, mime_type: st
         print(f"TEXT EXTRACT: result may be truncated, trying focused pass on later sections...")
         text2 = await extract_pass(" Focus especially on the LATTER HALF of the document: troubleshooting, service procedures, error codes, parts lists, maintenance sections.")
         if len(text2) > len(text):
-            # Merge: first pass + second pass (deduplicated roughly)
             text = text + "\n\n--- [Additional content from second extraction pass] ---\n\n" + text2
             print(f"TEXT EXTRACT MERGED: {filename} → {len(text)} chars total")
 
