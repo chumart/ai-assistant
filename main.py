@@ -454,17 +454,17 @@ async def _extract_pdf_mineru(file_bytes: bytes, filename: str) -> str:
             upload_url = result["data"]["file_urls"][0]
             print(f"MINERU BATCH: {batch_id}, uploading file...")
 
-        # Step 2: PUT file bytes to the upload URL
-        async with httpx.AsyncClient(timeout=300) as c:
+        # Step 2: PUT file bytes to the upload URL (600s for large files over slow links)
+        async with httpx.AsyncClient(timeout=600) as c:
             r = await c.put(upload_url, content=file_bytes)
             if r.status_code not in (200, 201):
                 print(f"MINERU UPLOAD FAIL: HTTP {r.status_code}")
                 return ""
             print(f"MINERU UPLOAD OK")
 
-        # Step 3: Poll for result (max 10 min, check every 10s)
-        max_wait = 600
-        interval = 10
+        # Step 3: Poll for result (max 15 min, check every 15s)
+        max_wait = 900
+        interval = 15
         elapsed = 0
         full_zip_url = None
 
@@ -508,7 +508,7 @@ async def _extract_pdf_mineru(file_bytes: bytes, filename: str) -> str:
             return ""
 
         # Step 4: Download zip and extract markdown
-        async with httpx.AsyncClient(timeout=120) as c:
+        async with httpx.AsyncClient(timeout=300) as c:
             r = await c.get(full_zip_url)
             if r.status_code != 200:
                 print(f"MINERU ZIP DOWNLOAD FAIL: HTTP {r.status_code}")
