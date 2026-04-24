@@ -180,11 +180,88 @@ async def init_db():
             ON knowledge_chunks(site_url)
             WHERE site_url LIKE 'doc:%'
         """)
+        # Odoo write audit log — records EVERY create/update the AI makes to Odoo,
+        # so you can verify exactly what was changed and by whom.
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS odoo_write_audit (
+                id           SERIAL PRIMARY KEY,
+                ts           TIMESTAMP DEFAULT NOW(),
+                who_uid      INTEGER,
+                who_name     TEXT,
+                tool_name    TEXT,
+                model        TEXT NOT NULL,
+                record_id    INTEGER,
+                operation    TEXT NOT NULL,
+                old_values   JSONB,
+                new_values   JSONB,
+                extra_info   JSONB,
+                status       TEXT DEFAULT 'success'
+            )
+        """)
+        await conn.execute("""
+            CREATE INDEX IF NOT EXISTS odoo_write_audit_ts_idx
+            ON odoo_write_audit(ts DESC)
+        """)
+        await conn.execute("""
+            CREATE INDEX IF NOT EXISTS odoo_write_audit_model_idx
+            ON odoo_write_audit(model, record_id)
+        """)
         print("DB initialized OK")
     except Exception as e:
         print(f"DB init error: {e}")
     finally:
         await conn.close()
+
+async def audit_odoo_write(
+    who_uid: int = 0,
+    who_name: str = "",
+    tool_name: str = "",
+    model: str = "",
+    record_id: Optional[int] = None,
+    operation: str = "",
+    old_values: Optional[dict] = None,
+    new_values: Optional[dict] = None,
+    extra_info: Optional[dict] = None,
+    status: str = "success",
+):
+    """Log every AI-initiated write to Odoo. Non-blocking, never raises."""
+    try:
+        conn = await get_db_conn()
+        if not conn:
+            # Still print to Railway logs as fallback
+            print(f"[AUDIT FALLBACK] who={who_name}({who_uid}) tool={tool_name} "
+                  f"{operation} {model}#{record_id} old={old_values} new={new_values} "
+                  f"status={status}")
+            return
+        try:
+            await conn.execute(
+                """
+                INSERT INTO odoo_write_audit
+                    (who_uid, who_name, tool_name, model, record_id,
+                     operation, old_values, new_values, extra_info, status)
+                VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8::jsonb, $9::jsonb, $10)
+                """,
+                who_uid or 0,
+                who_name or "",
+                tool_name or "",
+                model or "",
+                record_id,
+                operation or "",
+                json.dumps(old_values) if old_values is not None else None,
+                json.dumps(new_values) if new_values is not None else None,
+                json.dumps(extra_info) if extra_info is not None else None,
+                status or "success",
+            )
+            # Also mirror to Railway logs for live monitoring
+            print(f"[AUDIT] who={who_name}({who_uid}) tool={tool_name} "
+                  f"{operation} {model}#{record_id} "
+                  f"old={old_values} new={new_values} status={status}")
+        finally:
+            await conn.close()
+    except Exception as e:
+        # Never let audit failure break the actual business operation
+        print(f"[AUDIT ERROR] failed to write audit: {e} "
+              f"(operation={operation} model={model} rec={record_id})")
 
 @app.on_event("startup")
 async def startup():
@@ -1585,6 +1662,66 @@ Workflow:
   STEP 3 — After user confirms, call odoo_update_vendor_price ONCE with {{vendor_name, updates: [...]}}. Do NOT call odoo_search_products_by_sku or odoo_get_product_vendors first — the tool does all lookups internally.
   STEP 4 — Report results from the returned summary + per-SKU results. For each SKU show: status (updated / created / unchanged / not_found / error), old_price → new_price.
 
+LARGE RESULT SETS — SUMMARY-FIRST RULE (APPLIES TO ALL REPLIES):
+This rule applies to EVERY reply you produce, for EVERY type of query — searches, reports, lookups, cross-references, anything. Before dumping data, check how much you are about to output.
+
+TWO MODES, TWO DIFFERENT THRESHOLDS:
+
+MODE A — USER DID NOT EXPLICITLY ASK FOR A LIST (conservative threshold: 5 rows).
+  The user asked a general question like "查下25年以来采购过的产品", "show me what we bought from Thunder Group", "有哪些产品缺税", etc. — they want an answer, not necessarily a full table.
+  → Threshold: if output would be MORE THAN 5 TABLE ROWS, or >10 lines of bullets, or >300 characters of data — go to STAGE 1 (summary first).
+
+MODE B — USER EXPLICITLY ASKED FOR A LIST / DETAILS (relaxed threshold: 10 rows).
+  Signals that user wants the list: "清单", "列表", "所有", "全部", "明细", "详细", "每一条", "list", "all", "full list", "details", "show me each", "every", "breakdown".
+  → Threshold: if output would be MORE THAN 10 TABLE ROWS, or >20 lines of bullets, or >600 characters of data — go to STAGE 1 (summary first).
+  → If the list fits within 10 rows, output it directly in full. Do NOT force a summary step when the user already said they want the list and the list is reasonable size.
+
+HOW TO DETECT MODE B:
+Scan the user's ORIGINAL message (not your own assumptions). Look for the Chinese/English keywords listed above. When in doubt → default to MODE A (safer for UX).
+
+WHEN TO SWITCH TO STAGE 1 (summary first) — BOTH MODES:
+
+STAGE 1 — Announce + summarize (respond in user's language — Chinese for Chinese users, English for English users):
+  a) OPEN with a brief acknowledgement that the result set is large, in a friendly tone.
+     Chinese examples:
+       "我查到了比较多的结果，先给你一个总结："
+       "数据量有点大（X 条），我先给你个 summary，稍后你决定是否要看完整清单。"
+       "找到 X 条记录，我先给你概览，避免一次性输出太多："
+     English examples:
+       "I found quite a lot of results — let me give you a summary first."
+       "This is a larger result set (X records). Here's the overview before the full list:"
+  b) Give a TIGHT summary (3-6 lines). Good summary content depends on the data type:
+     - For search/list results: total count, key groupings (by date/vendor/category/status), totals if numeric, date range covered, one or two notable records
+     - For reports: headline metrics (total revenue/tax/commission/cost), top 1-2 contributors, period covered
+     - For price/inventory lookups: count of items, price range or total stock, any anomalies
+  c) CLOSE with an explicit ask. Chinese examples:
+       "需要我展示完整清单吗？"
+       "要不要我把详细表格列出来？"
+       "想看完整明细回复 '是' 即可。"
+     English examples:
+       "Want me to show the full list?"
+       "Should I output the detailed table?"
+
+STAGE 2 — Only when the user explicitly confirms (any of: 是 / 要 / 好 / 显示 / 给我 / yes / show / full / list / details / 继续), output the complete detailed table.
+
+HOW TO DECIDE IF YOUR REPLY IS "TOO LARGE":
+Before writing your reply, mentally count how many rows / lines / characters of data would be in the output, then compare against the threshold for your current MODE.
+
+WHY THIS RULE IS STRICT:
+Streaming long tables takes 1-3 minutes even when the tool call itself was fast. Users cannot tell if the system is stuck or still generating. A 10-second summary + opt-in confirmation is a drastically better experience than a 2-minute wall of text. Trust is built by responding fast with what matters, then offering more.
+
+WHAT NOT TO DO:
+- Do NOT skip the summary and dump the table directly when you are over the threshold.
+- Do NOT apologize for summarizing; it's the correct default.
+- Do NOT ask the user "do you want a summary or the full list?" at the start — always lead with the summary, then offer the full list.
+- Do NOT produce a summary AND the full table in the same reply. The whole point is to split the work.
+- Do NOT force a summary step if the user asked for a list AND the list is ≤10 rows — just output it.
+
+RARE EXCEPTIONS (still output directly without summary-first, regardless of mode):
+- The tool itself returned a small, already-formatted structured result (e.g. odoo_update_vendor_price per-SKU results).
+- The user's message explicitly demands a single value or speed ("just give me the total" — answer with just the total).
+- The reply is fundamentally short (1-4 rows, a single number, a yes/no).
+
 SCOPE OF KNOWLEDGE (answer freely and confidently):
 - Our own products: Chumart, Polarman, Flamaster, ChefAsst — specs, pricing, installation, maintenance
 - Competitor/industry products: True, Turbo Air, Beverage-Air, Hoshizaki, Manitowoc, Continental, Victory, Traulsen, Arctic Air, and any other commercial refrigeration or foodservice equipment brands — answer product questions, maintenance, repair, troubleshooting, comparisons
@@ -2343,7 +2480,25 @@ async def run_tool(name, inp, context=None):
                     continue
                 w = await odoo_write_record("product.supplierinfo", sup["id"],
                                             {"price": new_price})
+                # Audit this write regardless of success or failure
+                audit_extra = {
+                    "sku": sku, "vendor_name": vendor_resolved_name,
+                    "vendor_id": vendor_id, "product_id": pid,
+                    "product_name": prod.get("name"),
+                }
                 if w.get("error"):
+                    await audit_odoo_write(
+                        who_uid=(context or {}).get("uid", 0),
+                        who_name=(context or {}).get("username", ""),
+                        tool_name="odoo_update_vendor_price",
+                        model="product.supplierinfo",
+                        record_id=sup["id"],
+                        operation="update",
+                        old_values={"price": old_price},
+                        new_values={"price": new_price},
+                        extra_info=audit_extra,
+                        status=f"error: {w['error']}",
+                    )
                     results.append({
                         "sku": sku, "product_id": pid, "product_name": prod.get("name"),
                         "supplierinfo_id": sup["id"],
@@ -2351,6 +2506,18 @@ async def run_tool(name, inp, context=None):
                         "message": f"Write failed: {w['error']}"
                     })
                 else:
+                    await audit_odoo_write(
+                        who_uid=(context or {}).get("uid", 0),
+                        who_name=(context or {}).get("username", ""),
+                        tool_name="odoo_update_vendor_price",
+                        model="product.supplierinfo",
+                        record_id=sup["id"],
+                        operation="update",
+                        old_values={"price": old_price},
+                        new_values={"price": new_price},
+                        extra_info=audit_extra,
+                        status="success",
+                    )
                     results.append({
                         "sku": sku, "product_id": pid, "product_name": prod.get("name"),
                         "supplierinfo_id": sup["id"],
@@ -2368,13 +2535,42 @@ async def run_tool(name, inp, context=None):
                 # Also pin to the specific variant when available
                 create_vals["product_id"] = pid
                 c = await odoo_create("product.supplierinfo", create_vals)
+                audit_extra = {
+                    "sku": sku, "vendor_name": vendor_resolved_name,
+                    "vendor_id": vendor_id, "product_id": pid,
+                    "product_name": prod.get("name"),
+                }
                 if c.get("error"):
+                    await audit_odoo_write(
+                        who_uid=(context or {}).get("uid", 0),
+                        who_name=(context or {}).get("username", ""),
+                        tool_name="odoo_update_vendor_price",
+                        model="product.supplierinfo",
+                        record_id=None,
+                        operation="create",
+                        old_values=None,
+                        new_values=create_vals,
+                        extra_info=audit_extra,
+                        status=f"error: {c['error']}",
+                    )
                     results.append({
                         "sku": sku, "product_id": pid, "product_name": prod.get("name"),
                         "status": "error", "new_price": new_price,
                         "message": f"Create failed: {c['error']}"
                     })
                 else:
+                    await audit_odoo_write(
+                        who_uid=(context or {}).get("uid", 0),
+                        who_name=(context or {}).get("username", ""),
+                        tool_name="odoo_update_vendor_price",
+                        model="product.supplierinfo",
+                        record_id=c.get("id"),
+                        operation="create",
+                        old_values=None,
+                        new_values=create_vals,
+                        extra_info=audit_extra,
+                        status="success",
+                    )
                     results.append({
                         "sku": sku, "product_id": pid, "product_name": prod.get("name"),
                         "supplierinfo_id": c.get("id"),
@@ -3000,6 +3196,62 @@ async def kb_status():
             "doc_chunks": [dict(r) for r in doc_chunks],
             "recent_crawls": [dict(r) for r in logs]
         }
+    finally:
+        await conn.close()
+
+@app.get("/admin/audit")
+async def audit_recent(limit: int = 50, model: str = "", who: str = "",
+                        operation: str = "", since_hours: int = 0):
+    """
+    Query the Odoo write audit log.
+    Shows exactly which records the AI wrote, when, by whom, old vs new values.
+
+    Query params:
+      limit         max rows (default 50, max 500)
+      model         filter by Odoo model, e.g. 'product.supplierinfo'
+      who           filter by who_name (ilike match)
+      operation     'create' or 'update'
+      since_hours   only show entries from the last N hours
+    """
+    limit = max(1, min(int(limit), 500))
+    conn = await get_db_conn()
+    if not conn:
+        return {"error": "DB not connected"}
+    try:
+        clauses = []
+        args = []
+        if model:
+            args.append(model)
+            clauses.append(f"model = ${len(args)}")
+        if operation:
+            args.append(operation)
+            clauses.append(f"operation = ${len(args)}")
+        if who:
+            args.append(f"%{who}%")
+            clauses.append(f"who_name ILIKE ${len(args)}")
+        if since_hours and since_hours > 0:
+            args.append(since_hours)
+            clauses.append(f"ts >= NOW() - (${len(args)}::int * INTERVAL '1 hour')")
+        where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+        args.append(limit)
+        q = (f"SELECT id, ts, who_uid, who_name, tool_name, model, record_id, "
+             f"operation, old_values, new_values, extra_info, status "
+             f"FROM odoo_write_audit {where} "
+             f"ORDER BY ts DESC LIMIT ${len(args)}")
+        rows = await conn.fetch(q, *args)
+        out = []
+        for r in rows:
+            d = dict(r)
+            # Parse jsonb columns back into Python
+            for k in ("old_values", "new_values", "extra_info"):
+                if d.get(k) and isinstance(d[k], str):
+                    try:
+                        d[k] = json.loads(d[k])
+                    except Exception:
+                        pass
+            d["ts"] = d["ts"].isoformat() if d.get("ts") else None
+            out.append(d)
+        return {"count": len(out), "entries": out}
     finally:
         await conn.close()
 
