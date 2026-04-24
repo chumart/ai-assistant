@@ -5158,6 +5158,78 @@ async def list_documents(admin_key: str = ""):
     finally:
         await conn.close()
 
+@app.get("/admin/documents/{doc_id}/chunks")
+async def get_document_chunks(doc_id: str, admin_key: str = ""):
+    """Return all knowledge chunks for a specific document, for preview/debugging."""
+    if admin_key != os.getenv("ADMIN_KEY", "chumart2024"):
+        return {"error": "Invalid admin key"}
+    conn = await get_db_conn()
+    if not conn:
+        return {"error": "DB not connected"}
+    try:
+        rows = await conn.fetch("""
+            SELECT id, chunk_text, category, page_title
+            FROM knowledge_chunks
+            WHERE site_url = $1
+            ORDER BY id ASC
+        """, f"doc:{doc_id}")
+        chunks = []
+        for i, r in enumerate(rows):
+            chunks.append({
+                "index": i + 1,
+                "id": r["id"],
+                "text": r["chunk_text"],
+                "category": r["category"],
+                "page_title": r["page_title"],
+                "char_count": len(r["chunk_text"] or ""),
+            })
+        return {"doc_id": doc_id, "total": len(chunks), "chunks": chunks}
+    finally:
+        await conn.close()
+
+@app.get("/admin/kb-search")
+async def kb_search_test(q: str = "", admin_key: str = "", limit: int = 5):
+    """Test knowledge base search — returns top matching chunks for a query."""
+    if admin_key != os.getenv("ADMIN_KEY", "chumart2024"):
+        return {"error": "Invalid admin key"}
+    if not q.strip():
+        return {"error": "Query q is required"}
+    limit = max(1, min(int(limit), 20))
+
+    embedding = await get_embedding(q.strip())
+    if not embedding:
+        return {"error": "Failed to generate embedding — check OPENAI_API_KEY"}
+
+    conn = await get_db_conn()
+    if not conn:
+        return {"error": "DB not connected"}
+    try:
+        rows = await conn.fetch("""
+            SELECT kc.id, kc.chunk_text, kc.site_name, kc.page_title, kc.category,
+                   kc.site_url,
+                   1 - (kc.embedding <=> $1::vector) AS score
+            FROM knowledge_chunks kc
+            WHERE kc.embedding IS NOT NULL
+            ORDER BY kc.embedding <=> $1::vector
+            LIMIT $2
+        """, json.dumps(embedding), limit)
+        results = []
+        for r in rows:
+            doc_id = r["site_url"].replace("doc:", "") if r["site_url"] and r["site_url"].startswith("doc:") else None
+            results.append({
+                "score": round(float(r["score"]), 4),
+                "chunk_id": r["id"],
+                "doc_id": doc_id,
+                "site_name": r["site_name"],
+                "page_title": r["page_title"],
+                "category": r["category"],
+                "text": r["chunk_text"],
+                "char_count": len(r["chunk_text"] or ""),
+            })
+        return {"query": q, "limit": limit, "results": results}
+    finally:
+        await conn.close()
+
 @app.delete("/admin/documents/{doc_id}")
 async def delete_document(doc_id: str, admin_key: str = ""):
     if admin_key != os.getenv("ADMIN_KEY", "chumart2024"):
