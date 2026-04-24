@@ -1240,13 +1240,36 @@ TOOLS = [
     },
     {
         "name": "odoo_get_product_vendors",
-        "description": "Get all vendors for a list of products from product.supplierinfo. Returns each product with ALL its vendors (name, price, min_qty). If a product has multiple vendors, AI must ask user to choose. Use before creating any purchase order.",
+        "description": "Get all vendors for a list of products from product.supplierinfo. Returns each product with ALL its vendors including supplierinfo_id (the record ID in product.supplierinfo), vendor_id, vendor_name, price, min_qty. If a product has multiple vendors, AI must ask user to choose. Use before creating any purchase order, or before updating vendor prices.",
         "input_schema": {
             "type": "object",
             "properties": {
                 "product_ids": {"type": "array", "items": {"type": "integer"}, "description": "List of product IDs"}
             },
             "required": ["product_ids"]
+        }
+    },
+    {
+        "name": "odoo_update_vendor_price",
+        "description": "Update vendor pricelist (product.supplierinfo) prices for a batch of SKUs under ONE vendor. ALWAYS use this tool — NOT odoo_update_record — for any vendor price update request. This tool resolves product IDs from SKUs, finds or creates the correct supplierinfo record for the given vendor, and writes the new price. AI MUST NOT pass any record_id — the backend looks it up. If no existing vendor record exists for a product, a new one is created automatically. Requires explicit user confirmation before calling.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "vendor_name": {"type": "string", "description": "Vendor display name as shown in Odoo res.partner (e.g. 'Thunder Group')"},
+                "updates": {
+                    "type": "array",
+                    "description": "List of {sku, new_price} updates",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "sku": {"type": "string", "description": "Product SKU / default_code (e.g. 'ALFN001')"},
+                            "new_price": {"type": "number", "description": "New price (must be >= 0)"}
+                        },
+                        "required": ["sku", "new_price"]
+                    }
+                }
+            },
+            "required": ["vendor_name", "updates"]
         }
     },
     {
@@ -1543,6 +1566,24 @@ STEP 4 — Execute only after confirmation:
   IMPORTANT: partner_id in purchase_orders must be the res.partner ID from vendor info (from odoo_get_product_vendors vendor_id field), NOT a user ID or product ID.
   Report results: PO names (e.g. P00442) + Odoo links for each created PO.
   If any line_errors exist, tell user which products failed and why.
+
+VENDOR PRICELIST UPDATES (CRITICAL WORKFLOW):
+When the user wants to update vendor prices / 供应商价格 / vendor pricelist for a list of SKUs:
+
+RULE #1 — NEVER use odoo_update_record for product.supplierinfo. You will hallucinate record IDs. Use odoo_update_vendor_price instead.
+RULE #2 — NEVER guess, derive, or invent supplierinfo record_ids. The only way to write to product.supplierinfo is through odoo_update_vendor_price (which looks up the correct record internally) OR by first calling odoo_get_product_vendors and using the exact supplierinfo_id it returns.
+RULE #3 — odoo_update_vendor_price handles the "vendor doesn't have a record for this product yet" case automatically by creating a new supplierinfo row. Do NOT refuse the task just because a product has no existing vendor record.
+
+Workflow:
+  STEP 1 — Extract from user input: (a) the vendor name (ask user if unclear), (b) a list of {{sku, new_price}} pairs.
+  STEP 2 — Show the user a preview table:
+    "准备更新 **[Vendor Name]** 的供应商价格：
+    | SKU | 产品 | 新价格 |
+    |-----|------|--------|
+    回复 '确认' 即可执行。"
+    (Do not fetch current prices first — odoo_update_vendor_price will return old vs new in the result.)
+  STEP 3 — After user confirms, call odoo_update_vendor_price ONCE with {{vendor_name, updates: [...]}}. Do NOT call odoo_search_products_by_sku or odoo_get_product_vendors first — the tool does all lookups internally.
+  STEP 4 — Report results from the returned summary + per-SKU results. For each SKU show: status (updated / created / unchanged / not_found / error), old_price → new_price.
 
 SCOPE OF KNOWLEDGE (answer freely and confidently):
 - Our own products: Chumart, Polarman, Flamaster, ChefAsst — specs, pricing, installation, maintenance
@@ -2029,7 +2070,7 @@ async def run_tool(name, inp, context=None):
             r1 = await odoo_query(
                 "product.supplierinfo",
                 [["product_tmpl_id", "in", tmpl_ids]],
-                ["product_id", "product_tmpl_id", "partner_id", "price", "min_qty", "currency_id", "company_id"],
+                ["id", "product_id", "product_tmpl_id", "partner_id", "price", "min_qty", "currency_id", "company_id"],
                 limit=1000, order="sequence asc"
             )
             sup_rows = json.loads(r1)
@@ -2051,7 +2092,7 @@ async def run_tool(name, inp, context=None):
             r2 = await odoo_query(
                 "product.supplierinfo",
                 [["product_id", "in", missing_pids]],
-                ["product_id", "product_tmpl_id", "partner_id", "price", "min_qty", "currency_id", "company_id"],
+                ["id", "product_id", "product_tmpl_id", "partner_id", "price", "min_qty", "currency_id", "company_id"],
                 limit=1000, order="sequence asc"
             )
             extra = json.loads(r2)
@@ -2065,7 +2106,7 @@ async def run_tool(name, inp, context=None):
             all_r = await odoo_query(
                 "product.supplierinfo",
                 [],
-                ["product_id", "product_tmpl_id", "partner_id", "price"],
+                ["id", "product_id", "product_tmpl_id", "partner_id", "price"],
                 limit=5000, order="sequence asc"
             )
             all_sup = json.loads(all_r)
@@ -2088,6 +2129,7 @@ async def run_tool(name, inp, context=None):
             if not row.get("partner_id"):
                 continue
             vendor_info = {
+                "supplierinfo_id": row.get("id"),
                 "vendor_id": row["partner_id"][0],
                 "vendor_name": row["partner_id"][1],
                 "price": row.get("price", 0),
@@ -2120,6 +2162,240 @@ async def run_tool(name, inp, context=None):
                 "no_vendor": len(vendors) == 0
             })
         return json.dumps(result, ensure_ascii=False)
+
+    if name == "odoo_update_vendor_price":
+        """
+        Safely update vendor (supplierinfo) prices for a list of products.
+        This tool handles ID resolution internally — AI MUST NOT pass record_ids.
+
+        Input: {
+            "vendor_name": "Thunder Group",
+            "updates": [{"sku": "ALFN001", "new_price": 0.77}, ...]
+        }
+        For each update:
+          - Find product by SKU (exact match on default_code preferred)
+          - Find existing supplierinfo record for (product, vendor)
+          - If exists: update price
+          - If not exists: create new supplierinfo record
+        Returns per-SKU status (updated / created / not_found / vendor_not_found / error).
+        """
+        vendor_name_in = (inp.get("vendor_name") or "").strip()
+        updates_in = inp.get("updates") or []
+        if not vendor_name_in:
+            return json.dumps({"error": "vendor_name is required"})
+        if not isinstance(updates_in, list) or not updates_in:
+            return json.dumps({"error": "updates must be a non-empty list of {sku, new_price}"})
+
+        print(f"[UPDATE_VENDOR_PRICE] vendor='{vendor_name_in}' count={len(updates_in)}")
+
+        # 1) Resolve vendor partner_id (exact first, then ilike)
+        partner_r = json.loads(await odoo_query(
+            "res.partner",
+            [["name", "=", vendor_name_in], ["supplier_rank", ">", 0]],
+            ["id", "name"], limit=5
+        ))
+        if not isinstance(partner_r, list) or not partner_r:
+            partner_r = json.loads(await odoo_query(
+                "res.partner",
+                [["name", "ilike", vendor_name_in], ["supplier_rank", ">", 0]],
+                ["id", "name"], limit=10
+            ))
+        if not isinstance(partner_r, list) or not partner_r:
+            # last resort: ilike without supplier_rank filter
+            partner_r = json.loads(await odoo_query(
+                "res.partner",
+                [["name", "ilike", vendor_name_in]],
+                ["id", "name", "supplier_rank"], limit=10
+            ))
+        if not isinstance(partner_r, list) or not partner_r:
+            return json.dumps({"error": f"Vendor '{vendor_name_in}' not found in Odoo"})
+
+        # Prefer exact case-insensitive match
+        exact = [p for p in partner_r if (p.get("name") or "").strip().lower() == vendor_name_in.lower()]
+        vendor_partner = exact[0] if exact else partner_r[0]
+        vendor_id = vendor_partner["id"]
+        vendor_resolved_name = vendor_partner["name"]
+        if len(partner_r) > 1 and not exact:
+            print(f"[UPDATE_VENDOR_PRICE] ambiguous vendor, picked id={vendor_id} name='{vendor_resolved_name}' "
+                  f"from {[p['name'] for p in partner_r[:5]]}")
+
+        # 2) Resolve products by SKU in bulk
+        skus_clean = []
+        for u in updates_in:
+            s = (u.get("sku") or "").strip()
+            if s:
+                skus_clean.append(s)
+        skus_clean = list(dict.fromkeys(skus_clean))  # dedupe, preserve order
+
+        prod_r = json.loads(await odoo_query(
+            "product.product",
+            [["default_code", "in", skus_clean], ["active", "=", True]],
+            ["id", "name", "default_code", "product_tmpl_id"], limit=500
+        ))
+        if isinstance(prod_r, dict) and "error" in prod_r:
+            return json.dumps({"error": f"Product lookup failed: {prod_r.get('error')}"})
+        prod_r = prod_r if isinstance(prod_r, list) else []
+
+        # Map SKU (upper) -> product row
+        sku_to_prod = {}
+        for p in prod_r:
+            code = (p.get("default_code") or "").strip().upper()
+            if code and code not in sku_to_prod:
+                sku_to_prod[code] = p
+
+        # For SKUs not found via exact "in", fall back to per-SKU ilike
+        missing = [s for s in skus_clean if s.upper() not in sku_to_prod]
+        for s in missing:
+            r = json.loads(await odoo_query(
+                "product.product",
+                [["default_code", "ilike", s], ["active", "=", True]],
+                ["id", "name", "default_code", "product_tmpl_id"], limit=3
+            ))
+            if isinstance(r, list) and r:
+                # Prefer exact
+                ex = [p for p in r if (p.get("default_code") or "").upper() == s.upper()]
+                chosen = ex[0] if ex else r[0]
+                sku_to_prod[s.upper()] = chosen
+
+        # 3) Bulk-query existing supplierinfo for (this vendor, these products)
+        all_pids = [p["id"] for p in sku_to_prod.values()]
+        all_tmpl_ids = list({p["product_tmpl_id"][0] for p in sku_to_prod.values()
+                             if p.get("product_tmpl_id")})
+
+        existing_sup = []
+        if all_pids or all_tmpl_ids:
+            # Multi-company safety: match records for company_id=1 OR company_id=False (global)
+            company_filter = ["|", ["company_id", "=", False], ["company_id", "=", 1]]
+
+            sup_by_pid = json.loads(await odoo_query(
+                "product.supplierinfo",
+                (company_filter + [["partner_id", "=", vendor_id], ["product_id", "in", all_pids]])
+                    if all_pids else [["id", "=", False]],
+                ["id", "product_id", "product_tmpl_id", "partner_id", "price", "company_id"],
+                limit=1000, order="sequence asc"
+            ))
+            sup_by_pid = sup_by_pid if isinstance(sup_by_pid, list) else []
+            sup_by_tmpl = json.loads(await odoo_query(
+                "product.supplierinfo",
+                (company_filter + [["partner_id", "=", vendor_id], ["product_tmpl_id", "in", all_tmpl_ids]])
+                    if all_tmpl_ids else [["id", "=", False]],
+                ["id", "product_id", "product_tmpl_id", "partner_id", "price", "company_id"],
+                limit=1000, order="sequence asc"
+            ))
+            sup_by_tmpl = sup_by_tmpl if isinstance(sup_by_tmpl, list) else []
+            # Merge; prefer variant-specific (product_id set) over template-only
+            existing_sup = sup_by_pid + [s for s in sup_by_tmpl
+                                         if s.get("id") not in {x.get("id") for x in sup_by_pid}]
+            print(f"[UPDATE_VENDOR_PRICE] vendor_id={vendor_id} "
+                  f"found {len(sup_by_pid)} by product_id, "
+                  f"{len(sup_by_tmpl)} by template_id, "
+                  f"{len(existing_sup)} total unique")
+
+        # Index existing supplierinfo: prefer product_id match, then template match
+        sup_by_product_id = {}
+        sup_by_template_id = {}
+        for s in existing_sup:
+            if s.get("product_id"):
+                sup_by_product_id[s["product_id"][0]] = s
+            elif s.get("product_tmpl_id"):
+                tid = s["product_tmpl_id"][0]
+                # Only the first template-level record per template
+                sup_by_template_id.setdefault(tid, s)
+
+        # 4) Process each requested update
+        results = []
+        for u in updates_in:
+            sku = (u.get("sku") or "").strip()
+            try:
+                new_price = float(u.get("new_price"))
+            except (TypeError, ValueError):
+                results.append({"sku": sku, "status": "error",
+                                "message": "new_price must be a number"})
+                continue
+            if new_price < 0:
+                results.append({"sku": sku, "status": "error",
+                                "message": "new_price must be >= 0"})
+                continue
+
+            prod = sku_to_prod.get(sku.upper())
+            if not prod:
+                results.append({"sku": sku, "status": "not_found",
+                                "message": "Product SKU not found in Odoo"})
+                continue
+
+            pid = prod["id"]
+            tmpl_id = prod["product_tmpl_id"][0] if prod.get("product_tmpl_id") else None
+
+            # Find existing supplierinfo for this vendor+product
+            sup = sup_by_product_id.get(pid)
+            if not sup and tmpl_id is not None:
+                sup = sup_by_template_id.get(tmpl_id)
+
+            if sup:
+                old_price = sup.get("price", 0)
+                if abs(float(old_price) - new_price) < 1e-9:
+                    results.append({
+                        "sku": sku, "product_id": pid, "product_name": prod.get("name"),
+                        "supplierinfo_id": sup["id"],
+                        "status": "unchanged", "old_price": old_price, "new_price": new_price,
+                        "message": "Price already matches, no update needed"
+                    })
+                    continue
+                w = await odoo_write_record("product.supplierinfo", sup["id"],
+                                            {"price": new_price})
+                if w.get("error"):
+                    results.append({
+                        "sku": sku, "product_id": pid, "product_name": prod.get("name"),
+                        "supplierinfo_id": sup["id"],
+                        "status": "error", "old_price": old_price, "new_price": new_price,
+                        "message": f"Write failed: {w['error']}"
+                    })
+                else:
+                    results.append({
+                        "sku": sku, "product_id": pid, "product_name": prod.get("name"),
+                        "supplierinfo_id": sup["id"],
+                        "status": "updated", "old_price": old_price, "new_price": new_price
+                    })
+            else:
+                # No existing record → create one
+                create_vals = {
+                    "partner_id": vendor_id,
+                    "price": new_price,
+                    "min_qty": 0,
+                }
+                if tmpl_id is not None:
+                    create_vals["product_tmpl_id"] = tmpl_id
+                # Also pin to the specific variant when available
+                create_vals["product_id"] = pid
+                c = await odoo_create("product.supplierinfo", create_vals)
+                if c.get("error"):
+                    results.append({
+                        "sku": sku, "product_id": pid, "product_name": prod.get("name"),
+                        "status": "error", "new_price": new_price,
+                        "message": f"Create failed: {c['error']}"
+                    })
+                else:
+                    results.append({
+                        "sku": sku, "product_id": pid, "product_name": prod.get("name"),
+                        "supplierinfo_id": c.get("id"),
+                        "status": "created", "new_price": new_price,
+                        "message": "No prior vendor record; created new one"
+                    })
+
+        summary = {
+            "updated": sum(1 for r in results if r["status"] == "updated"),
+            "created": sum(1 for r in results if r["status"] == "created"),
+            "unchanged": sum(1 for r in results if r["status"] == "unchanged"),
+            "not_found": sum(1 for r in results if r["status"] == "not_found"),
+            "errors": sum(1 for r in results if r["status"] == "error"),
+        }
+        print(f"[UPDATE_VENDOR_PRICE] done vendor='{vendor_resolved_name}' summary={summary}")
+        return json.dumps({
+            "vendor_id": vendor_id,
+            "vendor_name": vendor_resolved_name,
+            "summary": summary,
+            "results": results
+        }, ensure_ascii=False)
 
     if name == "get_po_with_so_links":
         """Get a PO's product lines and find matching SO records within a date range."""
@@ -3061,7 +3337,7 @@ async def chat(req: ChatRequest, background_tasks: BackgroundTasks):
     # Filter tools based on permissions
     allowed_tools = []
     finance_tools = {"get_monthly_tax", "get_quarterly_tax", "get_monthly_sales", "get_missing_tax"}
-    write_tools = {"odoo_create_record", "odoo_add_order_line", "odoo_confirm_order", "odoo_update_record"}
+    write_tools = {"odoo_create_record", "odoo_add_order_line", "odoo_confirm_order", "odoo_update_record", "odoo_update_vendor_price"}
     for tool in TOOLS:
         tname = tool["name"]
         if tname in finance_tools and not perms.get("can_see_finance"):
@@ -3198,7 +3474,7 @@ async def chat_stream(req: ChatRequest, background_tasks: BackgroundTasks):
     # Filter tools based on permissions
     allowed_tools = []
     finance_tools = {"get_monthly_tax", "get_quarterly_tax", "get_monthly_sales", "get_missing_tax"}
-    write_tools = {"odoo_create_record", "odoo_add_order_line", "odoo_confirm_order", "odoo_update_record"}
+    write_tools = {"odoo_create_record", "odoo_add_order_line", "odoo_confirm_order", "odoo_update_record", "odoo_update_vendor_price"}
     for tool in TOOLS:
         tname = tool["name"]
         if tname in finance_tools and not perms.get("can_see_finance"):
