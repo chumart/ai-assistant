@@ -4291,12 +4291,27 @@ async def run_tool(name, inp, context=None):
         }, ensure_ascii=False)
 
     if name == "odoo_restock_analysis":
+        """
+        Restock analysis: query stock.move (outgoing, done) for a time window,
+        aggregate by product, compare with current inventory (qty_available),
+        and flag products that need restocking based on brand-specific lead times.
+
+        Data flow (optimized — no template queries needed):
+          1. Query stock.move (outgoing, done, last N days) — gets product_id + qty
+          2. Aggregate total outgoing per product
+          3. Query product.product for ONLY moved products — gets qty_available + product_tmpl_id
+          4. Query product.template for ONLY those templates — gets x_brand
+          5. Calculate daily_avg, days_remaining, urgency per product
+          6. Return ONLY actionable products (🔴🟠🟡), capped at 100
+
+        Brand field: x_brand on product.template (many2one → x_brand table).
+        Also: x_studio_brand on stock.move.line (related field, same table).
+        """
         import datetime as dt
         days_back = inp.get("days_back", 30)
         brand_filter = inp.get("brand_filter", "").strip()
         urgency_filter = inp.get("urgency_filter", "").strip()
 
-        # Brand lead-time configuration (days)
         BRAND_LEAD_TIMES = {
             "Polarman":     {"lead": 60, "reorder": 60, "urgent": 30},
             "Flamaster":    {"lead": 90, "reorder": 90, "urgent": 45},
@@ -4308,157 +4323,46 @@ async def run_tool(name, inp, context=None):
 
         try:
             date_from = (dt.datetime.now() - dt.timedelta(days=days_back)).strftime("%Y-%m-%d")
-            print(f"RESTOCK: analyzing {days_back} days since {date_from}, brand_filter='{brand_filter}'")
+            print(f"RESTOCK: analyzing {days_back} days since {date_from}, brand='{brand_filter}'")
 
-            # ── PATH A: brand_filter provided → targeted query (fast) ──
-            if brand_filter:
-                # Step A1: Find all product templates for this brand
-                brand_domain = [["x_brand.name", "ilike", brand_filter]]
-                tmpl_r = json.loads(await odoo_query(
-                    "product.template", brand_domain,
-                    ["id", "x_brand"], limit=2000
+            # ── Step 1: Query ALL outgoing stock.move in one pass ──
+            # stock.move is the source of truth for validated outbound movement.
+            # Typically 700-1500 rows for 30 days — manageable in 1-2 batches.
+            all_moves = []
+            offset = 0
+            batch_size = 2000
+            while True:
+                moves_r = json.loads(await odoo_query(
+                    "stock.move",
+                    [
+                        ["state", "=", "done"],
+                        ["picking_type_id.code", "=", "outgoing"],
+                        ["date", ">=", date_from],
+                        ["company_id", "=", 1],
+                    ],
+                    ["product_id", "product_qty"],
+                    limit=batch_size, offset=offset, order="id asc"
                 ))
-                # Fallback: if x_brand.name doesn't work, try x_brand with ilike
-                if not isinstance(tmpl_r, list) or not tmpl_r:
-                    tmpl_r = json.loads(await odoo_query(
-                        "product.template", [["x_brand", "ilike", brand_filter]],
-                        ["id", "x_brand"], limit=2000
-                    ))
-                if not isinstance(tmpl_r, list) or not tmpl_r:
-                    return json.dumps({
-                        "summary": f"No products found for brand '{brand_filter}'.",
-                        "products": [], "days_analyzed": days_back, "date_from": date_from
-                    })
+                if not isinstance(moves_r, list) or not moves_r:
+                    break
+                all_moves.extend(moves_r)
+                if len(moves_r) < batch_size:
+                    break
+                offset += batch_size
+            print(f"RESTOCK: {len(all_moves)} outgoing moves fetched")
 
-                tmpl_ids = [t["id"] for t in tmpl_r]
-                # Build brand_map from these results
-                brand_map = {}
-                for t in tmpl_r:
-                    if t.get("x_brand"):
-                        bname = t["x_brand"][1] if isinstance(t["x_brand"], list) else str(t["x_brand"])
-                        brand_map[t["id"]] = bname
-
-                print(f"RESTOCK PATH-A: found {len(tmpl_ids)} templates for brand '{brand_filter}'")
-
-                # Step A2: Get product.product IDs for these templates
-                prod_all = []
-                for i in range(0, len(tmpl_ids), 200):
-                    batch = tmpl_ids[i:i+200]
-                    pr = json.loads(await odoo_query(
-                        "product.product",
-                        [["product_tmpl_id", "in", batch], ["active", "=", True]],
-                        ["id", "default_code", "qty_available", "product_tmpl_id"],
-                        limit=500
-                    ))
-                    if isinstance(pr, list):
-                        prod_all.extend(pr)
-                inv_map = {p["id"]: p for p in prod_all}
-                target_pids = list(inv_map.keys())
-                print(f"RESTOCK PATH-A: {len(target_pids)} products for brand")
-
-                if not target_pids:
-                    return json.dumps({
-                        "summary": f"No active products found for brand '{brand_filter}'.",
-                        "products": [], "days_analyzed": days_back, "date_from": date_from
-                    })
-
-                # Step A3: Get outgoing stock.move ONLY for these products
-                all_moves = []
-                for i in range(0, len(target_pids), 200):
-                    batch = target_pids[i:i+200]
-                    moves_r = json.loads(await odoo_query(
-                        "stock.move",
-                        [
-                            ["state", "=", "done"],
-                            ["picking_type_id.code", "=", "outgoing"],
-                            ["date", ">=", date_from],
-                            ["company_id", "=", 1],
-                            ["product_id", "in", batch],
-                        ],
-                        ["product_id", "product_qty", "date"],
-                        limit=2000, order="id asc"
-                    ))
-                    if isinstance(moves_r, list):
-                        all_moves.extend(moves_r)
-                print(f"RESTOCK PATH-A: {len(all_moves)} outgoing moves for brand products")
-
-            # ── PATH B: no brand_filter → full scan (all brands) ──
-            else:
-                all_moves = []
-                offset = 0
-                batch_size = 2000
-                while True:
-                    moves_r = json.loads(await odoo_query(
-                        "stock.move",
-                        [
-                            ["state", "=", "done"],
-                            ["picking_type_id.code", "=", "outgoing"],
-                            ["date", ">=", date_from],
-                            ["company_id", "=", 1],
-                        ],
-                        ["product_id", "product_qty", "date"],
-                        limit=batch_size, offset=offset, order="id asc"
-                    ))
-                    if not isinstance(moves_r, list) or not moves_r:
-                        break
-                    all_moves.extend(moves_r)
-                    print(f"RESTOCK PATH-B: fetched batch offset={offset}, got {len(moves_r)} moves")
-                    if len(moves_r) < batch_size:
-                        break
-                    offset += batch_size
-
-                print(f"RESTOCK PATH-B: total outgoing moves: {len(all_moves)}")
-
-                # Need to build inv_map and brand_map for all products
-                product_ids_set = set()
-                for m in all_moves:
-                    if m.get("product_id"):
-                        product_ids_set.add(m["product_id"][0])
-                target_pids = list(product_ids_set)
-
-                inv_map = {}
-                for i in range(0, len(target_pids), 200):
-                    batch = target_pids[i:i+200]
-                    inv_r = json.loads(await odoo_query(
-                        "product.product",
-                        [["id", "in", batch]],
-                        ["id", "default_code", "qty_available", "product_tmpl_id"],
-                        limit=200
-                    ))
-                    if isinstance(inv_r, list):
-                        for p in inv_r:
-                            inv_map[p["id"]] = p
-
-                tmpl_ids = list({inv_map[pid]["product_tmpl_id"][0]
-                                for pid in target_pids
-                                if pid in inv_map and inv_map[pid].get("product_tmpl_id")})
-                brand_map = {}
-                if tmpl_ids:
-                    for i in range(0, len(tmpl_ids), 200):
-                        batch = tmpl_ids[i:i+200]
-                        tmpl_r = json.loads(await odoo_query(
-                            "product.template",
-                            [["id", "in", batch]],
-                            ["id", "x_brand"], limit=200
-                        ))
-                        if isinstance(tmpl_r, list):
-                            for t in tmpl_r:
-                                if t.get("x_brand"):
-                                    bname = t["x_brand"][1] if isinstance(t["x_brand"], list) else str(t["x_brand"])
-                                    brand_map[t["id"]] = bname
-
-            # ── Common: aggregate + calculate (both paths) ──
             if not all_moves:
-                msg = f"No outgoing stock moves found in the last {days_back} days"
-                if brand_filter:
-                    msg += f" for brand '{brand_filter}'"
                 return json.dumps({
-                    "summary": msg + ".",
-                    "products": [], "days_analyzed": days_back, "date_from": date_from
+                    "summary": {"days_analyzed": days_back, "date_from": date_from,
+                                "total_products_analyzed": 0, "actionable_count": 0,
+                                "counts": {"out_of_stock":0,"urgent":0,"reorder":0,"ok":0,"no_movement":0,"total":0},
+                                "brand_filter": brand_filter or "(all)"},
+                    "brand_summary": {},
+                    "products": [],
                 })
 
-            # Aggregate by product_id
-            product_stats = {}
+            # ── Step 2: Aggregate total outgoing per product_id ──
+            product_stats = {}  # pid -> {total_qty, name}
             for m in all_moves:
                 if not m.get("product_id"):
                     continue
@@ -4468,15 +4372,44 @@ async def run_tool(name, inp, context=None):
                     product_stats[pid] = {"total_qty": 0, "name": pname}
                 product_stats[pid]["total_qty"] += m.get("product_qty", 0)
 
-            # For PATH A, also include brand products with ZERO outgoing (they exist but didn't sell)
-            if brand_filter:
-                for pid in target_pids:
-                    if pid not in product_stats:
-                        inv = inv_map.get(pid, {})
-                        pname = inv.get("default_code", "") or f"Product #{pid}"
-                        product_stats[pid] = {"total_qty": 0, "name": pname, "no_movement": True}
+            moved_pids = list(product_stats.keys())
+            print(f"RESTOCK: {len(moved_pids)} unique products with outgoing moves")
 
-            # Calculate restock status
+            # ── Step 3: Fetch inventory + template ID for moved products ONLY ──
+            inv_map = {}  # pid -> {id, default_code, qty_available, product_tmpl_id}
+            for i in range(0, len(moved_pids), 200):
+                batch = moved_pids[i:i+200]
+                inv_r = json.loads(await odoo_query(
+                    "product.product",
+                    [["id", "in", batch]],
+                    ["id", "default_code", "qty_available", "product_tmpl_id"],
+                    limit=200
+                ))
+                if isinstance(inv_r, list):
+                    for p in inv_r:
+                        inv_map[p["id"]] = p
+
+            # ── Step 4: Fetch brand (x_brand) from product.template ──
+            tmpl_ids = list({inv_map[pid]["product_tmpl_id"][0]
+                            for pid in moved_pids
+                            if pid in inv_map and inv_map[pid].get("product_tmpl_id")})
+            brand_map = {}  # tmpl_id -> brand_name
+            if tmpl_ids:
+                for i in range(0, len(tmpl_ids), 200):
+                    batch = tmpl_ids[i:i+200]
+                    tmpl_r = json.loads(await odoo_query(
+                        "product.template",
+                        [["id", "in", batch]],
+                        ["id", "x_brand"], limit=200
+                    ))
+                    if isinstance(tmpl_r, list):
+                        for t in tmpl_r:
+                            if t.get("x_brand"):
+                                bname = t["x_brand"][1] if isinstance(t["x_brand"], list) else str(t["x_brand"])
+                                brand_map[t["id"]] = bname
+            print(f"RESTOCK: resolved brands for {len(brand_map)} templates")
+
+            # ── Step 5: Calculate restock status per product ──
             results = []
             for pid, stats in product_stats.items():
                 inv = inv_map.get(pid, {})
@@ -4485,11 +4418,16 @@ async def run_tool(name, inp, context=None):
                 tmpl_id = inv["product_tmpl_id"][0] if inv.get("product_tmpl_id") else None
                 brand = brand_map.get(tmpl_id, "Other") if tmpl_id else "Other"
 
+                # Brand filter: skip products not matching the requested brand
+                if brand_filter:
+                    if brand_filter.lower() not in brand.lower():
+                        continue
+
                 total_out = stats["total_qty"]
                 daily_avg = total_out / days_back if days_back > 0 else 0
                 days_remaining = (qty_available / daily_avg) if daily_avg > 0 else float("inf")
 
-                # Get lead time config
+                # Get lead time config for this brand
                 lead_config = DEFAULT_LEAD
                 for bname, cfg in BRAND_LEAD_TIMES.items():
                     if bname.lower() in brand.lower():
@@ -4497,10 +4435,7 @@ async def run_tool(name, inp, context=None):
                         break
 
                 # Determine urgency
-                if total_out == 0:
-                    urgency = "no_movement"
-                    urgency_label = "⚪ 无出库记录"
-                elif qty_available <= 0:
+                if qty_available <= 0:
                     urgency = "out_of_stock"
                     urgency_label = "🔴 已缺货"
                 elif days_remaining <= lead_config["urgent"]:
@@ -4532,19 +4467,19 @@ async def run_tool(name, inp, context=None):
                     "urgent_threshold": lead_config["urgent"],
                 })
 
-            # Sort: urgency priority, then days_remaining ascending
-            urgency_order = {"out_of_stock": 0, "urgent": 1, "reorder": 2, "ok": 3, "no_movement": 4}
+            # ── Step 6: Sort, summarize, and return only actionable items ──
+            urgency_order = {"out_of_stock": 0, "urgent": 1, "reorder": 2, "ok": 3}
             results.sort(key=lambda r: (
                 urgency_order.get(r["urgency"], 9),
                 r["days_remaining"] if r["days_remaining"] is not None else 99999
             ))
 
-            # Brand summary
+            # Brand summary (computed from ALL results)
             brand_summary = {}
             for r in results:
                 b = r["brand"]
                 if b not in brand_summary:
-                    brand_summary[b] = {"out_of_stock": 0, "urgent": 0, "reorder": 0, "ok": 0, "no_movement": 0, "total": 0}
+                    brand_summary[b] = {"out_of_stock": 0, "urgent": 0, "reorder": 0, "ok": 0, "total": 0}
                 brand_summary[b][r["urgency"]] += 1
                 brand_summary[b]["total"] += 1
 
@@ -4553,24 +4488,32 @@ async def run_tool(name, inp, context=None):
                 "urgent": sum(1 for r in results if r["urgency"] == "urgent"),
                 "reorder": sum(1 for r in results if r["urgency"] == "reorder"),
                 "ok": sum(1 for r in results if r["urgency"] == "ok"),
-                "no_movement": sum(1 for r in results if r["urgency"] == "no_movement"),
                 "total": len(results),
             }
 
             print(f"RESTOCK: done. OOS={counts['out_of_stock']}, urgent={counts['urgent']}, "
-                  f"reorder={counts['reorder']}, ok={counts['ok']}, no_move={counts['no_movement']}")
+                  f"reorder={counts['reorder']}, ok={counts['ok']}")
+
+            # Only return actionable products (🔴🟠🟡), capped at 100
+            actionable = [r for r in results if r["urgency"] in ("out_of_stock", "urgent", "reorder")]
+            returned_products = actionable[:100]
+            truncated = len(actionable) - len(returned_products)
 
             return json.dumps({
                 "summary": {
                     "days_analyzed": days_back,
                     "date_from": date_from,
-                    "total_products": len(results),
+                    "total_products_analyzed": len(results),
+                    "actionable_count": len(actionable),
+                    "returned_count": len(returned_products),
+                    "truncated": truncated,
+                    "skipped_ok": counts["ok"],
                     "counts": counts,
                     "brand_filter": brand_filter or "(all brands)",
                     "urgency_filter": urgency_filter or "(all levels)",
                 },
                 "brand_summary": brand_summary,
-                "products": results,
+                "products": returned_products,
             }, ensure_ascii=False)
 
         except Exception as e:
