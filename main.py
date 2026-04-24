@@ -2636,6 +2636,12 @@ async def run_tool(name, inp, context=None):
         """
         vendor_name_in = (inp.get("vendor_name") or "").strip()
         updates_in = inp.get("updates") or []
+        # AI sometimes passes updates as a JSON string instead of an array — handle both
+        if isinstance(updates_in, str):
+            try:
+                updates_in = json.loads(updates_in)
+            except json.JSONDecodeError:
+                return json.dumps({"error": "updates must be a JSON array of {sku, new_price}, got unparseable string"})
         if not vendor_name_in:
             return json.dumps({"error": "vendor_name is required"})
         if not isinstance(updates_in, list) or not updates_in:
@@ -4322,6 +4328,31 @@ async def extract_file(file: UploadFile = File(...)):
         filename = file.filename.lower()
         if filename.endswith(('.txt', '.md', '.csv')):
             return {"text": content.decode('utf-8', errors='ignore'), "name": file.filename}
+
+        # Excel files — parse with openpyxl, return as tab-separated text
+        if filename.endswith(('.xlsx', '.xls')):
+            try:
+                import io, openpyxl
+                wb = openpyxl.load_workbook(io.BytesIO(content), read_only=True, data_only=True)
+                all_text = []
+                for sheet_name in wb.sheetnames:
+                    ws = wb[sheet_name]
+                    rows = list(ws.iter_rows(values_only=True))
+                    if not rows:
+                        continue
+                    all_text.append(f"=== Sheet: {sheet_name} ===")
+                    for row in rows:
+                        cells = [str(c) if c is not None else "" for c in row]
+                        if any(c.strip() for c in cells):  # skip fully empty rows
+                            all_text.append("\t".join(cells))
+                wb.close()
+                text = "\n".join(all_text)
+                print(f"EXTRACT-FILE: {file.filename} (xlsx) → {len(text)} chars, {len(all_text)} rows")
+                return {"text": text, "name": file.filename}
+            except Exception as e:
+                print(f"EXTRACT-FILE xlsx error: {e}")
+                return {"text": f"[Excel parse error: {e}]", "name": file.filename}
+
         cleanup_caches()  # Clean expired entries on each upload
         now = datetime.datetime.now()
         if filename.endswith('.pdf'):
@@ -4372,12 +4403,14 @@ async def db_save_session(session_id: str, uid: int, username: str, title: str, 
     conn = await get_db_conn()
     if not conn: return
     try:
+        # PostgreSQL text columns cannot contain \u0000 — strip null bytes
+        msg_json = json.dumps(messages, ensure_ascii=False).replace('\x00', '')
         await conn.execute("""
             INSERT INTO chat_sessions (id, uid, username, title, messages, updated_at)
             VALUES ($1, $2, $3, $4, $5::jsonb, NOW())
             ON CONFLICT (id) DO UPDATE
             SET messages = $5::jsonb, title = $4, updated_at = NOW()
-        """, session_id, uid, username, title, json.dumps(messages, ensure_ascii=False))
+        """, session_id, uid, username, title, msg_json)
     except Exception as e:
         print(f"Session save error: {e}")
     finally:
