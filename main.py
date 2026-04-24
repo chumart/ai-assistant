@@ -1378,6 +1378,21 @@ TOOLS = [
         }
     },
     {
+        "name": "odoo_match_payment_to_customer",
+        "description": "MATCH A RECEIVED PAYMENT to customer invoices/SOs. USE THIS for any question like '我收到一笔 $X 的钱 不知道是哪个客户 / 哪个发票对应', 'which customer sent $X', 'find invoice for this payment', 'who paid $X on [date]'. Searches account.payment, account.move (invoices, by both total AND residual for partial-payment cases), and bank.statement.line in parallel. Amount tolerance is strict: $2 only — card payments already sync with exact net amount, and the real use case here is partial payments where amounts match exactly against amount_residual. Returns ranked candidates with match_score. ALWAYS use this INSTEAD OF multiple manual odoo_search calls on payment/invoice models. Read-only.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "amount": {"type": "number", "description": "The USD amount received (e.g. 3034.98). Required."},
+                "date": {"type": "string", "description": "Date money was received, YYYY-MM-DD. Optional but highly recommended (narrows search)."},
+                "date_window_days": {"type": "integer", "description": "Search ±N days around date. Default 14. Use 7 for tight matching, 30 for loose."},
+                "customer_hint": {"type": "string", "description": "Customer name from bank memo / Zelle note, if available (e.g. 'CARLOS RODRIGUEZ' or 'Anna Cafe'). Improves match accuracy significantly."},
+                "max_candidates": {"type": "integer", "description": "Max candidates to return. Default 10."}
+            },
+            "required": ["amount"]
+        }
+    },
+    {
         "name": "odoo_create_bulk_po",
         "description": "Create multiple purchase orders at once, one per vendor. Only call after user has confirmed the full plan. Each PO has one vendor and multiple product lines. CRITICAL: partner_id MUST come from odoo_get_product_vendors' vendor_id field (never user ID, never partner_name string). product_id MUST come from odoo_search_products_by_sku's product_id field (never invented, never product_tmpl_id).",
         "input_schema": {
@@ -1774,6 +1789,35 @@ DATE WINDOW:
   - If user says "去年" / "last year": since_date: "2025-01-01"
 
 DO NOT chain this with odoo_search for the same purpose. Call it once, use the result. If you need PO line details for ONE specific PO, then use odoo_search, but for SKU-centric questions this tool is always the answer.
+
+PAYMENT MATCHING QUERIES (CRITICAL PERFORMANCE RULE):
+When the user asks any of the following patterns — ALWAYS use odoo_match_payment_to_customer INSTEAD OF chaining odoo_search calls on account.payment / account.move / bank.statement.line:
+  - "我收到一笔 $X 的钱 不知道是哪个客户 / 哪个发票 / 哪个 SO"
+  - "上个月收到 $X 查下对应哪张发票"
+  - "这笔 $X 来自哪个客户"
+  - "Zelle 里 $X 是谁付的"
+  - "who paid $X", "which invoice matches this $X payment"
+  - Any screenshot of a bank statement + question about matching the amount
+
+RULE — When the question is "received money → which invoice/customer/SO":
+  ✅ CORRECT: odoo_match_payment_to_customer(amount=X, date="YYYY-MM-DD", customer_hint="NAME")
+  ❌ WRONG:   odoo_search(account.payment, ...) + odoo_search(account.move, ...) + ...
+
+The tool searches payments, invoices (by total AND by residual — for partial payments), and bank statement lines in parallel. Amount tolerance is strict ($2 only): card payments auto-sync with exact net amounts in Odoo and full payments get auto-linked by invoice_origin — so when we DO have to search, it's usually for partial payments where amounts match exactly against amount_residual. Candidates are ranked by match_score considering amount closeness, date proximity, and customer name match.
+
+EXTRACTING INPUTS FROM USER MESSAGE:
+  - amount (required): the USD amount mentioned
+  - date: if user says "上个月", pass the middle of last month or user-screenshot date; if user gives a date, use it exactly
+  - customer_hint: if user uploaded a bank screenshot with a name (like Zelle memo "CARLOS RODRIGUEZ PINTO") or mentioned a customer name, pass it — it dramatically improves accuracy
+  - date_window_days: default 14 is fine; use 30 if user is vague about timing
+
+INTERPRETING RESULTS:
+  - best_candidate.match_score >= 80 → confident: lead with "最可能是 [partner] 的 [invoice]"
+  - 50 <= score < 80 → medium: present top 2-3 candidates and let user pick
+  - score < 50 → low confidence: say "未找到高置信度匹配，建议提供更多信息"
+  - 0 candidates → say "未在 Odoo 中找到金额 $X 附近、日期 [range] 的记录"
+
+DO NOT fabricate matches. If no candidates returned, say so clearly. Do not invent invoice numbers or customer names.
 
 LARGE RESULT SETS — SUMMARY-FIRST RULE (APPLIES TO ALL REPLIES):
 This rule applies to EVERY reply you produce, for EVERY type of query — searches, reports, lookups, cross-references, anything. Before dumping data, check how much you are about to output.
@@ -2954,6 +2998,452 @@ async def run_tool(name, inp, context=None):
               f"have purchases in {len(all_po_ids)} POs, total ${round(total_amount,2)}")
         return json.dumps(output, ensure_ascii=False)
 
+    if name == "odoo_match_payment_to_customer":
+        """
+        Match a received payment amount to customer invoices / SOs / payment records.
+
+        USE THIS TOOL WHEN:
+          - User says "我收到一笔 $X 的钱，不知道是哪个客户/发票"
+          - User uploads a bank screenshot and asks which invoice it matches
+          - User asks "哪个 SO 对应这笔 $X"
+          - Any "which customer sent this money" question
+
+        DOES NOT DO WRITES. This is read-only discovery. If user then wants to
+        actually reconcile/apply the payment, they do it in Odoo UI.
+
+        Input:
+          {
+            "amount":            3034.98,         # required, USD amount received
+            "date":              "2026-03-24",    # optional, when money arrived
+            "date_window_days":  14,              # optional, default 14
+            "customer_hint":     "CARLOS RODRIGUEZ",  # optional, name from bank memo
+            "max_candidates":    10               # optional, default 10
+          }
+
+        Tolerance for amount matching:
+          $2 absolute, no percentage. Card payments auto-match in Odoo; the
+          use case is partial payments where amount equals amount_residual
+          exactly.
+
+        Returns candidates sorted by match_score (high → low), each with type
+        (payment/invoice/invoice_residual/bank_line), amount, date, partner,
+        linked SO if any, and match_reasons. Plus a best_candidate and summary.
+        """
+        import datetime as dt
+
+        # ── Parse inputs ──────────────────────────────────────────
+        try:
+            amount = float(inp.get("amount"))
+        except (TypeError, ValueError):
+            return json.dumps({"error": "amount is required and must be a number"})
+        if amount <= 0:
+            return json.dumps({"error": "amount must be positive"})
+
+        received_date_str = (inp.get("date") or "").strip()
+        received_date = None
+        if received_date_str:
+            try:
+                received_date = dt.datetime.strptime(received_date_str, "%Y-%m-%d").date()
+            except ValueError:
+                return json.dumps({"error": "date must be YYYY-MM-DD"})
+
+        date_window = int(inp.get("date_window_days") or 14)
+        if date_window < 1: date_window = 1
+        if date_window > 180: date_window = 180
+
+        customer_hint = (inp.get("customer_hint") or "").strip()
+        max_candidates = int(inp.get("max_candidates") or 10)
+
+        # Amount tolerance: just $2 absolute. No percentage tolerance.
+        # Reason: card payments auto-sync into Odoo with net amount and match
+        # automatically; full payments get auto-linked via invoice_origin. The
+        # cases we actually have to resolve here are partial payments, Zelle/
+        # Wire with unclear memos, split payments — all of which have EXACT
+        # amounts matching either invoice total or amount_residual. A $2 floor
+        # only covers tiny bank-line rounding, nothing else.
+        tolerance = 2.0
+        amount_low = round(amount - tolerance, 2)
+        amount_high = round(amount + tolerance, 2)
+
+        # Also compute a "near-exact" band for scoring.
+        near_exact_tol = 0.5  # strict — anything within 50 cents is a strong match
+
+        print(f"[MATCH_PAYMENT] amount={amount} tolerance=±${tolerance:.2f} "
+              f"window=±{date_window}d hint='{customer_hint}' date={received_date_str}")
+
+        # ── Build date window for searches ─────────────────────
+        date_from = date_to = None
+        if received_date:
+            date_from = (received_date - dt.timedelta(days=date_window)).strftime("%Y-%m-%d")
+            date_to = (received_date + dt.timedelta(days=date_window)).strftime("%Y-%m-%d")
+        else:
+            # No date given → search last 90 days as a reasonable default.
+            date_from = (dt.datetime.now() - dt.timedelta(days=90)).strftime("%Y-%m-%d")
+            date_to = dt.datetime.now().strftime("%Y-%m-%d")
+
+        # ── 1) Resolve customer_hint → partner_ids (if given) ──
+        hint_partner_ids = []
+        hint_partner_names = {}
+        if customer_hint:
+            # Try several matching strategies
+            hint_clean = customer_hint.strip()
+            # Strategy 1: exact (case-insensitive)
+            p_r = json.loads(await odoo_query(
+                "res.partner",
+                ["|", ["name", "=ilike", hint_clean],
+                      ["name", "ilike", hint_clean]],
+                ["id", "name"], limit=20
+            ))
+            p_r = p_r if isinstance(p_r, list) else []
+            # Strategy 2: first word only (e.g. "CARLOS" from "CARLOS RODRIGUEZ PINTO")
+            if not p_r:
+                first_word = hint_clean.split()[0] if hint_clean.split() else hint_clean
+                p_r = json.loads(await odoo_query(
+                    "res.partner",
+                    [["name", "ilike", first_word]],
+                    ["id", "name"], limit=20
+                ))
+                p_r = p_r if isinstance(p_r, list) else []
+            for p in p_r:
+                hint_partner_ids.append(p["id"])
+                hint_partner_names[p["id"]] = p["name"]
+            print(f"[MATCH_PAYMENT] customer_hint resolved to {len(hint_partner_ids)} partners: "
+                  f"{list(hint_partner_names.values())[:5]}")
+
+        # ── 2) Search account.payment ──────────────────────────
+        # Inbound customer payments in the amount window + date window.
+        pay_domain = [
+            ["amount", ">=", amount_low],
+            ["amount", "<=", amount_high],
+            ["date", ">=", date_from],
+            ["date", "<=", date_to],
+            ["company_id", "=", 1],
+            ["partner_type", "=", "customer"],  # only inbound customer payments
+        ]
+        pay_r = json.loads(await odoo_query(
+            "account.payment",
+            pay_domain,
+            ["id", "name", "amount", "date", "partner_id", "state",
+             "ref", "reconciled_invoice_ids", "payment_type"],
+            limit=100, order="date desc"
+        ))
+        pay_r = pay_r if isinstance(pay_r, list) else []
+        print(f"[MATCH_PAYMENT] account.payment: {len(pay_r)} candidates")
+
+        # ── 3) Search account.move (invoices) ──────────────────
+        # By amount_total AND by amount_residual — customer might pay full or partial.
+        inv_total_domain = [
+            ["amount_total", ">=", amount_low],
+            ["amount_total", "<=", amount_high],
+            ["invoice_date", ">=", date_from],
+            ["invoice_date", "<=", date_to],
+            ["company_id", "=", 1],
+            ["state", "=", "posted"],
+            ["move_type", "in", ["out_invoice", "out_refund"]],
+        ]
+        inv_r_total = json.loads(await odoo_query(
+            "account.move",
+            inv_total_domain,
+            ["id", "name", "amount_total", "amount_residual", "invoice_date",
+             "partner_id", "payment_state", "invoice_origin", "ref", "move_type"],
+            limit=100, order="invoice_date desc"
+        ))
+        inv_r_total = inv_r_total if isinstance(inv_r_total, list) else []
+
+        inv_residual_domain = [
+            ["amount_residual", ">=", amount_low],
+            ["amount_residual", "<=", amount_high],
+            ["invoice_date", ">=", date_from],
+            ["invoice_date", "<=", date_to],
+            ["company_id", "=", 1],
+            ["state", "=", "posted"],
+            ["move_type", "in", ["out_invoice"]],
+            ["payment_state", "in", ["not_paid", "partial", "in_payment"]],
+        ]
+        inv_r_residual = json.loads(await odoo_query(
+            "account.move",
+            inv_residual_domain,
+            ["id", "name", "amount_total", "amount_residual", "invoice_date",
+             "partner_id", "payment_state", "invoice_origin", "ref", "move_type"],
+            limit=100, order="invoice_date desc"
+        ))
+        inv_r_residual = inv_r_residual if isinstance(inv_r_residual, list) else []
+        print(f"[MATCH_PAYMENT] account.move: {len(inv_r_total)} by total, "
+              f"{len(inv_r_residual)} by residual")
+
+        # ── 4) Search account.bank.statement.line ──────────────
+        # Bank reconciliation entries — raw bank transactions
+        try:
+            bank_r = json.loads(await odoo_query(
+                "account.bank.statement.line",
+                [
+                    ["amount", ">=", amount_low],
+                    ["amount", "<=", amount_high],
+                    ["date", ">=", date_from],
+                    ["date", "<=", date_to],
+                    ["company_id", "=", 1],
+                ],
+                ["id", "date", "amount", "partner_id", "payment_ref", "ref",
+                 "is_reconciled"],
+                limit=100, order="date desc"
+            ))
+            bank_r = bank_r if isinstance(bank_r, list) else []
+        except Exception as e:
+            print(f"[MATCH_PAYMENT] bank line query failed (may not exist in this DB): {e}")
+            bank_r = []
+        print(f"[MATCH_PAYMENT] bank.statement.line: {len(bank_r)} candidates")
+
+        # ── 5) Score and build candidates ──────────────────────
+        candidates = []
+
+        def amount_score(cand_amount):
+            """Score based on how close the candidate amount is to the target.
+            Strict: amounts should match exactly or be within $2 (bank rounding)."""
+            diff = abs(cand_amount - amount)
+            if diff <= near_exact_tol:
+                return 60, "金额精确匹配"
+            elif diff <= 1.0:
+                return 45, f"金额差 ${diff:.2f} (四舍五入)"
+            elif diff <= tolerance:
+                return 25, f"金额差 ${diff:.2f} (在 ${tolerance:.0f} 容差内)"
+            return 0, f"金额差 ${diff:.2f}"
+
+        def date_score(cand_date_str):
+            if not received_date or not cand_date_str:
+                return 0, ""
+            try:
+                cand_date = dt.datetime.strptime(cand_date_str[:10], "%Y-%m-%d").date()
+                diff_days = abs((cand_date - received_date).days)
+            except Exception:
+                return 0, ""
+            if diff_days == 0:
+                return 30, "同一天"
+            elif diff_days <= 3:
+                return 20, f"±{diff_days} 天"
+            elif diff_days <= 7:
+                return 10, f"±{diff_days} 天"
+            elif diff_days <= 14:
+                return 5, f"±{diff_days} 天"
+            return 0, f"±{diff_days} 天"
+
+        def customer_score(partner_id, partner_name):
+            if not customer_hint:
+                return 0, ""
+            if partner_id in hint_partner_ids:
+                hint_lower = customer_hint.strip().lower()
+                pname_lower = (partner_name or "").strip().lower()
+                if hint_lower == pname_lower:
+                    return 25, f"客户名精确匹配 '{partner_name}'"
+                elif hint_lower in pname_lower or pname_lower in hint_lower:
+                    return 20, f"客户名包含 '{partner_name}'"
+                else:
+                    return 15, f"客户名模糊匹配 '{partner_name}'"
+            # Not in hint list but do a fuzzy check on the name
+            hint_lower = customer_hint.strip().lower()
+            pname_lower = (partner_name or "").strip().lower()
+            if hint_lower and pname_lower:
+                hint_first = hint_lower.split()[0] if hint_lower.split() else hint_lower
+                if hint_first in pname_lower or pname_lower.startswith(hint_first):
+                    return 10, f"客户名部分包含 '{partner_name}'"
+            return 0, ""
+
+        odoo_web_base = ODOO_URL.rstrip("/")
+
+        # -- 5a. account.payment candidates --
+        for p in pay_r:
+            c_amt = float(p.get("amount") or 0)
+            c_date = p.get("date") or ""
+            partner = p.get("partner_id")
+            partner_id = partner[0] if partner else None
+            partner_name = partner[1] if partner else ""
+            reasons = []
+            a_score, a_reason = amount_score(c_amt)
+            if a_score == 0: continue  # out of tolerance, skip
+            reasons.append(a_reason)
+            d_score, d_reason = date_score(c_date)
+            if d_reason: reasons.append(d_reason)
+            cu_score, cu_reason = customer_score(partner_id, partner_name)
+            if cu_reason: reasons.append(cu_reason)
+            type_bonus = 5  # payment record is the most direct evidence
+            reasons.append("付款单记录")
+
+            # Get linked invoices
+            linked_inv = p.get("reconciled_invoice_ids") or []
+
+            total_score = a_score + d_score + cu_score + type_bonus
+            candidates.append({
+                "type": "payment",
+                "match_score": total_score,
+                "record_id": p["id"],
+                "name": p.get("name"),
+                "amount": round(c_amt, 2),
+                "date": c_date,
+                "partner_id": partner_id,
+                "partner_name": partner_name,
+                "state": p.get("state"),
+                "payment_ref": p.get("ref") or "",
+                "linked_invoice_ids": linked_inv,
+                "match_reasons": reasons,
+                "odoo_link": f"{odoo_web_base}/odoo/payments/{p['id']}",
+            })
+
+        # -- 5b. account.move (by amount_total) candidates --
+        seen_invoice_ids = set()
+        for inv in inv_r_total:
+            seen_invoice_ids.add(inv["id"])
+            c_amt = float(inv.get("amount_total") or 0)
+            c_date = inv.get("invoice_date") or ""
+            partner = inv.get("partner_id")
+            partner_id = partner[0] if partner else None
+            partner_name = partner[1] if partner else ""
+            reasons = []
+            a_score, a_reason = amount_score(c_amt)
+            if a_score == 0: continue
+            reasons.append(a_reason + " (发票总额)")
+            d_score, d_reason = date_score(c_date)
+            if d_reason: reasons.append(d_reason)
+            cu_score, cu_reason = customer_score(partner_id, partner_name)
+            if cu_reason: reasons.append(cu_reason)
+            type_bonus = 0
+            reasons.append(f"发票 ({inv.get('payment_state','?')})")
+
+            total_score = a_score + d_score + cu_score + type_bonus
+            candidates.append({
+                "type": "invoice_total",
+                "match_score": total_score,
+                "record_id": inv["id"],
+                "name": inv.get("name"),
+                "amount": round(c_amt, 2),
+                "amount_residual": round(float(inv.get("amount_residual") or 0), 2),
+                "date": c_date,
+                "partner_id": partner_id,
+                "partner_name": partner_name,
+                "payment_state": inv.get("payment_state"),
+                "linked_so": inv.get("invoice_origin") or "",
+                "ref": inv.get("ref") or "",
+                "match_reasons": reasons,
+                "odoo_link": f"{odoo_web_base}/odoo/account-move/{inv['id']}",
+            })
+
+        # -- 5c. account.move (by amount_residual) candidates --
+        for inv in inv_r_residual:
+            if inv["id"] in seen_invoice_ids:
+                continue  # already covered by amount_total branch
+            c_amt = float(inv.get("amount_residual") or 0)
+            c_date = inv.get("invoice_date") or ""
+            partner = inv.get("partner_id")
+            partner_id = partner[0] if partner else None
+            partner_name = partner[1] if partner else ""
+            reasons = []
+            a_score, a_reason = amount_score(c_amt)
+            if a_score == 0: continue
+            reasons.append(a_reason + " (未付余额)")
+            d_score, d_reason = date_score(c_date)
+            if d_reason: reasons.append(d_reason)
+            cu_score, cu_reason = customer_score(partner_id, partner_name)
+            if cu_reason: reasons.append(cu_reason)
+            type_bonus = 3  # residual-match often indicates partial payment flow
+            reasons.append(f"分期付款发票 ({inv.get('payment_state','?')})")
+
+            total_score = a_score + d_score + cu_score + type_bonus
+            candidates.append({
+                "type": "invoice_residual",
+                "match_score": total_score,
+                "record_id": inv["id"],
+                "name": inv.get("name"),
+                "amount": round(float(inv.get("amount_total") or 0), 2),
+                "amount_residual": round(c_amt, 2),
+                "date": c_date,
+                "partner_id": partner_id,
+                "partner_name": partner_name,
+                "payment_state": inv.get("payment_state"),
+                "linked_so": inv.get("invoice_origin") or "",
+                "ref": inv.get("ref") or "",
+                "match_reasons": reasons,
+                "odoo_link": f"{odoo_web_base}/odoo/account-move/{inv['id']}",
+            })
+
+        # -- 5d. bank.statement.line candidates --
+        for b in bank_r:
+            c_amt = float(b.get("amount") or 0)
+            c_date = b.get("date") or ""
+            partner = b.get("partner_id")
+            partner_id = partner[0] if partner else None
+            partner_name = partner[1] if partner else ""
+            reasons = []
+            a_score, a_reason = amount_score(c_amt)
+            if a_score == 0: continue
+            reasons.append(a_reason)
+            d_score, d_reason = date_score(c_date)
+            if d_reason: reasons.append(d_reason)
+            cu_score, cu_reason = customer_score(partner_id, partner_name)
+            if cu_reason: reasons.append(cu_reason)
+            type_bonus = 2
+            payment_ref = b.get("payment_ref") or b.get("ref") or ""
+            reasons.append(f"银行对账行 ('{payment_ref[:60]}')" if payment_ref else "银行对账行")
+
+            # If customer_hint was given and bank memo contains it, big bonus
+            if customer_hint and payment_ref:
+                if customer_hint.strip().lower() in payment_ref.lower():
+                    cu_score = max(cu_score, 20)
+                    reasons.append(f"银行备注包含 '{customer_hint}'")
+
+            total_score = a_score + d_score + cu_score + type_bonus
+            candidates.append({
+                "type": "bank_line",
+                "match_score": total_score,
+                "record_id": b["id"],
+                "name": payment_ref[:80] or f"Bank line #{b['id']}",
+                "amount": round(c_amt, 2),
+                "date": c_date,
+                "partner_id": partner_id,
+                "partner_name": partner_name,
+                "is_reconciled": b.get("is_reconciled"),
+                "payment_ref": payment_ref,
+                "match_reasons": reasons,
+                "odoo_link": f"{odoo_web_base}/odoo/action-account.action_bank_statement_tree",
+            })
+
+        # ── 6) Sort, dedupe, pick top ──────────────────────────
+        candidates.sort(key=lambda c: c["match_score"], reverse=True)
+        top_candidates = candidates[:max_candidates]
+
+        # ── 7) Enrich top candidates with linked SO info ───────
+        # For invoice candidates, invoice_origin is often "SO..." — surface it.
+        # Also for top candidate, pull the full SO if we can.
+        best = top_candidates[0] if top_candidates else None
+
+        # ── 8) Build human-readable summary line ───────────────
+        if not candidates:
+            summary_line = f"未找到金额在 ${amount_low} ~ ${amount_high} 之间的候选记录（日期 {date_from} ~ {date_to}）。可能这笔款项尚未在 Odoo 中记录，或者金额/日期与实际偏差较大。"
+        elif best["match_score"] >= 80:
+            summary_line = (f"最可能: {best['partner_name']} 的 {best['name']} "
+                            f"(${best['amount']}, {best['date']}, 分数 {best['match_score']})。"
+                            f"共 {len(candidates)} 个候选。")
+        elif best["match_score"] >= 50:
+            summary_line = (f"最可能（置信度中等）: {best['partner_name']} 的 {best['name']} "
+                            f"(${best['amount']}, {best['date']}, 分数 {best['match_score']})。"
+                            f"共 {len(candidates)} 个候选，建议对比前几条确认。")
+        else:
+            summary_line = (f"找到 {len(candidates)} 个弱匹配候选，置信度较低。最高分: "
+                            f"{best['partner_name']} 的 {best['name']} (${best['amount']}, 分数 {best['match_score']})。"
+                            f"建议提供更多信息（客户名、准确日期）缩小范围。")
+
+        output = {
+            "amount_searched": amount,
+            "tolerance_used": round(tolerance, 2),
+            "search_range": [amount_low, amount_high],
+            "date_range": [date_from, date_to],
+            "customer_hint": customer_hint or None,
+            "total_candidates_found": len(candidates),
+            "best_candidate": best,
+            "candidates": top_candidates,
+            "summary": summary_line,
+        }
+        print(f"[MATCH_PAYMENT] done: {len(candidates)} candidates, "
+              f"top_score={best['match_score'] if best else 'N/A'}")
+        return json.dumps(output, ensure_ascii=False, default=str)
+
     if name == "get_po_with_so_links":
         """Get a PO's product lines and find matching SO records within a date range."""
         import datetime as dt
@@ -3966,7 +4456,7 @@ async def chat(req: ChatRequest, background_tasks: BackgroundTasks):
 
     # Filter tools based on permissions
     allowed_tools = []
-    finance_tools = {"get_monthly_tax", "get_quarterly_tax", "get_monthly_sales", "get_missing_tax"}
+    finance_tools = {"get_monthly_tax", "get_quarterly_tax", "get_monthly_sales", "get_missing_tax", "odoo_match_payment_to_customer"}
     write_tools = {"odoo_create_record", "odoo_add_order_line", "odoo_confirm_order", "odoo_update_record", "odoo_update_vendor_price"}
     # Tools that expose vendor names, prices, PO costs — only admin / finance / purchase should see these
     cost_tools = {"odoo_find_recent_purchases_by_skus", "odoo_get_product_vendors", "odoo_create_bulk_po", "get_po_with_so_links"}
@@ -4140,7 +4630,7 @@ async def chat_stream(req: ChatRequest, background_tasks: BackgroundTasks):
 
     # Filter tools based on permissions
     allowed_tools = []
-    finance_tools = {"get_monthly_tax", "get_quarterly_tax", "get_monthly_sales", "get_missing_tax"}
+    finance_tools = {"get_monthly_tax", "get_quarterly_tax", "get_monthly_sales", "get_missing_tax", "odoo_match_payment_to_customer"}
     write_tools = {"odoo_create_record", "odoo_add_order_line", "odoo_confirm_order", "odoo_update_record", "odoo_update_vendor_price"}
     # Tools that expose vendor names, prices, PO costs — only admin / finance / purchase should see these
     cost_tools = {"odoo_find_recent_purchases_by_skus", "odoo_get_product_vendors", "odoo_create_bulk_po", "get_po_with_so_links"}
