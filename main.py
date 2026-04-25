@@ -2126,32 +2126,41 @@ NEVER return a service_manual when user asks for product_manual, or spec_sheet w
 
 When a user mentions a model number, product name, or asks about a topic, follow these steps IN ORDER:
 
-STEP 1 — EXACT SEARCH
-Search for the exact term: search_knowledge(query="[model/topic as given]")
-→ If results contain useful content: answer directly using the chunk text. DONE.
-→ If empty or irrelevant: go to Step 2.
+STEP 1 — BROAD SEARCH (NO doc_name filter)
+ALWAYS search the FULL knowledge base first. NEVER guess a doc_name on the first search.
+  search_knowledge(query="[model number] [topic/symptom]", top_k=10)
+Example: search_knowledge(query="FLM-F3-NG pilot light troubleshooting", top_k=10)
+→ If results contain useful content from a specific document: answer directly using the chunk text, cite the document name. DONE.
+→ If empty or low relevance (<40%): go to Step 2.
 
-STEP 2 — DOCUMENT SCAN
-Search just the model/product name to find which documents exist:
-search_knowledge(query="[model number]") and search_knowledge(query="[product type]")
-→ If you find a matching document: search WITHIN it using doc_name filter:
-   search_knowledge(query="[the topic/symptom]", doc_name="[document name]")
-→ If results still insufficient: go to Step 3.
+⚠️ CRITICAL: Do NOT use doc_name filter in Step 1. You might guess the wrong filename.
+  ❌ WRONG:  search_knowledge(query="pilot light", doc_name="Gas Open Pot Fryer")  ← guessed wrong name, missed "Gas Fryer.pdf"
+  ✅ RIGHT:  search_knowledge(query="FLM-F3-NG pilot light troubleshooting")       ← searches everything, finds it
+
+STEP 2 — TARGETED SEARCH BY CATEGORY
+If Step 1 didn't find the answer, try searching by category priority:
+For troubleshooting/repair/maintenance/售后/故障 questions → search service_manual and product_manual FIRST:
+  search_knowledge(query="[model] [symptom]", category="product_manual")
+  search_knowledge(query="[model] [symptom]", category="service_manual")
+For specs/dimensions/capacity questions → search spec_sheet:
+  search_knowledge(query="[model] specifications", category="spec_sheet")
 
 STEP 3 — INFER AND BROADEN
 Infer the product category from the model number or name:
-- FLM- prefix → Flamaster brand (gas fryers, griddles, ranges)
-- PLM- prefix → Polarman brand (refrigerators, freezers)
-- CMPC/SLBM etc → Chumart accessories
-- "fryer" / "freezer" / "refrigerator" → search by equipment type
+- FLM- prefix → Flamaster brand (gas fryers, griddles, ranges, ovens, broilers)
+- PLM- prefix → Polarman brand (refrigerators, freezers, prep tables)
+- CA- prefix → ChefAsst brand (work tables, sinks, shelving)
+- CMPC/SLBM/CMEP etc → Chumart accessories
 Then search: search_knowledge(query="[inferred brand] [equipment type] [topic]")
 → If found: answer and note "I found this in our [document name], which covers similar models"
 → If still not found: go to Step 4.
 
-STEP 4 — ASK THE USER
-Tell the user specifically what you searched and what's missing. Ask a focused question:
-- "I searched for [X] but didn't find a specific manual for [model]. Is this a [product type]? Do you have a service manual I can add to the knowledge base?"
-- Never just say "not found" — always explain what you tried and what would help.
+STEP 4 — TELL THE USER HONESTLY
+Tell the user specifically what you searched and what's missing:
+- "我在知识库中搜索了 [model]，找到了 [X document] 但里面没有关于 [topic] 的具体内容。"
+- "知识库中没有 [model] 的专属文件，但有 [similar model] 的手册可供参考。"
+- Never just say "not found" — always explain what you tried and what's available.
+- NEVER fabricate an answer by mixing training data with "I found it in the document" claims.
 
 CRITICAL RULES FOR DOCUMENT CONTENT:
 - The chunk_text in search results IS the actual text from the document — read it and use it directly
@@ -2159,6 +2168,14 @@ CRITICAL RULES FOR DOCUMENT CONTENT:
 - If a chunk mentions a troubleshooting table, error code, or procedure — quote it directly in your answer
 - Always cite the source document name when using document content
 - If the user asks about content that IS in the results but you're unsure — quote the relevant section verbatim
+
+DOWNLOAD LINK RULES (CRITICAL — NEVER fabricate):
+- When providing a download link, ONLY use doc_id values that were ACTUALLY RETURNED by search_knowledge or list_documents in THIS conversation
+- The doc_id appears in search results as "[Doc ID: xxxx-xxxx-xxxx]" — copy it exactly
+- NEVER invent, guess, or construct a doc_id yourself
+- If you don't have a real doc_id from a tool result, do NOT provide a download link — just tell the user the document name and suggest they find it in the Library page
+  ❌ WRONG:  [Download](/docs/signed-url/e8f4c8a9-3d2a-4f5c-9e1b-7a5d6c8f3e2a)  ← invented ID, returns "Document not found"
+  ✅ RIGHT:  [Download](/docs/signed-url/aaa79794-8257-4c4c-862b-921cd4e2211a)    ← real ID from search_knowledge result
 
 Judging "clearly answers":
 - ✅ User asks "Polarman PLM-54FS 的制冷剂" and search_knowledge returns "PLM-54FS uses R290 refrigerant..." → answer from KB
