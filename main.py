@@ -4362,15 +4362,16 @@ async def run_tool(name, inp, context=None):
                 })
 
             # ── Step 2: Aggregate total outgoing per product_id ──
-            product_stats = {}  # pid -> {total_qty, name}
+            product_stats = {}  # pid -> {total_qty, move_count, name}
             for m in all_moves:
                 if not m.get("product_id"):
                     continue
                 pid = m["product_id"][0]
                 pname = m["product_id"][1]
                 if pid not in product_stats:
-                    product_stats[pid] = {"total_qty": 0, "name": pname}
+                    product_stats[pid] = {"total_qty": 0, "move_count": 0, "name": pname}
                 product_stats[pid]["total_qty"] += m.get("product_qty", 0)
+                product_stats[pid]["move_count"] += 1
 
             moved_pids = list(product_stats.keys())
             print(f"RESTOCK: {len(moved_pids)} unique products with outgoing moves")
@@ -4424,6 +4425,7 @@ async def run_tool(name, inp, context=None):
                         continue
 
                 total_out = stats["total_qty"]
+                move_count = stats["move_count"]
                 daily_avg = total_out / days_back if days_back > 0 else 0
                 days_remaining = (qty_available / daily_avg) if daily_avg > 0 else float("inf")
 
@@ -4458,6 +4460,7 @@ async def run_tool(name, inp, context=None):
                     "brand": brand,
                     "qty_available": round(qty_available, 1),
                     "total_outgoing": round(total_out, 1),
+                    "move_count": move_count,
                     "daily_avg": round(daily_avg, 2),
                     "days_remaining": round(days_remaining, 1) if days_remaining != float("inf") else None,
                     "urgency": urgency,
@@ -4471,6 +4474,7 @@ async def run_tool(name, inp, context=None):
             urgency_order = {"out_of_stock": 0, "urgent": 1, "reorder": 2, "ok": 3}
             results.sort(key=lambda r: (
                 urgency_order.get(r["urgency"], 9),
+                -r["move_count"],  # more shipments = higher priority (genuine recurring demand)
                 r["days_remaining"] if r["days_remaining"] is not None else 99999
             ))
 
