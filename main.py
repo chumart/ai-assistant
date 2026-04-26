@@ -1933,7 +1933,12 @@ TOOLS = [
 
 def get_system_prompt(role: str = "guest", user_name: str = "", user_id: int = 0, free_mode: bool = False, memories: list = []):
     today = datetime.date.today().strftime("%Y年%m月%d日")
-    now_la = datetime.datetime.now(LA_TZ).strftime("%Y-%m-%d %H:%M %Z")
+    now_dt = datetime.datetime.now(LA_TZ)
+    now_la = now_dt.strftime("%Y-%m-%d %H:%M %Z")
+    weekday_names = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+    weekday_cn = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
+    dow_en = weekday_names[now_dt.weekday()]
+    dow_cn = weekday_cn[now_dt.weekday()]
     perms = ROLE_PERMISSIONS.get(role, ROLE_PERMISSIONS["guest"])
 
     # Build permission-specific rules
@@ -2032,7 +2037,7 @@ COST/MARGIN RULES (NO ACCESS):
 
     # Free mode: ONLY when admin explicitly toggles it on
     if role == "admin" and free_mode:
-        return f"""今天是{today}，当前时间(洛杉矶): {now_la}。你是 Chumart AI，Chumart 管理员的专属私人助手。
+        return f"""今天是{today}（{dow_cn}/{dow_en}），当前时间(洛杉矶): {now_la}。你是 Chumart AI，Chumart 管理员的专属私人助手。
 你支持中英文，用用户的语言回复。{memory_block}
 
 【你的能力没有限制】
@@ -2062,7 +2067,7 @@ COST/MARGIN RULES (NO ACCESS):
     if memories:
         memory_block = f"\n\nUSER MEMORY (personalization context):\n" + "\n".join(f"- {m}" for m in memories)
 
-    return f"""今天是{today}，当前时间(洛杉矶): {now_la}。You are Chumart Assistant, an enterprise AI assistant.
+    return f"""今天是{today}（{dow_cn}/{dow_en}），当前时间(洛杉矶): {now_la}。You are Chumart Assistant, an enterprise AI assistant.
 You support both English and Chinese - reply in the same language the user uses.
 
 CURRENT USER: {user_name} | ROLE: {perms['label']} | UID: {user_id}{memory_block}
