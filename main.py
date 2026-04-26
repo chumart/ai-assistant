@@ -6148,8 +6148,19 @@ async def odoo_bot_chat(req: OdooBotRequest):
     # Load user memory
     memories = await db_get_memory(uid)
 
-    # Build system prompt
+    # Build system prompt — add Odoo Bot-specific rules
     system_prompt = get_system_prompt(role, author, uid, False, memories)
+    system_prompt += """
+
+ODOO DISCUSS BOT RULES (you are responding inside Odoo Discuss chat, NOT the web frontend):
+- Keep replies SHORT and concise — Discuss chat window is narrow, long replies are hard to read
+- Do NOT mention "前端会自动生成下载按钮" — there is no frontend here, only Discuss chat
+- For Excel/PDF downloads, give the FULL URL directly: https://chumart-ai.up.railway.app/export/commission?year=YYYY&month=MM
+- For document downloads, give the FULL URL: https://chumart-ai.up.railway.app/docs/signed-url/{doc_id}
+- Do NOT use Markdown tables (they render poorly in Discuss) — use compact card-style or bullet lists instead
+- Use simple formatting: **bold** for emphasis, bullet points (•) for lists
+- Maximum reply length: ~500 words. If data is larger, give a summary and offer the download link.
+"""
 
     # Call Claude — use Haiku for speed (Discuss needs fast replies, not long essays)
     # Sonnet takes 8-15s per turn; Haiku takes 2-4s.
