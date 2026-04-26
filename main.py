@@ -1812,6 +1812,43 @@ TOOLS = [
         }
     },
     {
+        "name": "odoo_create_invoice_from_so",
+        "description": "Create an invoice from a Sales Order. USE THIS when user says 'release S04100', 'create invoice for CMT12345', '给这个订单开票'. For Shopify (#CMT) and Amazon (AMZ) orders, the SO existing in Odoo means payment is confirmed — can proceed directly. For normal orders (S-prefix), require explicit payment confirmation first. Returns the created invoice ID and name.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "so_name": {"type": "string", "description": "Sales Order name/number (e.g. 'S04100', '#CMT12345', 'AMZ-12345')"},
+                "payment_method": {"type": "string", "description": "Payment method selection value for x_payment_method field. Common values: Cash, Stripe, Zelle, Shopify Payment, Amazon Payment, Square, Combo(Cash+Zelle), etc. For Shopify orders default to 'Shopify Payment'. For Amazon default to 'Amazon Payment'."},
+            },
+            "required": ["so_name"]
+        }
+    },
+    {
+        "name": "odoo_register_payment",
+        "description": "Register payment on an invoice (marks it as paid). Call AFTER odoo_create_invoice_from_so. Requires the invoice_id returned from that tool. Journal mapping: Cash payments → 'Cash' journal, Amazon → 'Amazon PLAT BUS CHECKING' journal, everything else (Stripe/Zelle/Square/Shopify) → 'Revenue and COGS' journal. Stripe invoices may already be auto-registered — check payment_state first.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "invoice_id": {"type": "integer", "description": "The account.move ID of the invoice to register payment on"},
+                "journal_name": {"type": "string", "description": "Journal name: 'Cash', 'Revenue and COGS', or 'Amazon PLAT BUS CHECKING'"},
+                "amount": {"type": "number", "description": "Payment amount. Usually the invoice total. Optional — if omitted, pays the full invoice amount."},
+                "payment_date": {"type": "string", "description": "Payment date YYYY-MM-DD. Optional — defaults to today."}
+            },
+            "required": ["invoice_id", "journal_name"]
+        }
+    },
+    {
+        "name": "odoo_export_invoice_pdf",
+        "description": "Export an invoice as PDF. Returns a download URL. Use after creating and registering payment on an invoice. The PDF can be downloaded or sent to a printer.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "invoice_id": {"type": "integer", "description": "The account.move ID to export as PDF"}
+            },
+            "required": ["invoice_id"]
+        }
+    },
+    {
         "name": "create_reminder",
         "description": "Schedule a reminder that notifies the user via email/SMS/voice call at a specified time. Use when user says '提醒我...', 'remind me...', '下个月X号提醒我'. fire_at must be ISO datetime (naive = LA time). Default channel is email. Add 'sms' for text, 'call' for phone call.",
         "input_schema": {
@@ -2307,6 +2344,40 @@ This is a meaningful answer, not a failure. Tell the user something like:
 Then ask: "你能提供更多信息吗？比如客户名、准确的金额或日期。"
 
 DO NOT say "我找到一条银行对账记录" as an answer — the user is usually asking this FROM the bank line view, so that would just echo their input.
+
+ORDER RELEASE / INVOICE AUTOMATION (开票自动化):
+When user says "release [SO]", "开票 [SO]", "create invoice for [SO]", "process [SO]", or similar — follow this workflow:
+
+THREE TYPES OF ORDERS — different rules for each:
+
+TYPE 1 — Shopify (#CMT prefix) and Amazon (AMZ prefix):
+  These orders are already paid when they appear in Odoo. PROCEED DIRECTLY:
+  1. Call odoo_create_invoice_from_so(so_name="CMT12345", payment_method="Shopify Payment")
+     - For #CMT orders: payment_method = "Shopify Payment"
+     - For AMZ orders: payment_method = "Amazon Payment"
+  2. Call odoo_register_payment(invoice_id=XXX, journal_name="Revenue and COGS")
+     - For #CMT: journal = "Revenue and COGS"
+     - For AMZ: journal = "Amazon PLAT BUS CHECKING"
+  3. Call odoo_export_invoice_pdf(invoice_id=XXX)
+  4. Reply with: "✅ [SO] 已处理: 发票 [INV] 已创建, 收款已登记, PDF: [link]"
+
+TYPE 2 — Normal orders (S prefix):
+  REQUIRES explicit payment confirmation. Do NOT auto-process.
+  1. Ask: "S04100 金额 $X, 确认收到款了吗? 付款方式是什么? (Cash/Zelle/Stripe/Square)"
+  2. Wait for confirmation + payment method
+  3. Then proceed same as above with correct payment_method and journal:
+     - Cash → payment_method="Cash", journal="Cash"
+     - Zelle → payment_method="Zelle", journal="Revenue and COGS"
+     - Stripe → payment_method="Stripe", journal="Revenue and COGS" (may auto-register)
+     - Square → payment_method="POS Machine", journal="Revenue and COGS"
+     - Combo (e.g. Cash+Zelle) → payment_method="Combo(Cash+Zelle)", journal="Revenue and COGS"
+
+BATCH RELEASE:
+  If user says "release CMT12345, CMT12346, AMZ-789" — process each one sequentially.
+  Report results as a summary: "✅ 3/3 orders processed: [details]"
+
+PERMISSION: Only admin and finance roles can use these tools.
+  If a sales role tries to release an order, reply: "需要财务或管理员确认后才能开票。"
 
 RESTOCK ANALYSIS (补货分析):
 When the user asks anything like "哪些产品需要补货", "补货分析", "restock analysis", "what needs reordering", "库存预警", "inventory alert", "根据出库看看该采购什么" — follow this workflow:
@@ -4935,6 +5006,323 @@ async def run_tool(name, inp, context=None):
             return f"Search error: {e}"
         finally:
             await conn.close()
+    if name == "odoo_create_invoice_from_so":
+        """Create invoice from a Sales Order.
+        Steps: find SO → call action_create_invoice → set payment method → return invoice info.
+        """
+        so_name = (inp.get("so_name") or "").strip()
+        payment_method = (inp.get("payment_method") or "").strip()
+        if not so_name:
+            return json.dumps({"error": "so_name is required"})
+
+        try:
+            cookies = await odoo_get_session()
+
+            # Step 1: Find the SO
+            so_r = json.loads(await odoo_query("sale.order",
+                [["name", "=", so_name], ["company_id", "=", 1]],
+                ["id", "name", "partner_id", "amount_total", "state", "invoice_status", "invoice_ids"],
+                limit=1, cookies=cookies))
+            if not isinstance(so_r, list) or not so_r:
+                return json.dumps({"error": f"SO '{so_name}' not found"})
+            so = so_r[0]
+
+            # Check SO state
+            if so.get("state") not in ("sale", "done"):
+                return json.dumps({"error": f"SO '{so_name}' is in state '{so.get('state')}', must be confirmed (sale/done) to invoice"})
+
+            # Check if already invoiced
+            existing_invoices = so.get("invoice_ids") or []
+            if existing_invoices:
+                # Check if any posted invoice exists
+                inv_check = json.loads(await odoo_query("account.move",
+                    [["id", "in", existing_invoices], ["state", "=", "posted"]],
+                    ["id", "name", "payment_state", "amount_total"],
+                    limit=5, cookies=cookies))
+                if isinstance(inv_check, list) and inv_check:
+                    inv = inv_check[0]
+                    return json.dumps({
+                        "already_invoiced": True,
+                        "invoice_id": inv["id"],
+                        "invoice_name": inv.get("name"),
+                        "payment_state": inv.get("payment_state"),
+                        "amount_total": inv.get("amount_total"),
+                        "message": f"SO {so_name} already has invoice {inv.get('name')} (payment_state: {inv.get('payment_state')})"
+                    })
+
+            # Step 2: Create invoice via action_create_invoice wizard
+            # In Odoo 17, we call sale.advance.payment.inv wizard
+            async with httpx.AsyncClient(timeout=30, follow_redirects=True) as c:
+                # Create the wizard
+                wiz_r = await c.post(f"{ODOO_URL}/web/dataset/call_kw", json={
+                    "jsonrpc": "2.0", "method": "call", "id": 10,
+                    "params": {
+                        "model": "sale.advance.payment.inv",
+                        "method": "create",
+                        "args": [{"advance_payment_method": "delivered"}],
+                        "kwargs": {"context": {"active_ids": [so["id"]], "active_model": "sale.order"}}
+                    }
+                }, cookies=cookies)
+                wiz_data = wiz_r.json()
+                if wiz_data.get("error"):
+                    return json.dumps({"error": f"Invoice wizard create failed: {wiz_data['error'].get('data', {}).get('message', str(wiz_data['error']))}"})
+                wiz_id = wiz_data.get("result")
+
+                # Execute the wizard to create invoice
+                exec_r = await c.post(f"{ODOO_URL}/web/dataset/call_kw", json={
+                    "jsonrpc": "2.0", "method": "call", "id": 11,
+                    "params": {
+                        "model": "sale.advance.payment.inv",
+                        "method": "create_invoices",
+                        "args": [[wiz_id]],
+                        "kwargs": {"context": {"active_ids": [so["id"]], "active_model": "sale.order"}}
+                    }
+                }, cookies=cookies)
+                exec_data = exec_r.json()
+                if exec_data.get("error"):
+                    return json.dumps({"error": f"Invoice creation failed: {exec_data['error'].get('data', {}).get('message', str(exec_data['error']))}"})
+
+            # Step 3: Find the newly created invoice
+            so_refresh = json.loads(await odoo_query("sale.order",
+                [["id", "=", so["id"]]],
+                ["invoice_ids"], limit=1, cookies=cookies))
+            new_inv_ids = so_refresh[0].get("invoice_ids", []) if so_refresh else []
+            # The new invoice is the one not in existing_invoices
+            created_inv_ids = [i for i in new_inv_ids if i not in existing_invoices]
+            if not created_inv_ids:
+                created_inv_ids = new_inv_ids  # fallback
+
+            if not created_inv_ids:
+                return json.dumps({"error": "Invoice creation seemed to succeed but no new invoice found"})
+
+            inv_id = created_inv_ids[0]
+
+            # Step 4: Post the invoice (draft → posted)
+            post_result = await odoo_call_method("account.move", inv_id, "action_post")
+            if post_result.get("error"):
+                return json.dumps({"error": f"Invoice post failed: {post_result['error']}"})
+
+            # Step 5: Set payment method if provided
+            if payment_method:
+                await odoo_write_record("account.move", inv_id,
+                    {"x_payment_method": payment_method}, cookies=cookies)
+
+            # Get final invoice info
+            inv_info = json.loads(await odoo_query("account.move",
+                [["id", "=", inv_id]],
+                ["id", "name", "amount_total", "payment_state", "x_payment_method"],
+                limit=1, cookies=cookies))
+            inv = inv_info[0] if isinstance(inv_info, list) and inv_info else {}
+
+            partner_name = so["partner_id"][1] if so.get("partner_id") else ""
+
+            await audit_odoo_write(
+                who_uid=ctx.get("uid", 0), who_name=ctx.get("username", ""),
+                tool_name="odoo_create_invoice_from_so",
+                model="account.move", record_id=inv_id,
+                operation="create_invoice",
+                new_values={"so": so_name, "payment_method": payment_method},
+                extra_info={"partner": partner_name, "amount": so.get("amount_total")},
+            )
+
+            return json.dumps({
+                "success": True,
+                "so_name": so_name,
+                "partner": partner_name,
+                "invoice_id": inv_id,
+                "invoice_name": inv.get("name", ""),
+                "amount_total": inv.get("amount_total", so.get("amount_total")),
+                "payment_state": inv.get("payment_state", "not_paid"),
+                "payment_method": payment_method,
+                "odoo_link": f"{ODOO_URL}/odoo/account-move/{inv_id}",
+                "message": f"Invoice {inv.get('name', '')} created for {so_name} ({partner_name}), amount ${inv.get('amount_total', 0):,.2f}"
+            }, ensure_ascii=False)
+
+        except Exception as e:
+            print(f"CREATE_INVOICE error: {e}")
+            import traceback; traceback.print_exc()
+            return json.dumps({"error": f"Failed to create invoice: {str(e)}"})
+
+    if name == "odoo_register_payment":
+        """Register payment on an invoice.
+        Uses Odoo's account.payment.register wizard (same as clicking 'Register Payment' in UI).
+        """
+        invoice_id = inp.get("invoice_id")
+        journal_name = (inp.get("journal_name") or "").strip()
+        amount = inp.get("amount")
+        payment_date = inp.get("payment_date") or datetime.date.today().strftime("%Y-%m-%d")
+
+        if not invoice_id:
+            return json.dumps({"error": "invoice_id is required"})
+        if not journal_name:
+            return json.dumps({"error": "journal_name is required (Cash, Revenue and COGS, or Amazon PLAT BUS CHECKING)"})
+
+        try:
+            cookies = await odoo_get_session()
+
+            # Check invoice state first
+            inv_r = json.loads(await odoo_query("account.move",
+                [["id", "=", invoice_id]],
+                ["id", "name", "state", "payment_state", "amount_total", "amount_residual"],
+                limit=1, cookies=cookies))
+            if not isinstance(inv_r, list) or not inv_r:
+                return json.dumps({"error": f"Invoice {invoice_id} not found"})
+            inv = inv_r[0]
+
+            if inv.get("state") != "posted":
+                return json.dumps({"error": f"Invoice {inv.get('name')} is not posted (state={inv.get('state')}). Post it first."})
+            if inv.get("payment_state") in ("paid", "in_payment"):
+                return json.dumps({
+                    "already_paid": True,
+                    "invoice_name": inv.get("name"),
+                    "payment_state": inv.get("payment_state"),
+                    "message": f"Invoice {inv.get('name')} is already {inv.get('payment_state')}"
+                })
+
+            # Find journal by name
+            journal_r = json.loads(await odoo_query("account.journal",
+                [["name", "ilike", journal_name], ["company_id", "=", 1]],
+                ["id", "name", "type"], limit=5, cookies=cookies))
+            if not isinstance(journal_r, list) or not journal_r:
+                return json.dumps({"error": f"Journal '{journal_name}' not found. Available: Cash, Revenue and COGS, Amazon PLAT BUS CHECKING"})
+            # Prefer exact match
+            exact = [j for j in journal_r if j["name"].lower() == journal_name.lower()]
+            journal = exact[0] if exact else journal_r[0]
+            journal_id = journal["id"]
+
+            pay_amount = amount if amount else float(inv.get("amount_residual") or inv.get("amount_total") or 0)
+
+            # Use account.payment.register wizard (same as UI button)
+            async with httpx.AsyncClient(timeout=30, follow_redirects=True) as c:
+                # Create wizard
+                wiz_vals = {
+                    "journal_id": journal_id,
+                    "amount": pay_amount,
+                    "payment_date": payment_date,
+                }
+                wiz_r = await c.post(f"{ODOO_URL}/web/dataset/call_kw", json={
+                    "jsonrpc": "2.0", "method": "call", "id": 20,
+                    "params": {
+                        "model": "account.payment.register",
+                        "method": "create",
+                        "args": [wiz_vals],
+                        "kwargs": {"context": {
+                            "active_model": "account.move",
+                            "active_ids": [invoice_id],
+                        }}
+                    }
+                }, cookies=cookies)
+                wiz_data = wiz_r.json()
+                if wiz_data.get("error"):
+                    return json.dumps({"error": f"Payment wizard failed: {wiz_data['error'].get('data', {}).get('message', str(wiz_data['error']))}"})
+                wiz_id = wiz_data.get("result")
+
+                # Execute wizard
+                exec_r = await c.post(f"{ODOO_URL}/web/dataset/call_kw", json={
+                    "jsonrpc": "2.0", "method": "call", "id": 21,
+                    "params": {
+                        "model": "account.payment.register",
+                        "method": "action_create_payments",
+                        "args": [[wiz_id]],
+                        "kwargs": {"context": {
+                            "active_model": "account.move",
+                            "active_ids": [invoice_id],
+                        }}
+                    }
+                }, cookies=cookies)
+                exec_data = exec_r.json()
+                if exec_data.get("error"):
+                    return json.dumps({"error": f"Payment registration failed: {exec_data['error'].get('data', {}).get('message', str(exec_data['error']))}"})
+
+            # Verify payment state
+            inv_after = json.loads(await odoo_query("account.move",
+                [["id", "=", invoice_id]],
+                ["id", "name", "payment_state", "amount_residual"],
+                limit=1, cookies=cookies))
+            inv_final = inv_after[0] if isinstance(inv_after, list) and inv_after else {}
+
+            await audit_odoo_write(
+                who_uid=ctx.get("uid", 0), who_name=ctx.get("username", ""),
+                tool_name="odoo_register_payment",
+                model="account.move", record_id=invoice_id,
+                operation="register_payment",
+                new_values={"journal": journal["name"], "amount": pay_amount, "date": payment_date},
+                extra_info={"invoice_name": inv.get("name")},
+            )
+
+            return json.dumps({
+                "success": True,
+                "invoice_id": invoice_id,
+                "invoice_name": inv.get("name"),
+                "amount_paid": pay_amount,
+                "journal": journal["name"],
+                "payment_date": payment_date,
+                "payment_state_after": inv_final.get("payment_state", "unknown"),
+                "amount_residual_after": inv_final.get("amount_residual", 0),
+                "message": f"Payment ${pay_amount:,.2f} registered on {inv.get('name')} via {journal['name']}"
+            }, ensure_ascii=False)
+
+        except Exception as e:
+            print(f"REGISTER_PAYMENT error: {e}")
+            import traceback; traceback.print_exc()
+            return json.dumps({"error": f"Failed to register payment: {str(e)}"})
+
+    if name == "odoo_export_invoice_pdf":
+        """Export invoice as PDF using Odoo's report engine."""
+        invoice_id = inp.get("invoice_id")
+        if not invoice_id:
+            return json.dumps({"error": "invoice_id is required"})
+
+        try:
+            cookies = await odoo_get_session()
+
+            # Verify invoice exists
+            inv_r = json.loads(await odoo_query("account.move",
+                [["id", "=", invoice_id]],
+                ["id", "name", "state"],
+                limit=1, cookies=cookies))
+            if not isinstance(inv_r, list) or not inv_r:
+                return json.dumps({"error": f"Invoice {invoice_id} not found"})
+            inv = inv_r[0]
+            inv_name = inv.get("name", f"INV-{invoice_id}")
+
+            # Call Odoo report endpoint to generate PDF
+            async with httpx.AsyncClient(timeout=60, follow_redirects=True) as c:
+                # Odoo 17 report URL pattern
+                report_url = f"{ODOO_URL}/report/pdf/account.report_invoice/{invoice_id}"
+                r = await c.get(report_url, cookies=cookies)
+
+                if r.status_code != 200:
+                    return json.dumps({"error": f"PDF generation failed: HTTP {r.status_code}"})
+
+                pdf_bytes = r.content
+                if len(pdf_bytes) < 100:
+                    return json.dumps({"error": "PDF generation returned empty or invalid file"})
+
+            # Upload to R2 for download
+            safe_name = inv_name.replace("/", "_")
+            r2_key = f"invoices/{safe_name}.pdf"
+            ok = await r2_upload(pdf_bytes, r2_key, "application/pdf")
+            if not ok:
+                return json.dumps({"error": "Failed to upload PDF to storage"})
+
+            download_url = f"{R2_PUBLIC_URL}/{r2_key}"
+
+            print(f"EXPORT_PDF: {inv_name} → {len(pdf_bytes)} bytes → {r2_key}")
+
+            return json.dumps({
+                "success": True,
+                "invoice_id": invoice_id,
+                "invoice_name": inv_name,
+                "pdf_size_kb": len(pdf_bytes) // 1024,
+                "download_url": download_url,
+                "message": f"Invoice {inv_name} exported as PDF ({len(pdf_bytes)//1024}KB)"
+            })
+
+        except Exception as e:
+            print(f"EXPORT_PDF error: {e}")
+            return json.dumps({"error": f"Failed to export PDF: {str(e)}"})
+
     if name == "create_reminder":
         content = (inp.get("content") or "").strip()
         fire_at_str = (inp.get("fire_at") or "").strip()
@@ -5700,7 +6088,7 @@ async def chat(req: ChatRequest, background_tasks: BackgroundTasks):
     # Filter tools based on permissions
     allowed_tools = []
     finance_tools = {"get_monthly_tax", "get_quarterly_tax", "get_monthly_sales", "get_missing_tax", "odoo_match_payment_to_customer"}
-    write_tools = {"odoo_create_record", "odoo_add_order_line", "odoo_confirm_order", "odoo_update_record", "odoo_update_vendor_price"}
+    write_tools = {"odoo_create_record", "odoo_add_order_line", "odoo_confirm_order", "odoo_update_record", "odoo_update_vendor_price", "odoo_create_invoice_from_so", "odoo_register_payment", "odoo_export_invoice_pdf"}
     # Tools that expose vendor names, prices, PO costs — only admin / finance / purchase should see these
     cost_tools = {"odoo_find_recent_purchases_by_skus", "odoo_get_product_vendors", "odoo_create_bulk_po", "get_po_with_so_links", "odoo_restock_analysis"}
     for tool in TOOLS:
@@ -5874,7 +6262,7 @@ async def chat_stream(req: ChatRequest, background_tasks: BackgroundTasks):
     # Filter tools based on permissions
     allowed_tools = []
     finance_tools = {"get_monthly_tax", "get_quarterly_tax", "get_monthly_sales", "get_missing_tax", "odoo_match_payment_to_customer"}
-    write_tools = {"odoo_create_record", "odoo_add_order_line", "odoo_confirm_order", "odoo_update_record", "odoo_update_vendor_price"}
+    write_tools = {"odoo_create_record", "odoo_add_order_line", "odoo_confirm_order", "odoo_update_record", "odoo_update_vendor_price", "odoo_create_invoice_from_so", "odoo_register_payment", "odoo_export_invoice_pdf"}
     # Tools that expose vendor names, prices, PO costs — only admin / finance / purchase should see these
     cost_tools = {"odoo_find_recent_purchases_by_skus", "odoo_get_product_vendors", "odoo_create_bulk_po", "get_po_with_so_links", "odoo_restock_analysis"}
     for tool in TOOLS:
@@ -6617,7 +7005,7 @@ async def odoo_bot_chat(req: OdooBotRequest):
     # Filter tools by permission (same logic as /chat)
     allowed_tools = []
     finance_tools = {"get_monthly_tax", "get_quarterly_tax", "get_monthly_sales", "get_missing_tax", "odoo_match_payment_to_customer"}
-    write_tools = {"odoo_create_record", "odoo_add_order_line", "odoo_confirm_order", "odoo_update_record", "odoo_update_vendor_price"}
+    write_tools = {"odoo_create_record", "odoo_add_order_line", "odoo_confirm_order", "odoo_update_record", "odoo_update_vendor_price", "odoo_create_invoice_from_so", "odoo_register_payment", "odoo_export_invoice_pdf"}
     cost_tools = {"odoo_find_recent_purchases_by_skus", "odoo_get_product_vendors", "odoo_create_bulk_po", "get_po_with_so_links", "odoo_restock_analysis"}
     for tool in TOOLS:
         tname = tool["name"]
