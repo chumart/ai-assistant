@@ -12,6 +12,7 @@ import asyncio
 import datetime
 from urllib.parse import urljoin, urlparse
 from typing import Optional
+from zoneinfo import ZoneInfo
 
 app = FastAPI()
 
@@ -47,6 +48,17 @@ R2_PUBLIC_URL = os.getenv("R2_PUBLIC_URL", "")
 
 # MinerU Cloud API (PDF OCR)
 MINERU_API_TOKEN = os.getenv("MINERU_API_TOKEN", "")
+
+# Reminder notifications
+SENDGRID_API_KEY   = os.getenv("SENDGRID_API_KEY", "")
+SENDGRID_FROM      = os.getenv("SENDGRID_FROM", "ai@chumartai.com")
+SENDGRID_FROM_NAME = os.getenv("SENDGRID_FROM_NAME", "Chumart AI")
+TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID", "")
+TWILIO_AUTH_TOKEN   = os.getenv("TWILIO_AUTH_TOKEN", "")
+TWILIO_FROM_NUMBER  = os.getenv("TWILIO_FROM_NUMBER", "")
+
+LA_TZ = ZoneInfo("America/Los_Angeles")
+UTC_TZ = datetime.timezone.utc
 
 VALID_STATES = ["paid", "in_payment", "reversed"]
 CA_STATE_ID  = 13
@@ -209,6 +221,56 @@ async def init_db():
             CREATE INDEX IF NOT EXISTS odoo_write_audit_model_idx
             ON odoo_write_audit(model, record_id)
         """)
+        # Reminders & Events (personal assistant)
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS reminders (
+                id           SERIAL PRIMARY KEY,
+                uid          INTEGER NOT NULL,
+                user_name    TEXT,
+                content      TEXT NOT NULL,
+                fire_at      TIMESTAMPTZ NOT NULL,
+                channels     TEXT[] DEFAULT ARRAY['email']::TEXT[],
+                target_email TEXT,
+                target_phone TEXT,
+                fired        BOOLEAN DEFAULT FALSE,
+                fired_at     TIMESTAMPTZ,
+                error        TEXT,
+                created_at   TIMESTAMPTZ DEFAULT NOW()
+            )
+        """)
+        await conn.execute("""
+            CREATE INDEX IF NOT EXISTS reminders_pending_idx
+            ON reminders(fire_at) WHERE fired = FALSE
+        """)
+        await conn.execute("""
+            CREATE INDEX IF NOT EXISTS reminders_uid_idx
+            ON reminders(uid, fire_at DESC)
+        """)
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS events (
+                id          SERIAL PRIMARY KEY,
+                uid         INTEGER NOT NULL,
+                user_name   TEXT,
+                title       TEXT NOT NULL,
+                notes       TEXT DEFAULT '',
+                location    TEXT DEFAULT '',
+                start_at    TIMESTAMPTZ NOT NULL,
+                end_at      TIMESTAMPTZ,
+                created_at  TIMESTAMPTZ DEFAULT NOW()
+            )
+        """)
+        await conn.execute("""
+            CREATE INDEX IF NOT EXISTS events_uid_start_idx
+            ON events(uid, start_at)
+        """)
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS user_contacts (
+                uid        INTEGER PRIMARY KEY,
+                email      TEXT,
+                phone      TEXT,
+                updated_at TIMESTAMPTZ DEFAULT NOW()
+            )
+        """)
         print("DB initialized OK")
     except Exception as e:
         print(f"DB init error: {e}")
@@ -269,13 +331,181 @@ async def audit_odoo_write(
 @app.on_event("startup")
 async def startup():
     print("=" * 60)
-    print("CHUMART AI BACKEND — BUILD: security-v13 (2026-04-22)")
+    print("CHUMART AI BACKEND — BUILD: reminder-v1 (2026-04-26)")
     print("=" * 60)
     await init_db()
+    # Start reminder scanner (checks every 60 seconds for due reminders)
+    try:
+        from apscheduler.schedulers.asyncio import AsyncIOScheduler
+        scheduler = AsyncIOScheduler()
+        scheduler.add_job(_check_due_reminders, "interval", seconds=60)
+        scheduler.start()
+        print("Reminder scheduler started (60s interval)")
+    except ImportError:
+        print("WARNING: apscheduler not installed — reminders will not fire automatically")
+    except Exception as e:
+        print(f"WARNING: Failed to start reminder scheduler: {e}")
+
 
 # ─────────────────────────────────────────────
-# Embedding
+# Reminder & Event helpers
 # ─────────────────────────────────────────────
+
+def _parse_iso_to_utc(iso_str: str) -> datetime.datetime:
+    """Parse ISO datetime. Naive = America/Los_Angeles. Returns UTC."""
+    iso_str = iso_str.strip().replace("Z", "+00:00")
+    dt = datetime.datetime.fromisoformat(iso_str)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=LA_TZ)
+    return dt.astimezone(UTC_TZ)
+
+def _fmt_la(dt_val: datetime.datetime) -> str:
+    """Format datetime for display in LA time."""
+    if dt_val.tzinfo is None:
+        dt_val = dt_val.replace(tzinfo=UTC_TZ)
+    return dt_val.astimezone(LA_TZ).strftime("%Y-%m-%d %H:%M %Z")
+
+async def _get_user_contact(uid: int) -> dict:
+    """Find user's email + phone from user_contacts table, fallback to Odoo."""
+    email = phone = None
+    conn = await get_db_conn()
+    if conn:
+        try:
+            row = await conn.fetchrow("SELECT email, phone FROM user_contacts WHERE uid=$1", uid)
+            if row:
+                email = row["email"] or None
+                phone = row["phone"] or None
+        except Exception as e:
+            print(f"get_user_contact DB error: {e}")
+        finally:
+            await conn.close()
+    if not email or not phone:
+        try:
+            users_r = json.loads(await odoo_query("res.users", [["id","=",uid]],
+                                                   ["login","email","partner_id"], limit=1))
+            if isinstance(users_r, list) and users_r:
+                u = users_r[0]
+                if not email:
+                    email = u.get("email") or u.get("login")
+                if not phone and u.get("partner_id"):
+                    pid = u["partner_id"][0]
+                    partners_r = json.loads(await odoo_query("res.partner", [["id","=",pid]],
+                                                             ["phone","mobile"], limit=1))
+                    if isinstance(partners_r, list) and partners_r:
+                        p = partners_r[0]
+                        phone = p.get("mobile") or p.get("phone") or None
+        except Exception as e:
+            print(f"get_user_contact Odoo error: {e}")
+    return {"email": email, "phone": phone}
+
+async def _send_email(to_email: str, subject: str, body_text: str) -> tuple:
+    """Send email via SendGrid."""
+    if not SENDGRID_API_KEY:
+        return False, "SENDGRID_API_KEY not configured"
+    if not to_email:
+        return False, "no recipient email"
+    body_html = f"<pre style='font-family:system-ui,sans-serif;font-size:15px;white-space:pre-wrap'>{body_text}</pre>"
+    payload = {
+        "personalizations": [{"to": [{"email": to_email}]}],
+        "from": {"email": SENDGRID_FROM, "name": SENDGRID_FROM_NAME},
+        "subject": subject,
+        "content": [{"type": "text/plain", "value": body_text}, {"type": "text/html", "value": body_html}],
+    }
+    try:
+        async with httpx.AsyncClient(timeout=15) as c:
+            r = await c.post("https://api.sendgrid.com/v3/mail/send",
+                headers={"Authorization": f"Bearer {SENDGRID_API_KEY}", "Content-Type": "application/json"},
+                json=payload)
+        return (True, None) if r.status_code in (200, 202) else (False, f"SendGrid {r.status_code}: {r.text[:200]}")
+    except Exception as e:
+        return False, f"SendGrid exception: {e}"
+
+async def _send_sms(to_phone: str, body: str) -> tuple:
+    """Send SMS via Twilio."""
+    if not (TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN and TWILIO_FROM_NUMBER):
+        return False, "Twilio not configured"
+    if not to_phone:
+        return False, "no recipient phone"
+    try:
+        async with httpx.AsyncClient(timeout=15,
+            auth=(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)) as c:
+            r = await c.post(
+                f"https://api.twilio.com/2010-04-01/Accounts/{TWILIO_ACCOUNT_SID}/Messages.json",
+                data={"From": TWILIO_FROM_NUMBER, "To": to_phone, "Body": body[:1000]})
+        return (True, None) if r.status_code in (200, 201) else (False, f"Twilio SMS {r.status_code}: {r.text[:200]}")
+    except Exception as e:
+        return False, f"Twilio SMS exception: {e}"
+
+async def _send_voice_call(to_phone: str, message: str) -> tuple:
+    """Place Twilio voice call that reads message aloud, repeats once."""
+    if not (TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN and TWILIO_FROM_NUMBER):
+        return False, "Twilio not configured"
+    if not to_phone:
+        return False, "no recipient phone"
+    safe = (message.replace("&","&amp;").replace("<","&lt;").replace(">","&gt;")
+            .replace('"',"&quot;").replace("'","&apos;"))
+    has_cjk = any('\u4e00' <= ch <= '\u9fff' for ch in message)
+    voice = "Polly.Zhiyu" if has_cjk else "Polly.Joanna"
+    lang  = "cmn-CN" if has_cjk else "en-US"
+    twiml = (f'<Response><Pause length="1"/>'
+             f'<Say voice="{voice}" language="{lang}">{safe}</Say>'
+             f'<Pause length="1"/>'
+             f'<Say voice="{voice}" language="{lang}">{safe}</Say></Response>')
+    try:
+        async with httpx.AsyncClient(timeout=15,
+            auth=(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)) as c:
+            r = await c.post(
+                f"https://api.twilio.com/2010-04-01/Accounts/{TWILIO_ACCOUNT_SID}/Calls.json",
+                data={"From": TWILIO_FROM_NUMBER, "To": to_phone, "Twiml": twiml})
+        return (True, None) if r.status_code in (200, 201) else (False, f"Twilio Call {r.status_code}: {r.text[:200]}")
+    except Exception as e:
+        return False, f"Twilio Call exception: {e}"
+
+async def _check_due_reminders():
+    """Called every 60s by APScheduler. Fires due reminders."""
+    conn = await get_db_conn()
+    if not conn:
+        return
+    try:
+        now_utc = datetime.datetime.now(UTC_TZ)
+        rows = await conn.fetch("""
+            SELECT id, uid, user_name, content, fire_at, channels,
+                   target_email, target_phone
+            FROM reminders WHERE fired = FALSE AND fire_at <= $1
+            ORDER BY fire_at LIMIT 50
+        """, now_utc)
+        if not rows:
+            return
+        print(f"[REMINDER] {len(rows)} due reminder(s)")
+        for r in rows:
+            content = r["content"]
+            channels = list(r["channels"] or ["email"])
+            email, phone = r["target_email"], r["target_phone"]
+            if (not email and "email" in channels) or \
+               (not phone and ("sms" in channels or "call" in channels)):
+                contact = await _get_user_contact(r["uid"])
+                email = email or contact["email"]
+                phone = phone or contact["phone"]
+            errors = []
+            if "email" in channels:
+                ok, err = await _send_email(email, "⏰ 提醒 / Reminder",
+                    f"Chumart AI Reminder\n\n📌 {content}\n\nScheduled: {_fmt_la(r['fire_at'])}")
+                if not ok: errors.append(f"email:{err}")
+            if "sms" in channels:
+                ok, err = await _send_sms(phone, f"⏰ Chumart AI: {content}")
+                if not ok: errors.append(f"sms:{err}")
+            if "call" in channels:
+                has_cjk = any('\u4e00' <= ch <= '\u9fff' for ch in content)
+                msg = f"你好,这是 Chumart AI 的提醒。{content}" if has_cjk else f"Hello, Chumart AI reminder. {content}"
+                ok, err = await _send_voice_call(phone, msg)
+                if not ok: errors.append(f"call:{err}")
+            print(f"[REMINDER] id={r['id']} fired, errors={errors or 'none'}")
+            await conn.execute("UPDATE reminders SET fired=TRUE, fired_at=NOW(), error=$1 WHERE id=$2",
+                ("; ".join(errors) if errors else None), r["id"])
+    except Exception as e:
+        print(f"check_due_reminders error: {e}")
+    finally:
+        await conn.close()
 
 # ─────────────────────────────────────────────
 # Embedding
@@ -1577,6 +1807,87 @@ TOOLS = [
                 "days_back": {"type": "integer", "default": 30, "description": "Number of days of outgoing history to analyze (default 30)"},
                 "brand_filter": {"type": "string", "default": "", "description": "Optional: filter to a specific brand name (e.g. 'Polarman', 'Flamaster'). Empty = all brands."},
                 "urgency_filter": {"type": "string", "default": "", "enum": ["", "out_of_stock", "urgent", "reorder", "ok", "no_movement"], "description": "Optional: filter results to a specific urgency level only"}
+            },
+            "required": []
+        }
+    },
+    {
+        "name": "create_reminder",
+        "description": "Schedule a reminder that notifies the user via email/SMS/voice call at a specified time. Use when user says '提醒我...', 'remind me...', '下个月X号提醒我'. fire_at must be ISO datetime (naive = LA time). Default channel is email. Add 'sms' for text, 'call' for phone call.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "content": {"type": "string", "description": "What to remind about"},
+                "fire_at": {"type": "string", "description": "When to fire, ISO format like '2026-05-24T09:00:00'. Naive = LA time. If user only gives date, default time to 09:00."},
+                "channels": {"type": "array", "items": {"type": "string", "enum": ["email", "sms", "call"]}, "description": "Notification channels. Default ['email']. Add 'sms' if user says '短信', 'call' if user says '打电话'/'重要'."}
+            },
+            "required": ["content", "fire_at"]
+        }
+    },
+    {
+        "name": "list_reminders",
+        "description": "List the user's scheduled reminders. Use when user asks 'what reminders do I have' / '我有什么提醒'.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "include_fired": {"type": "boolean", "default": False, "description": "If true, include past fired reminders too."}
+            },
+            "required": []
+        }
+    },
+    {
+        "name": "cancel_reminder",
+        "description": "Cancel a pending reminder by id. Get id from list_reminders first.",
+        "input_schema": {
+            "type": "object",
+            "properties": {"id": {"type": "integer"}},
+            "required": ["id"]
+        }
+    },
+    {
+        "name": "create_event",
+        "description": "Record a calendar event/行程. Use when user says '帮我记一下下周三开会', 'I have a meeting on Friday'. This does NOT send a reminder — call create_reminder separately if user wants notification.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "title": {"type": "string"},
+                "start_at": {"type": "string", "description": "ISO datetime, naive = LA time"},
+                "end_at": {"type": "string", "description": "Optional end time"},
+                "notes": {"type": "string"},
+                "location": {"type": "string"}
+            },
+            "required": ["title", "start_at"]
+        }
+    },
+    {
+        "name": "list_events",
+        "description": "List user's calendar events in a date range. Use when user asks '我明天有什么安排', 'what's on my schedule'. Defaults to next 30 days.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "date_from": {"type": "string", "description": "ISO date, start of range"},
+                "date_to": {"type": "string", "description": "ISO date, end of range"}
+            },
+            "required": []
+        }
+    },
+    {
+        "name": "delete_event",
+        "description": "Delete a calendar event by id. Get id from list_events first.",
+        "input_schema": {
+            "type": "object",
+            "properties": {"id": {"type": "integer"}},
+            "required": ["id"]
+        }
+    },
+    {
+        "name": "set_my_contact",
+        "description": "Save user's preferred email or phone for receiving reminders. Phone must be E.164 format (e.g. +13105551234). Falls back to Odoo login email and partner mobile if not set.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "email": {"type": "string"},
+                "phone": {"type": "string", "description": "E.164 format, e.g. +13105551234"}
             },
             "required": []
         }
@@ -4623,6 +4934,188 @@ async def run_tool(name, inp, context=None):
             return f"Search error: {e}"
         finally:
             await conn.close()
+    if name == "create_reminder":
+        content = (inp.get("content") or "").strip()
+        fire_at_str = (inp.get("fire_at") or "").strip()
+        channels = inp.get("channels") or ["email"]
+        if isinstance(channels, str):
+            channels = [channels]
+        channels = [c for c in channels if c in ("email", "sms", "call")]
+        if not channels:
+            channels = ["email"]
+        if not content:
+            return json.dumps({"error": "content is required"})
+        if not fire_at_str:
+            return json.dumps({"error": "fire_at is required (ISO datetime)"})
+        try:
+            fire_at_utc = _parse_iso_to_utc(fire_at_str)
+        except Exception as e:
+            return json.dumps({"error": f"could not parse fire_at: {e}"})
+        now_utc = datetime.datetime.now(UTC_TZ)
+        if fire_at_utc <= now_utc:
+            return json.dumps({"error": f"fire_at ({_fmt_la(fire_at_utc)}) is in the past"})
+        uid = ctx.get("uid", 0)
+        if not uid:
+            return json.dumps({"error": "user not authenticated"})
+        contact = await _get_user_contact(uid)
+        missing = []
+        if "email" in channels and not contact["email"]:
+            missing.append("email")
+        if ("sms" in channels or "call" in channels) and not contact["phone"]:
+            missing.append("phone (set via set_my_contact or Odoo partner mobile)")
+        if missing:
+            return json.dumps({"error": f"missing contact info: {', '.join(missing)}"})
+        conn = await get_db_conn()
+        if not conn:
+            return json.dumps({"error": "database unavailable"})
+        try:
+            row = await conn.fetchrow("""
+                INSERT INTO reminders (uid, user_name, content, fire_at, channels, target_email, target_phone)
+                VALUES ($1, $2, $3, $4, $5::TEXT[], $6, $7) RETURNING id, fire_at
+            """, uid, ctx.get("username", ""), content, fire_at_utc, channels, contact["email"], contact["phone"])
+            return json.dumps({"ok": True, "id": row["id"], "content": content,
+                "fire_at_la": _fmt_la(row["fire_at"]), "channels": channels,
+                "message": f"Reminder set for {_fmt_la(row['fire_at'])}: {content}"}, ensure_ascii=False)
+        finally:
+            await conn.close()
+
+    if name == "list_reminders":
+        uid = ctx.get("uid", 0)
+        if not uid:
+            return json.dumps({"error": "user not authenticated"})
+        include_fired = bool(inp.get("include_fired", False))
+        conn = await get_db_conn()
+        if not conn:
+            return json.dumps({"error": "database unavailable"})
+        try:
+            if include_fired:
+                rows = await conn.fetch("SELECT id, content, fire_at, channels, fired, fired_at, error FROM reminders WHERE uid=$1 ORDER BY fire_at DESC LIMIT 50", uid)
+            else:
+                rows = await conn.fetch("SELECT id, content, fire_at, channels, fired, fired_at, error FROM reminders WHERE uid=$1 AND fired=FALSE ORDER BY fire_at ASC", uid)
+            out = [{"id": r["id"], "content": r["content"], "fire_at_la": _fmt_la(r["fire_at"]),
+                    "channels": list(r["channels"] or []), "fired": r["fired"],
+                    "fired_at_la": _fmt_la(r["fired_at"]) if r["fired_at"] else None,
+                    "error": r["error"]} for r in rows]
+            return json.dumps({"count": len(out), "reminders": out}, ensure_ascii=False)
+        finally:
+            await conn.close()
+
+    if name == "cancel_reminder":
+        uid = ctx.get("uid", 0)
+        rid = inp.get("id")
+        if not uid:
+            return json.dumps({"error": "user not authenticated"})
+        if not rid:
+            return json.dumps({"error": "id is required"})
+        conn = await get_db_conn()
+        if not conn:
+            return json.dumps({"error": "database unavailable"})
+        try:
+            result = await conn.execute("DELETE FROM reminders WHERE id=$1 AND uid=$2 AND fired=FALSE", rid, uid)
+            if result.endswith(" 1"):
+                return json.dumps({"ok": True, "deleted_id": rid})
+            return json.dumps({"error": f"reminder {rid} not found or already fired"})
+        finally:
+            await conn.close()
+
+    if name == "create_event":
+        uid = ctx.get("uid", 0)
+        if not uid:
+            return json.dumps({"error": "user not authenticated"})
+        title = (inp.get("title") or "").strip()
+        if not title:
+            return json.dumps({"error": "title is required"})
+        start_str = inp.get("start_at")
+        if not start_str:
+            return json.dumps({"error": "start_at is required"})
+        try:
+            start_utc = _parse_iso_to_utc(start_str)
+        except Exception as e:
+            return json.dumps({"error": f"could not parse start_at: {e}"})
+        end_utc = None
+        if inp.get("end_at"):
+            try:
+                end_utc = _parse_iso_to_utc(inp["end_at"])
+            except Exception:
+                pass
+        conn = await get_db_conn()
+        if not conn:
+            return json.dumps({"error": "database unavailable"})
+        try:
+            row = await conn.fetchrow("""
+                INSERT INTO events (uid, user_name, title, notes, location, start_at, end_at)
+                VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id, start_at, end_at
+            """, uid, ctx.get("username", ""), title, inp.get("notes", ""), inp.get("location", ""), start_utc, end_utc)
+            return json.dumps({"ok": True, "id": row["id"], "title": title,
+                "start_at_la": _fmt_la(row["start_at"]),
+                "end_at_la": _fmt_la(row["end_at"]) if row["end_at"] else None,
+                "message": f"Event: {title} @ {_fmt_la(row['start_at'])}"}, ensure_ascii=False)
+        finally:
+            await conn.close()
+
+    if name == "list_events":
+        uid = ctx.get("uid", 0)
+        if not uid:
+            return json.dumps({"error": "user not authenticated"})
+        try:
+            start = _parse_iso_to_utc(inp["date_from"]) if inp.get("date_from") else datetime.datetime.now(UTC_TZ) - datetime.timedelta(hours=1)
+            end = _parse_iso_to_utc(inp["date_to"]) if inp.get("date_to") else datetime.datetime.now(UTC_TZ) + datetime.timedelta(days=30)
+        except Exception as e:
+            return json.dumps({"error": f"date parse error: {e}"})
+        conn = await get_db_conn()
+        if not conn:
+            return json.dumps({"error": "database unavailable"})
+        try:
+            rows = await conn.fetch("SELECT id, title, notes, location, start_at, end_at FROM events WHERE uid=$1 AND start_at >= $2 AND start_at <= $3 ORDER BY start_at ASC", uid, start, end)
+            out = [{"id": r["id"], "title": r["title"], "start_at_la": _fmt_la(r["start_at"]),
+                    "end_at_la": _fmt_la(r["end_at"]) if r["end_at"] else None,
+                    "notes": r["notes"], "location": r["location"]} for r in rows]
+            return json.dumps({"count": len(out), "events": out}, ensure_ascii=False)
+        finally:
+            await conn.close()
+
+    if name == "delete_event":
+        uid = ctx.get("uid", 0)
+        eid = inp.get("id")
+        if not uid:
+            return json.dumps({"error": "user not authenticated"})
+        if not eid:
+            return json.dumps({"error": "id is required"})
+        conn = await get_db_conn()
+        if not conn:
+            return json.dumps({"error": "database unavailable"})
+        try:
+            result = await conn.execute("DELETE FROM events WHERE id=$1 AND uid=$2", eid, uid)
+            if result.endswith(" 1"):
+                return json.dumps({"ok": True, "deleted_id": eid})
+            return json.dumps({"error": f"event {eid} not found"})
+        finally:
+            await conn.close()
+
+    if name == "set_my_contact":
+        uid = ctx.get("uid", 0)
+        if not uid:
+            return json.dumps({"error": "user not authenticated"})
+        email = (inp.get("email") or "").strip() or None
+        phone = (inp.get("phone") or "").strip() or None
+        if not email and not phone:
+            return json.dumps({"error": "provide at least one of: email, phone"})
+        if phone and not phone.startswith("+"):
+            return json.dumps({"error": "phone must be E.164 format starting with +, e.g. +13105551234"})
+        conn = await get_db_conn()
+        if not conn:
+            return json.dumps({"error": "database unavailable"})
+        try:
+            await conn.execute("""
+                INSERT INTO user_contacts (uid, email, phone, updated_at) VALUES ($1, $2, $3, NOW())
+                ON CONFLICT (uid) DO UPDATE SET
+                    email = COALESCE(EXCLUDED.email, user_contacts.email),
+                    phone = COALESCE(EXCLUDED.phone, user_contacts.phone), updated_at = NOW()
+            """, uid, email, phone)
+            return json.dumps({"ok": True, "email": email, "phone": phone, "message": "Contact preferences saved."})
+        finally:
+            await conn.close()
+
     return "Unknown tool"
 
 # ─────────────────────────────────────────────
