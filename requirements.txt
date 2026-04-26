@@ -8,3 +8,4 @@ asyncpg
 openpyxl
 boto3
 python-docx
+apscheduler
