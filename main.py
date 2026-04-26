@@ -6077,6 +6077,135 @@ async def get_signed_url(doc_id: str, download: bool = True):
 async def invoice_stats(year: int, month: int):
     return await monthly_tax(year, month)
 
+
+# ─────────────────────────────────────────────
+# Odoo Discuss Bot endpoint
+# ─────────────────────────────────────────────
+
+class OdooBotRequest(BaseModel):
+    uid: int                    # Odoo user ID who sent the message
+    message: str                # The message text
+    channel_id: int = 0         # Discuss channel ID (for reply routing)
+    author_name: str = ""       # Display name of the sender
+    bot_secret: str = ""        # Shared secret to authenticate Odoo → Railway
+
+# In-memory conversation history per Odoo user (last 10 turns)
+ODOO_BOT_HISTORY: dict = {}  # uid -> list of {role, content}
+ODOO_BOT_MAX_HISTORY = 20    # messages (10 turns)
+
+@app.post("/odoo-bot/chat")
+async def odoo_bot_chat(req: OdooBotRequest):
+    """Endpoint for Odoo Discuss Bot module.
+    Odoo custom module POSTs here when a user messages the bot.
+    Returns the AI reply as JSON {reply: "..."}.
+    """
+    # Authenticate: shared secret between Odoo module and Railway
+    expected_secret = os.getenv("ODOO_BOT_SECRET", "")
+    if expected_secret and req.bot_secret != expected_secret:
+        return {"error": "Invalid bot_secret"}
+
+    if not req.message.strip():
+        return {"reply": "请输入您的问题。"}
+
+    uid = req.uid
+    author = req.author_name or f"User#{uid}"
+    print(f"[ODOO-BOT] uid={uid} name={author} msg={req.message[:100]}")
+
+    # Get user role from Odoo groups
+    role = await get_user_role(uid)
+    perms = ROLE_PERMISSIONS.get(role, ROLE_PERMISSIONS["guest"])
+    print(f"[ODOO-BOT] uid={uid} role={role}")
+
+    # Filter tools by permission (same logic as /chat)
+    allowed_tools = []
+    finance_tools = {"get_monthly_tax", "get_quarterly_tax", "get_monthly_sales", "get_missing_tax", "odoo_match_payment_to_customer"}
+    write_tools = {"odoo_create_record", "odoo_add_order_line", "odoo_confirm_order", "odoo_update_record", "odoo_update_vendor_price"}
+    cost_tools = {"odoo_find_recent_purchases_by_skus", "odoo_get_product_vendors", "odoo_create_bulk_po", "get_po_with_so_links", "odoo_restock_analysis"}
+    for tool in TOOLS:
+        tname = tool["name"]
+        if tname in finance_tools and not perms.get("can_see_finance"):
+            continue
+        if tname in write_tools and not perms.get("can_write_odoo"):
+            continue
+        if tname in cost_tools and not perms.get("can_see_cost"):
+            continue
+        allowed_tools.append(tool)
+
+    # Build conversation history
+    if uid not in ODOO_BOT_HISTORY:
+        ODOO_BOT_HISTORY[uid] = []
+    conv = ODOO_BOT_HISTORY[uid]
+    conv.append({"role": "user", "content": req.message})
+    # Trim to last N messages
+    if len(conv) > ODOO_BOT_MAX_HISTORY:
+        conv = conv[-ODOO_BOT_MAX_HISTORY:]
+        ODOO_BOT_HISTORY[uid] = conv
+
+    # Load user memory
+    memories = await db_get_memory(uid)
+
+    # Build system prompt
+    system_prompt = get_system_prompt(role, author, uid, False, memories)
+
+    # Call Claude (non-streaming, since Odoo expects a single reply)
+    tool_context = {"uid": uid, "username": author, "role": role}
+    headers = {"x-api-key": ANTHROPIC_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json"}
+
+    try:
+        async with httpx.AsyncClient(timeout=300) as c:
+            current_messages = list(conv)
+            for _ in range(8):  # max tool iterations
+                r = await c.post("https://api.anthropic.com/v1/messages", headers=headers, json={
+                    "model": "claude-sonnet-4-5",
+                    "max_tokens": 4096,
+                    "system": system_prompt,
+                    "tools": allowed_tools,
+                    "messages": current_messages
+                })
+                d = r.json()
+                if "error" in d:
+                    print(f"[ODOO-BOT] API error: {d['error']}")
+                    return {"reply": f"AI 错误: {d['error'].get('message', str(d['error']))}"}
+
+                if d.get("stop_reason") == "tool_use":
+                    tool_results = []
+                    for block in d.get("content", []):
+                        if block.get("type") == "tool_use":
+                            print(f"[ODOO-BOT] tool: {block['name']}")
+                            result = await run_tool(block["name"], block.get("input", {}), context=tool_context)
+                            tool_results.append({"type": "tool_result", "tool_use_id": block["id"], "content": result})
+                    current_messages.append({"role": "assistant", "content": d["content"]})
+                    current_messages.append({"role": "user", "content": tool_results})
+                else:
+                    break
+
+            reply = "".join(b.get("text", "") for b in d.get("content", []) if b.get("type") == "text")
+    except Exception as e:
+        print(f"[ODOO-BOT] exception: {e}")
+        reply = f"AI 请求失败: {str(e)}"
+
+    if not reply:
+        reply = "抱歉，没有生成回复。"
+
+    # Save to history
+    conv.append({"role": "assistant", "content": reply})
+    if len(conv) > ODOO_BOT_MAX_HISTORY:
+        ODOO_BOT_HISTORY[uid] = conv[-ODOO_BOT_MAX_HISTORY:]
+
+    print(f"[ODOO-BOT] reply to uid={uid}: {reply[:100]}...")
+    return {"reply": reply}
+
+@app.post("/odoo-bot/reset")
+async def odoo_bot_reset(uid: int = 0, bot_secret: str = ""):
+    """Reset conversation history for an Odoo bot user."""
+    expected_secret = os.getenv("ODOO_BOT_SECRET", "")
+    if expected_secret and bot_secret != expected_secret:
+        return {"error": "Invalid bot_secret"}
+    if uid in ODOO_BOT_HISTORY:
+        del ODOO_BOT_HISTORY[uid]
+    return {"status": "reset", "uid": uid}
+
+
 @app.get("/health")
 async def health():
     conn = await get_db_conn()
