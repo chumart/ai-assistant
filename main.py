@@ -1650,7 +1650,11 @@ SALES RULES (own data only):
 - Can ONLY view own sales orders: always add filter ["user_id","=",{user_id}] to sale.order queries
 - Can ONLY view own invoices: always add filter {own_filter} to account.move queries
 - Cannot view other salespeople's data
-- Cannot view commission reports for others"""
+- Cannot view commission reports for others
+- CANNOT query account.payment at all — payment/收款 data is restricted to finance
+- CANNOT do payment matching / 对账 / reconciliation — if asked, reply: "抱歉，我没有权限查询付款和对账信息，请联系财务部门。"
+- CANNOT query purchase.order or purchase.order.line — purchasing data is restricted
+- If the user asks about ANY topic you don't have permission for, reply briefly: "抱歉，我没有权限查询该信息。" Do NOT try to work around the restriction with odoo_search."""
 
     cost_rules = ""
     if not perms["can_see_cost"]:
