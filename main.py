@@ -6147,17 +6147,19 @@ async def odoo_bot_chat(req: OdooBotRequest):
     # Build system prompt
     system_prompt = get_system_prompt(role, author, uid, False, memories)
 
-    # Call Claude (non-streaming, since Odoo expects a single reply)
+    # Call Claude — use Haiku for speed (Discuss needs fast replies, not long essays)
+    # Sonnet takes 8-15s per turn; Haiku takes 2-4s.
     tool_context = {"uid": uid, "username": author, "role": role}
     headers = {"x-api-key": ANTHROPIC_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json"}
+    bot_model = "claude-haiku-4-5-20251001"
 
     try:
         async with httpx.AsyncClient(timeout=300) as c:
             current_messages = list(conv)
             for _ in range(8):  # max tool iterations
                 r = await c.post("https://api.anthropic.com/v1/messages", headers=headers, json={
-                    "model": "claude-sonnet-4-5",
-                    "max_tokens": 4096,
+                    "model": bot_model,
+                    "max_tokens": 2048,
                     "system": system_prompt,
                     "tools": allowed_tools,
                     "messages": current_messages
