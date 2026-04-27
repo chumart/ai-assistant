@@ -7548,11 +7548,15 @@ async def stripe_webhook(request: Request):
     print(f"[STRIPE] Event: {event_type}")
 
     if event_type in ("payment_intent.amount_capturable_updated", "payment_intent.requires_capture"):
-        # Stripe returns StripeObject which doesn't support .get() — convert to dict
-        pi = dict(event["data"]["object"])
+        # StripeObject → plain dict (不能用 dict()，要用 stripe 自带的序列化)
+        pi_obj = event["data"]["object"]
+        try:
+            pi = json.loads(json.dumps(pi_obj, default=str))
+        except Exception:
+            pi = {k: pi_obj[k] for k in pi_obj}
         pi_id = pi.get("id", "")
-        amount_capturable = pi.get("amount_capturable", 0)
-        amount = pi.get("amount", 0) / 100.0
+        amount_capturable = pi.get("amount_capturable", 0) or 0
+        amount = (pi.get("amount", 0) or 0) / 100.0
 
         # 只在有钱可 capture 时处理（amount_capturable > 0）
         if amount_capturable == 0:
@@ -7561,26 +7565,14 @@ async def stripe_webhook(request: Request):
 
         # --- 从 Odoo 生成的 PaymentIntent 提取信息 ---
         so_ref = (pi.get("description") or "").strip()
-        # charges 可能也是 StripeObject，安全取值
-        charges_data = pi.get("charges", {})
-        if hasattr(charges_data, "data"):
-            charges_list = charges_data.data
-        elif isinstance(charges_data, dict):
-            charges_list = charges_data.get("data", [])
-        else:
-            charges_list = []
-        first_charge = dict(charges_list[0]) if charges_list else {}
-        billing = first_charge.get("billing_details", {})
-        if hasattr(billing, "get"):
-            customer_name = (billing.get("name") or "").strip()
-        else:
-            customer_name = str(getattr(billing, "name", "") or "").strip()
+        charges_data = pi.get("charges") or {}
+        charges_list = charges_data.get("data", []) if isinstance(charges_data, dict) else []
+        first_charge = charges_list[0] if charges_list else {}
+        billing = first_charge.get("billing_details", {}) if isinstance(first_charge, dict) else {}
+        customer_name = (billing.get("name") or "").strip() if isinstance(billing, dict) else ""
         if not customer_name:
-            shipping = pi.get("shipping", {}) or {}
-            if hasattr(shipping, "get"):
-                customer_name = (shipping.get("name") or "").strip()
-            else:
-                customer_name = str(getattr(shipping, "name", "") or "").strip()
+            shipping = pi.get("shipping") or {}
+            customer_name = (shipping.get("name") or "").strip() if isinstance(shipping, dict) else ""
         customer_email = pi.get("receipt_email", "") or ""
 
         print(f"[STRIPE] capturable: pi={pi_id}, ${amount}, capturable=${amount_capturable/100.0}, SO={so_ref}, customer={customer_name}")
