@@ -3404,6 +3404,8 @@ async def run_tool(name, inp, context=None):
 
         main = prod_r[0]
         print(f"[RELATED_PARTS] resolved main: id={main['id']}, sku={main.get('default_code')}")
+        print(f"[RELATED_PARTS] full main record keys: {list(main.keys())}")
+        print(f"[RELATED_PARTS] full main record: {json.dumps(main, default=str)[:500]}")
 
         # Step 2: x_studio_related_parts may exist on product.product OR product.template
         # Try product.product first (where Studio shows it)
@@ -3421,6 +3423,7 @@ async def run_tool(name, inp, context=None):
                         [["id", "=", tmpl_id]],
                         ["id", "x_studio_related_parts"],
                         limit=1, cookies=cookies))
+                    print(f"[RELATED_PARTS] template raw: {json.dumps(tmpl_r, default=str)[:500]}")
                     if isinstance(tmpl_r, list) and tmpl_r:
                         tmpl_ids = tmpl_r[0].get("x_studio_related_parts") or []
                         if tmpl_ids and tmpl_ids is not False:
@@ -3428,6 +3431,51 @@ async def run_tool(name, inp, context=None):
                             print(f"[RELATED_PARTS] from product.template: {len(related_tmpl_ids)} template id(s) = {related_tmpl_ids[:10]}")
                 except Exception as e:
                     print(f"[RELATED_PARTS] template fallback error (non-fatal): {e}")
+
+        # Last-resort debug: dump all x_studio_* fields on the record
+        if not related_tmpl_ids:
+            try:
+                async with httpx.AsyncClient(timeout=15, follow_redirects=True) as c:
+                    fg_r = await c.post(f"{ODOO_URL}/web/dataset/call_kw", json={
+                        "jsonrpc": "2.0", "method": "call", "id": 1,
+                        "params": {
+                            "model": "product.product",
+                            "method": "fields_get",
+                            "args": [],
+                            "kwargs": {"attributes": ["string", "type", "relation"]}
+                        }
+                    }, cookies=cookies)
+                    fields_data = fg_r.json().get("result", {})
+                    studio_fields = {k: v for k, v in fields_data.items() if k.startswith("x_studio")}
+                    print(f"[RELATED_PARTS] DEBUG: all x_studio_* fields on product.product: {list(studio_fields.keys())}")
+                    for fk, fv in studio_fields.items():
+                        print(f"[RELATED_PARTS]   {fk} = {fv}")
+
+                    # Try reading the record with ALL studio fields explicitly
+                    if studio_fields:
+                        all_studio_keys = list(studio_fields.keys())
+                        raw_r = await c.post(f"{ODOO_URL}/web/dataset/call_kw", json={
+                            "jsonrpc": "2.0", "method": "call", "id": 2,
+                            "params": {
+                                "model": "product.product",
+                                "method": "read",
+                                "args": [[main["id"]], all_studio_keys],
+                                "kwargs": {}
+                            }
+                        }, cookies=cookies)
+                        raw_data = raw_r.json().get("result", [])
+                        if raw_data:
+                            print(f"[RELATED_PARTS] DEBUG: raw studio fields on record {main['id']}: {json.dumps(raw_data[0], default=str)[:800]}")
+                            # Try every studio many2many for our part
+                            for fk, fv in studio_fields.items():
+                                if fv.get("type") == "many2many":
+                                    val = raw_data[0].get(fk)
+                                    if val and isinstance(val, list):
+                                        print(f"[RELATED_PARTS]   ↳ {fk} has {len(val)} value(s) — trying these as related parts")
+                                        related_tmpl_ids = val
+                                        break
+            except Exception as e:
+                print(f"[RELATED_PARTS] debug dump error (non-fatal): {e}")
 
         if not related_tmpl_ids:
             return json.dumps({
