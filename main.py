@@ -7547,10 +7547,16 @@ async def stripe_webhook(request: Request):
     event_type = event["type"]
     print(f"[STRIPE] Event: {event_type}")
 
-    if event_type == "payment_intent.requires_capture":
+    if event_type in ("payment_intent.amount_capturable_updated", "payment_intent.requires_capture"):
         pi = event["data"]["object"]
         pi_id = pi["id"]
+        amount_capturable = pi.get("amount_capturable", 0)
         amount = pi["amount"] / 100.0
+
+        # 只在有钱可 capture 时处理（amount_capturable > 0）
+        if amount_capturable == 0:
+            print(f"[STRIPE] amount_capturable=0 for {pi_id}, skipping (already captured or cancelled)")
+            return {"status": "skipped_no_capturable_amount"}
 
         # --- 从 Odoo 生成的 PaymentIntent 提取信息 ---
         so_ref = (pi.get("description") or "").strip()
@@ -7560,7 +7566,7 @@ async def stripe_webhook(request: Request):
             customer_name = pi.get("shipping", {}).get("name", "")
         customer_email = pi.get("receipt_email", "")
 
-        print(f"[STRIPE] requires_capture: pi={pi_id}, ${amount}, SO={so_ref}, customer={customer_name}")
+        print(f"[STRIPE] capturable: pi={pi_id}, ${amount}, capturable=${amount_capturable/100.0}, SO={so_ref}, customer={customer_name}")
 
         try:
             # ============================================
