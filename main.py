@@ -2411,7 +2411,7 @@ PASS 2 (fallback — looser): odoo_search WITHOUT supplier_rank filter,
 
 If BOTH passes return 0 results:
   Tell user "供应商不存在 / Vendor not found in Odoo".
-  Offer to create a new vendor (use odoo_create_record with model="res.partner", values={"name": "...", "supplier_rank": 1}).
+  Offer to create a new vendor (use odoo_create_record with model="res.partner", values containing name and supplier_rank=1).
   Wait for user confirmation before creating.
 
 STEP 3 — Show grouped PO plan:
@@ -2439,7 +2439,7 @@ STEP 4 — Execute only after confirmation:
 UPDATING EXISTING PO FIELDS (Vendor Reference, expected date, etc.):
   When user asks to update an existing PO field like "把 P00466 的 vendor reference 改成 M66-003SP/2026":
   1. Confirm what change to make
-  2. Call odoo_update_record(model="purchase.order", record_id=<id>, values={"partner_ref": "M66-003SP/2026"})
+  2. Call odoo_update_record(model="purchase.order", record_id=<id>, values=dict with partner_ref="M66-003SP/2026")
   3. Verify by querying the PO again
   ⚠️ NEVER claim "已更新" if you didn't actually call odoo_update_record. The user can check Odoo directly — do not lie.
 
