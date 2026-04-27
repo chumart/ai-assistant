@@ -3404,8 +3404,6 @@ async def run_tool(name, inp, context=None):
 
         main = prod_r[0]
         print(f"[RELATED_PARTS] resolved main: id={main['id']}, sku={main.get('default_code')}")
-        print(f"[RELATED_PARTS] full main record keys: {list(main.keys())}")
-        print(f"[RELATED_PARTS] full main record: {json.dumps(main, default=str)[:500]}")
 
         # Step 2: x_studio_related_parts may exist on product.product OR product.template
         # Try product.product first (where Studio shows it)
@@ -3423,7 +3421,6 @@ async def run_tool(name, inp, context=None):
                         [["id", "=", tmpl_id]],
                         ["id", "x_studio_related_parts"],
                         limit=1, cookies=cookies))
-                    print(f"[RELATED_PARTS] template raw: {json.dumps(tmpl_r, default=str)[:500]}")
                     if isinstance(tmpl_r, list) and tmpl_r:
                         tmpl_ids = tmpl_r[0].get("x_studio_related_parts") or []
                         if tmpl_ids and tmpl_ids is not False:
@@ -3432,7 +3429,9 @@ async def run_tool(name, inp, context=None):
                 except Exception as e:
                     print(f"[RELATED_PARTS] template fallback error (non-fatal): {e}")
 
-        # Last-resort debug: dump all x_studio_* fields on the record
+        # Last-resort fallback: Studio sometimes creates duplicate fields with same label.
+        # If x_studio_related_parts is empty, look for any other m2m field that's actually
+        # populated (prioritized: name contains "related"/"parts"/"accessor" first, then by label).
         if not related_tmpl_ids:
             try:
                 async with httpx.AsyncClient(timeout=15, follow_redirects=True) as c:
@@ -3446,36 +3445,64 @@ async def run_tool(name, inp, context=None):
                         }
                     }, cookies=cookies)
                     fields_data = fg_r.json().get("result", {})
-                    studio_fields = {k: v for k, v in fields_data.items() if k.startswith("x_studio")}
-                    print(f"[RELATED_PARTS] DEBUG: all x_studio_* fields on product.product: {list(studio_fields.keys())}")
-                    for fk, fv in studio_fields.items():
-                        print(f"[RELATED_PARTS]   {fk} = {fv}")
-
-                    # Try reading the record with ALL studio fields explicitly
-                    if studio_fields:
-                        all_studio_keys = list(studio_fields.keys())
+                    studio_m2m = {
+                        k: v for k, v in fields_data.items()
+                        if k.startswith("x_studio")
+                        and v.get("type") == "many2many"
+                        and v.get("relation") == "product.template"
+                    }
+                    if studio_m2m:
+                        # Read all candidate fields' values
+                        keys_to_read = list(studio_m2m.keys())
                         raw_r = await c.post(f"{ODOO_URL}/web/dataset/call_kw", json={
                             "jsonrpc": "2.0", "method": "call", "id": 2,
                             "params": {
                                 "model": "product.product",
                                 "method": "read",
-                                "args": [[main["id"]], all_studio_keys],
+                                "args": [[main["id"]], keys_to_read],
                                 "kwargs": {}
                             }
                         }, cookies=cookies)
                         raw_data = raw_r.json().get("result", [])
                         if raw_data:
-                            print(f"[RELATED_PARTS] DEBUG: raw studio fields on record {main['id']}: {json.dumps(raw_data[0], default=str)[:800]}")
-                            # Try every studio many2many for our part
-                            for fk, fv in studio_fields.items():
-                                if fv.get("type") == "many2many":
-                                    val = raw_data[0].get(fk)
-                                    if val and isinstance(val, list):
-                                        print(f"[RELATED_PARTS]   ↳ {fk} has {len(val)} value(s) — trying these as related parts")
-                                        related_tmpl_ids = val
-                                        break
+                            rec = raw_data[0]
+
+                            # Score each candidate field — prefer fields whose label or name suggests "related parts"
+                            def _score(field_key, field_meta):
+                                name_lower = field_key.lower()
+                                label_lower = (field_meta.get("string") or "").lower()
+                                hay = name_lower + " " + label_lower
+                                score = 0
+                                for kw, pts in [
+                                    ("related part", 100),
+                                    ("related_part", 100),
+                                    ("relatedpart", 100),
+                                    ("related",   60),
+                                    ("part",      40),
+                                    ("accessor",  80),
+                                    ("配件",       80),
+                                    ("相关",       40),
+                                ]:
+                                    if kw in hay:
+                                        score += pts
+                                return score
+
+                            # Build sorted candidates: highest score first, populated fields only
+                            candidates = []
+                            for fk, fv in studio_m2m.items():
+                                val = rec.get(fk)
+                                if isinstance(val, list) and val:
+                                    candidates.append((_score(fk, fv), fk, fv, val))
+                            candidates.sort(key=lambda x: -x[0])
+
+                            if candidates:
+                                top_score, top_key, top_meta, top_val = candidates[0]
+                                print(f"[RELATED_PARTS] auto-detected field: {top_key} (score={top_score}, label='{top_meta.get('string')}', {len(top_val)} value(s))")
+                                related_tmpl_ids = top_val
+                            else:
+                                print(f"[RELATED_PARTS] no populated m2m→template field found among studio fields")
             except Exception as e:
-                print(f"[RELATED_PARTS] debug dump error (non-fatal): {e}")
+                print(f"[RELATED_PARTS] auto-detect fallback error (non-fatal): {e}")
 
         if not related_tmpl_ids:
             return json.dumps({
