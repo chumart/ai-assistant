@@ -72,6 +72,11 @@ ZELLE_BANK_SENDER       = os.getenv("ZELLE_BANK_SENDER", "")
 # PrintNode — cloud printing service
 PRINTNODE_API_KEY       = os.getenv("PRINTNODE_API_KEY", "")
 PRINTNODE_DEFAULT_PRINTER_ID = os.getenv("PRINTNODE_DEFAULT_PRINTER_ID", "")  # optional — default printer if AI doesn't specify
+# Hardcoded print defaults (Chumart standard):
+#   Letter size, grayscale (black & white), duplex on long-edge (book-style flip)
+PRINTNODE_DEFAULT_COLOR  = False        # Black & white only
+PRINTNODE_DEFAULT_PAPER  = "Letter"     # 8.5 x 11 inch
+PRINTNODE_DEFAULT_DUPLEX = "long-edge"  # Double-sided, book-style
 
 LA_TZ = ZoneInfo("America/Los_Angeles")
 UTC_TZ = datetime.timezone.utc
@@ -2031,6 +2036,7 @@ TOOLS = [
             "Print an invoice PDF on a physical printer via PrintNode. "
             "Use AFTER odoo_export_invoice_pdf has been called and we have an invoice_id. "
             "If printer_id is not provided, uses the default printer from env. "
+            "Options like color/paper/duplex use server defaults unless overridden in this call. "
             "Returns the print job id and status."
         ),
         "input_schema": {
@@ -2039,7 +2045,10 @@ TOOLS = [
                 "invoice_id": {"type": "integer", "description": "The account.move ID to print"},
                 "printer_id": {"type": "integer", "description": "Optional PrintNode printer ID. If omitted, uses default."},
                 "copies": {"type": "integer", "description": "Number of copies (default 1)"},
-                "title": {"type": "string", "description": "Optional title for the print job (shown in PrintNode dashboard)"}
+                "title": {"type": "string", "description": "Optional title for the print job (shown in PrintNode dashboard)"},
+                "color": {"type": "boolean", "description": "Override default. true=color, false=grayscale. Default is grayscale (B&W)."},
+                "paper": {"type": "string", "description": "Override paper size: 'Letter', 'A4', 'Legal', 'A5', etc. Default is Letter (8.5x11)."},
+                "duplex": {"type": "string", "description": "Override double-sided: 'long-edge' (book-style) / 'short-edge' (notepad) / 'none' (single-side). Default is 'long-edge' (double-sided book-style)."}
             },
             "required": ["invoice_id"]
         }
@@ -2735,12 +2744,26 @@ REMINDER MANAGEMENT (提醒管理) — STRICT RULES:
 - "我有什么提醒" / "list my reminders" → list_reminders.
 
 ⚠️ CRITICAL ANTI-HALLUCINATION RULE ⚠️
-DO NOT respond with "已取消" / "cancelled" / "已删除" / "已更新" UNLESS:
-  (a) You actually called cancel_reminder/update_reminder in THIS turn, AND
-  (b) The tool returned ok=true
-If you only THINK you cancelled something, you DIDN'T. Tool calls are the only way to make changes.
-If user says "你刚才不是取消了吗?" / "didn't you already cancel?" — that means YOU LIED last time.
-You must apologize, call the tool now, and verify with list_reminders.
+DO NOT respond with success language ("已取消" / "cancelled" / "已删除" / "已更新" / 
+"已开票" / "Release complete" / "✅ ... created" / "Invoice INV/...") UNLESS:
+  (a) You actually called the corresponding tool in THIS turn, AND
+  (b) The tool returned ok=true (or success=true)
+
+This applies to EVERY write operation:
+  - Reminders: cancel_reminder, update_reminder, create_reminder
+  - Invoices/PO/SO: odoo_create_invoice_from_so, odoo_register_payment, odoo_export_invoice_pdf,
+    print_invoice, release_so, odoo_update_record, odoo_create_record, odoo_create_bulk_po,
+    odoo_confirm_order, odoo_add_order_line
+  - Anything that changes data anywhere
+
+NEVER fabricate result fields like invoice numbers, PO numbers, IDs, amounts, job IDs,
+PDF URLs, or success messages. If you're tempted to write "INV/2026/01100" — STOP — that
+number must come from an actual tool result, not from a guess based on a previous invoice
+number being 01099.
+
+If you only THINK something happened, it DIDN'T. Tool calls are the only way to make changes.
+If user says "你刚才不是已经处理了吗?" / "didn't you already do that?" — that means YOU LIED last time.
+You must apologize, call the tool now, and verify the result.
 
 When user references a reminder by content (not id), use list_reminders to find candidates. 
 If multiple match, ASK which one — don't guess.
@@ -2750,18 +2773,25 @@ When user says "release [SO]", "开票 [SO]", "create invoice for [SO]", "proces
 
 ═══ ROUTING — DECIDE BASED ON SO PREFIX FIRST ═══
 Before calling ANY tool, look at the SO name prefix:
-- Starts with "AMZ" → Amazon order → jump straight to AMAZON WORKFLOW below (skip check_so_payment_status entirely)
-- Starts with "#CMT" or "CMT" → Shopify order → jump straight to SHOPIFY WORKFLOW below (skip check_so_payment_status entirely)
-- Starts with "S" followed by digits (e.g. S04210) → Normal order → use WEBHOOK QUEUE WORKFLOW below (need to check payment first)
+- Contains "AMZ" anywhere (e.g. "AMZ113-...", "AMZ-12345") → Amazon order → jump straight to AMAZON WORKFLOW below
+- Contains "CMT" anywhere (e.g. "CMT1761", "#CMT1761", "CMT-1761") → Shopify order → jump straight to SHOPIFY WORKFLOW below
+- Starts with "S" followed by digits only (e.g. "S04210", "S00123") → Normal order → use WEBHOOK QUEUE WORKFLOW below (need to check payment first)
 
-DO NOT call check_so_payment_status for AMZ/CMT orders — they are pre-paid by the marketplace,
-the payment record won't be in our queue, the check will always fail, and you'll waste a tool call.
+⚠️ STRICT RULE: DO NOT call check_so_payment_status for AMZ/CMT orders. These are
+pre-paid by the marketplace; their payments are NOT in our webhook queue so the check
+will always say "no payment found" and waste a tool call. Just go to the workflow.
+
+Examples:
+  user: "release CMT1761"      → SHOPIFY WORKFLOW (no check_so_payment_status)
+  user: "release #CMT1761"     → SHOPIFY WORKFLOW (no check_so_payment_status)
+  user: "release AMZ113-8770998-5220226" → AMAZON WORKFLOW (no check_so_payment_status)
+  user: "release S04210"       → WEBHOOK QUEUE WORKFLOW (call check_so_payment_status first)
 
 WEBHOOK QUEUE WORKFLOW (only for S-prefix orders, paid via Stripe/Zelle/Square):
 The webhook RECORDS payments to a queue but does NOT capture or invoice them. 
 Capture happens ONLY when the user explicitly releases via AI.
 
-STEP 1 — Always call check_so_payment_status(so_name) FIRST. It returns:
+STEP 1 — Call check_so_payment_status(so_name). It returns:
   - SO state (must be 'sale' or 'done' to release; 'draft'/'sent' = Quotation, will be rejected)
   - List of received payments from queue
   - Total received vs SO amount (must be >= SO amount, otherwise rejected)
@@ -6050,7 +6080,24 @@ async def run_tool(name, inp, context=None):
                 if len(pdf_bytes) < 100:
                     return json.dumps({"error": "PDF generation returned empty file"})
 
-            # 3) Submit to PrintNode
+            # 3) Build PrintNode options (color/paper/duplex — fall back to env defaults)
+            color_override = inp.get("color")
+            paper_override = (inp.get("paper") or "").strip()
+            duplex_override = (inp.get("duplex") or "").strip()
+            options = {
+                "color": color_override if color_override is not None else PRINTNODE_DEFAULT_COLOR,
+                "paper": paper_override or PRINTNODE_DEFAULT_PAPER,
+            }
+            # Duplex: explicit "none"/"single" override means no duplex; otherwise use override or default
+            if duplex_override.lower() in ("none", "single", "off"):
+                pass  # don't include duplex in options → single-sided
+            elif duplex_override:
+                options["duplex"] = duplex_override
+            elif PRINTNODE_DEFAULT_DUPLEX:
+                options["duplex"] = PRINTNODE_DEFAULT_DUPLEX
+            options["copies"] = copies  # PrintNode also supports copies in options
+
+            # 4) Submit to PrintNode
             pdf_b64 = base64.b64encode(pdf_bytes).decode("ascii")
             auth_b64 = base64.b64encode(f"{PRINTNODE_API_KEY}:".encode()).decode()
 
@@ -6061,7 +6108,9 @@ async def run_tool(name, inp, context=None):
                 "content": pdf_b64,
                 "source": "Chumart AI",
                 "qty": copies,
+                "options": options,
             }
+            print(f"[PRINT] Submitting to PrintNode with options: {options}")
 
             async with httpx.AsyncClient(timeout=30) as c:
                 r = await c.post("https://api.printnode.com/printjobs",
