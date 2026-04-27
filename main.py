@@ -1829,6 +1829,29 @@ TOOLS = [
         }
     },
     {
+        "name": "odoo_get_related_parts",
+        "description": (
+            "Get the configured 'Related Parts' (相关配件) of a main product. Each main product in our Odoo "
+            "has a many2many field x_studio_related_parts that lists all its accessories/spare parts "
+            "(knobs, handles, wheels, controllers, compressors, etc.). "
+            "USE THIS FIRST whenever the user asks about parts/accessories/spare parts for a specific model — "
+            "e.g. 'PC11-NG 的 knob', 'parts for FLM-PC11-NG', '54FS 的旋钮', 'PLM-54RS 的压缩机'. "
+            "Searching by SKU pattern (like default_code ilike 'PC11') WILL MISS most accessories because "
+            "accessory SKUs usually don't contain the main model's code. Always check this tool's results FIRST. "
+            "Returns list of related products with id, default_code (SKU), name, list_price. "
+            "If empty list returned, then fall back to keyword search and knowledge base."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "main_sku": {"type": "string", "description": "SKU of the main product (e.g. 'FLM-PC11-NG', 'PLM-54RS'). Either main_sku OR main_product_id required."},
+                "main_product_id": {"type": "integer", "description": "Product ID of the main product. Either main_sku OR main_product_id required."},
+                "filter_keyword": {"type": "string", "description": "Optional: filter related parts by keyword in name/SKU (e.g. 'knob', '旋钮', 'compressor'). Empty = return all related parts."}
+            },
+            "required": []
+        }
+    },
+    {
         "name": "odoo_get_product_vendors",
         "description": "Get all vendors for a list of products from product.supplierinfo. Returns each product with ALL its vendors including supplierinfo_id (the record ID in product.supplierinfo), vendor_id, vendor_name, price, min_qty. If a product has multiple vendors, AI must ask user to choose. Use before creating any purchase order, or before updating vendor prices.",
         "input_schema": {
@@ -2365,6 +2388,55 @@ WRITE OPERATION RULES:
 - NEVER execute write operations without explicit confirmation ("confirm", "确认", "yes", "go ahead")
 - After creating, always show Odoo direct link from tool result
 - If user role lacks can_write_odoo, politely decline
+
+RELATED PARTS / ACCESSORIES SEARCH (相关配件搜索) — IMPORTANT:
+
+There are TWO scenarios to handle differently:
+
+═══ SCENARIO A: User specifies a main model + part type ═══
+Examples:
+  - "PC11-NG 的 knob"
+  - "PLM-54RS 的旋钮 / 门把手 / 压缩机"
+  - "what parts does FLM-PC11-NG have"
+  - "I need a controller for the pasta cooker PC11"
+
+WORKFLOW:
+1. Call odoo_get_related_parts(main_sku=<main>, filter_keyword=<part_name>) FIRST.
+   Each main product in our Odoo has x_studio_related_parts (Related Parts) listing
+   all configured accessories. SKU-pattern search WILL miss most accessories because
+   accessory SKUs usually don't contain the main model's code (e.g. PC11's knob is 'FLM-N005').
+2. If returns count > 0 → list them with SKU + name + price. Done.
+3. If count == 0 with filter → retry without filter_keyword to see all configured parts.
+4. If still empty → fall back to scenario B's keyword search (the part might exist
+   without being linked to the main product yet).
+5. As last resort → search_knowledge for the spec sheet's parts list.
+
+═══ SCENARIO B: User asks about a part by name only (no main model in this turn) ═══
+Examples:
+  - "找一下 knob"
+  - "我要个旋钮"
+  - "do we have any handles in stock"
+  - "search for compressor"
+
+WORKFLOW:
+1. Use odoo_search on product.product:
+   domain=[["name", "ilike", "<keyword>"], ["company_id", "=", 1]]
+   (or default_code ilike if user gave a SKU-like keyword)
+   fields=["id", "default_code", "name", "list_price", "qty_available"]
+2. If conversation history mentions a specific main model earlier (e.g. user previously
+   said "我有台 PC11-NG"), then ALSO call odoo_get_related_parts on that model and
+   CROSS-REFERENCE: parts in BOTH lists are the most relevant.
+3. List results with relevance hint:
+   - "Most likely match" first if cross-referencing found one
+   - Then other matches
+4. If too many matches (>10) and there's a main model in context, narrow down
+   by calling odoo_get_related_parts(main_sku=<context_model>, filter_keyword=<keyword>).
+
+═══ GENERAL RULES ═══
+- NEVER claim a part doesn't exist if you only ran SKU pattern search (e.g. default_code ilike "PC11")
+- Always prefer odoo_get_related_parts when there's a main model context
+- Always prefer name search over SKU search for accessories (their SKUs are unpredictable)
+- If found multiple candidates, ask user to confirm rather than guess
 
 BULK PURCHASE ORDER WORKFLOW (when user gives a list of SKUs OR PI/PO documents):
 Follow these steps in order:
@@ -3260,6 +3332,110 @@ async def run_tool(name, inp, context=None):
                 not_found.append(sku)
                 results.append({"sku_searched": sku, "found": False})
         return json.dumps({"results": results, "not_found": not_found}, ensure_ascii=False)
+
+    if name == "odoo_get_related_parts":
+        """Get x_studio_related_parts for a main product.
+        Field is on product.template (many2many to product.template).
+        Accepts main_sku or main_product_id.
+        Optional filter_keyword filters the returned parts by name/SKU substring."""
+        main_sku = (inp.get("main_sku") or "").strip()
+        main_pid = inp.get("main_product_id")
+        kw = (inp.get("filter_keyword") or "").strip().lower()
+
+        if not main_sku and not main_pid:
+            return json.dumps({"error": "Provide either main_sku or main_product_id"})
+
+        cookies = await odoo_get_session()
+
+        # Step 1: Resolve main product → product.template id
+        if main_pid:
+            prod_r = json.loads(await odoo_query("product.product",
+                [["id", "=", main_pid]],
+                ["id", "default_code", "name", "product_tmpl_id"],
+                limit=1, cookies=cookies))
+        else:
+            prod_r = json.loads(await odoo_query("product.product",
+                [["default_code", "=ilike", main_sku], ["active", "=", True]],
+                ["id", "default_code", "name", "product_tmpl_id"],
+                limit=5, cookies=cookies))
+            # Prefer exact case match
+            if isinstance(prod_r, list) and prod_r:
+                exact = [p for p in prod_r if (p.get("default_code") or "").upper() == main_sku.upper()]
+                if exact:
+                    prod_r = [exact[0]]
+
+        if not isinstance(prod_r, list) or not prod_r:
+            return json.dumps({
+                "found": False,
+                "message": f"Main product '{main_sku or main_pid}' not found in Odoo",
+            })
+
+        main = prod_r[0]
+        tmpl_id = main["product_tmpl_id"][0] if isinstance(main.get("product_tmpl_id"), list) else main.get("product_tmpl_id")
+        if not tmpl_id:
+            return json.dumps({"error": f"Main product has no product_tmpl_id: {main}"})
+
+        # Step 2: Read x_studio_related_parts (list of product.template IDs)
+        tmpl_r = json.loads(await odoo_query("product.template",
+            [["id", "=", tmpl_id]],
+            ["id", "name", "default_code", "x_studio_related_parts"],
+            limit=1, cookies=cookies))
+        if not isinstance(tmpl_r, list) or not tmpl_r:
+            return json.dumps({"error": f"Could not load product.template {tmpl_id}"})
+
+        related_tmpl_ids = tmpl_r[0].get("x_studio_related_parts") or []
+        if not related_tmpl_ids:
+            return json.dumps({
+                "found": True,
+                "main_product": {"id": main["id"], "sku": main.get("default_code"), "name": main.get("name")},
+                "related_parts": [],
+                "count": 0,
+                "message": f"No related parts configured for {main.get('default_code') or main.get('name')}. "
+                           f"Try keyword search or knowledge base instead.",
+            })
+
+        # Step 3: Get product.product info for each related template (we want SKU which is on product.product)
+        related_prods_r = json.loads(await odoo_query("product.product",
+            [["product_tmpl_id", "in", related_tmpl_ids], ["active", "=", True]],
+            ["id", "default_code", "name", "list_price", "qty_available", "product_tmpl_id"],
+            limit=200, cookies=cookies))
+
+        if not isinstance(related_prods_r, list):
+            related_prods_r = []
+
+        # Step 4: Apply optional keyword filter
+        if kw:
+            filtered = []
+            for p in related_prods_r:
+                hay = ((p.get("default_code") or "") + " " + (p.get("name") or "")).lower()
+                if kw in hay:
+                    filtered.append(p)
+            related_prods_r = filtered
+
+        # Format output
+        results = [{
+            "id": p["id"],
+            "sku": p.get("default_code") or "",
+            "name": p.get("name") or "",
+            "list_price": p.get("list_price", 0),
+            "qty_available": p.get("qty_available", 0),
+        } for p in related_prods_r]
+
+        return json.dumps({
+            "found": True,
+            "main_product": {
+                "id": main["id"],
+                "sku": main.get("default_code"),
+                "name": main.get("name"),
+            },
+            "filter_keyword": kw or None,
+            "related_parts": results,
+            "count": len(results),
+            "total_configured": len(related_tmpl_ids),
+            "message": (f"Found {len(results)} related part(s)" +
+                        (f" matching '{kw}'" if kw else "") +
+                        (f" out of {len(related_tmpl_ids)} configured" if kw else "")),
+        }, ensure_ascii=False)
 
     if name == "odoo_get_product_vendors":
         product_ids = inp.get("product_ids", [])
@@ -7706,6 +7882,7 @@ TOOL_PROGRESS_LABELS_ZH = {
     "odoo_search":                 "🔍 正在搜索 Odoo 数据...",
     "odoo_search_product":         "📦 正在搜索产品...",
     "odoo_search_partner":         "👤 正在搜索客户...",
+    "odoo_get_related_parts":      "🔧 正在查相关配件...",
     "odoo_check_stock":            "📦 正在查库存...",
     "odoo_recent_sales":           "💰 正在查最近销售...",
     "odoo_restock_analysis":       "📦 正在分析补货...",
@@ -7742,6 +7919,7 @@ TOOL_PROGRESS_LABELS_EN = {
     "odoo_search":                 "🔍 Searching Odoo...",
     "odoo_search_product":         "📦 Searching products...",
     "odoo_search_partner":         "👤 Searching customers...",
+    "odoo_get_related_parts":      "🔧 Looking up related parts...",
     "odoo_check_stock":            "📦 Checking stock...",
     "odoo_recent_sales":           "💰 Fetching recent sales...",
     "odoo_restock_analysis":       "📦 Analyzing restock...",
