@@ -2045,10 +2045,29 @@ TOOLS = [
     },
     {
         "name": "cancel_reminder",
-        "description": "Cancel a pending reminder by id. Get id from list_reminders first.",
+        "description": "Cancel a pending reminder by id. Get id from list_reminders first. To cancel by content (e.g. 'cancel my X reminder'), first call list_reminders to find the matching id.",
         "input_schema": {
             "type": "object",
             "properties": {"id": {"type": "integer"}},
+            "required": ["id"]
+        }
+    },
+    {
+        "name": "update_reminder",
+        "description": (
+            "Update an existing reminder's time and/or content. Use when user says '改一下我的X提醒到Y时间', "
+            "'change my reminder to ...', 'reschedule the X reminder'. "
+            "ALWAYS call list_reminders first to get the correct id (don't guess). "
+            "If multiple pending reminders match the user's description, ask which one. "
+            "DO NOT use create_reminder + cancel_reminder as a workaround — use this tool to atomically update."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "id": {"type": "integer", "description": "Reminder id from list_reminders"},
+                "fire_at": {"type": "string", "description": "New time, ISO datetime (naive = LA time). Optional — only pass if changing time."},
+                "content": {"type": "string", "description": "New content. Optional — only pass if changing content."}
+            },
             "required": ["id"]
         }
     },
@@ -2530,6 +2549,15 @@ This is a meaningful answer, not a failure. Tell the user something like:
 Then ask: "你能提供更多信息吗？比如客户名、准确的金额或日期。"
 
 DO NOT say "我找到一条银行对账记录" as an answer — the user is usually asking this FROM the bank line view, so that would just echo their input.
+
+REMINDER MANAGEMENT (提醒管理):
+- "改一下我的X提醒到Y" / "reschedule X to Y" / "把X提醒改成Y时间" → MUST use update_reminder. 
+  STEPS: (1) call list_reminders, (2) find the matching reminder's id, (3) call update_reminder with id + new fire_at.
+  DO NOT call create_reminder + cancel_reminder as a workaround — that creates duplicates (one cancel without one create = orphan).
+- "取消我的X提醒" / "cancel my X reminder" → call list_reminders first to find id, then cancel_reminder(id).
+- "我有什么提醒" / "list my reminders" → list_reminders.
+- NEVER claim a reminder was deleted/cancelled if you didn't actually call cancel_reminder. NEVER claim a reminder was updated if you didn't actually call update_reminder. After ANY change, call list_reminders again to verify and tell user the actual state.
+- If user references a reminder by content (not id), use list_reminders to find candidates. If multiple match, ASK which one — don't guess.
 
 ORDER RELEASE / INVOICE AUTOMATION (开票自动化):
 When user says "release [SO]", "开票 [SO]", "create invoice for [SO]", "process [SO]", or asks "did we receive payment for [SO]?" / "[SO] 收到款了吗" — follow this workflow:
@@ -5879,6 +5907,73 @@ async def run_tool(name, inp, context=None):
         finally:
             await conn.close()
 
+    if name == "update_reminder":
+        uid = ctx.get("uid", 0)
+        rid = inp.get("id")
+        if not uid:
+            return json.dumps({"error": "user not authenticated"})
+        if not rid:
+            return json.dumps({"error": "id is required (call list_reminders first to find it)"})
+
+        new_fire_at = inp.get("fire_at")
+        new_content = inp.get("content")
+        if not new_fire_at and not new_content:
+            return json.dumps({"error": "must provide at least one of: fire_at, content"})
+
+        # Parse new time if provided
+        new_fire_at_utc = None
+        if new_fire_at:
+            try:
+                new_fire_at_utc = _parse_iso_to_utc(new_fire_at)
+            except Exception as e:
+                return json.dumps({"error": f"could not parse fire_at: {e}"})
+
+        conn = await get_db_conn()
+        if not conn:
+            return json.dumps({"error": "database unavailable"})
+        try:
+            # Verify reminder exists and belongs to user
+            existing = await conn.fetchrow(
+                "SELECT id, content, fire_at, fired FROM reminders WHERE id=$1 AND uid=$2",
+                rid, uid
+            )
+            if not existing:
+                return json.dumps({"error": f"reminder {rid} not found or not yours"})
+            if existing["fired"]:
+                return json.dumps({"error": f"reminder {rid} already fired, cannot update"})
+
+            # Build update query
+            sets = []
+            params = []
+            idx = 1
+            if new_fire_at_utc:
+                sets.append(f"fire_at = ${idx}")
+                params.append(new_fire_at_utc)
+                idx += 1
+            if new_content:
+                sets.append(f"content = ${idx}")
+                params.append(new_content)
+                idx += 1
+            params.extend([rid, uid])
+            sql = f"UPDATE reminders SET {', '.join(sets)} WHERE id = ${idx} AND uid = ${idx+1}"
+            await conn.execute(sql, *params)
+
+            # Return the updated reminder for confirmation
+            updated = await conn.fetchrow(
+                "SELECT id, content, fire_at FROM reminders WHERE id=$1",
+                rid
+            )
+            fire_la = updated["fire_at"].astimezone(LA_TZ) if updated["fire_at"] else None
+            return json.dumps({
+                "ok": True,
+                "id": updated["id"],
+                "content": updated["content"],
+                "fire_at_la": fire_la.strftime("%Y-%m-%d %H:%M") if fire_la else None,
+                "message": f"提醒已更新: {updated['content']} → {fire_la.strftime('%Y-%m-%d %H:%M') if fire_la else 'N/A'}",
+            }, ensure_ascii=False)
+        finally:
+            await conn.close()
+
     if name == "create_event":
         uid = ctx.get("uid", 0)
         if not uid:
@@ -7595,11 +7690,12 @@ ODOO DISCUSS BOT RULES (you are responding inside Odoo Discuss chat, NOT the web
 - Maximum reply length: ~500 words. If data is larger, give a summary and offer the download link.
 """
 
-    # Call Claude — use Haiku for speed (Discuss needs fast replies, not long essays)
-    # Sonnet takes 8-15s per turn; Haiku takes 2-4s.
+    # Call Claude — Sonnet for admin/finance (better reasoning for reminders/invoicing),
+    # Haiku for others (faster, cheaper).
     tool_context = {"uid": uid, "username": author, "role": role}
     headers = {"x-api-key": ANTHROPIC_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json"}
-    bot_model = "claude-haiku-4-5-20251001"
+    bot_model = "claude-sonnet-4-5" if role in ("admin", "finance") else "claude-haiku-4-5-20251001"
+    print(f"[ODOO-BOT] uid={uid} role={role} model={bot_model}")
 
     try:
         async with httpx.AsyncClient(timeout=300) as c:
