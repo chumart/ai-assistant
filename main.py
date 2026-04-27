@@ -2397,19 +2397,40 @@ There are TWO scenarios to handle differently:
 Examples:
   - "PC11-NG 的 knob"
   - "PLM-54RS 的旋钮 / 门把手 / 压缩机"
+  - "FLM-ST2-SS 的 sneeze guard"
   - "what parts does FLM-PC11-NG have"
   - "I need a controller for the pasta cooker PC11"
 
-WORKFLOW:
-1. Call odoo_get_related_parts(main_sku=<main>, filter_keyword=<part_name>) FIRST.
-   Each main product in our Odoo has x_studio_related_parts (Related Parts) listing
-   all configured accessories. SKU-pattern search WILL miss most accessories because
-   accessory SKUs usually don't contain the main model's code (e.g. PC11's knob is 'FLM-N005').
-2. If returns count > 0 → list them with SKU + name + price. Done.
-3. If count == 0 with filter → retry without filter_keyword to see all configured parts.
-4. If still empty → fall back to scenario B's keyword search (the part might exist
-   without being linked to the main product yet).
-5. As last resort → search_knowledge for the spec sheet's parts list.
+⚠️ MANDATORY FALLBACK CHAIN — execute steps in order, ONLY stop when one returns results:
+
+STEP 1: odoo_get_related_parts(main_sku=<main>, filter_keyword=<part_name>)
+  → if count > 0 → list them, DONE.
+  → if count == 0 → go to STEP 2 (do NOT stop yet).
+
+STEP 2: odoo_get_related_parts(main_sku=<main>) — WITHOUT filter_keyword
+  → if count > 0 → list all parts, mention which match the user's keyword.
+  → if count == 0 → go to STEP 3.
+
+STEP 3: odoo_search by NAME (most accessory SKUs don't contain main model code,
+        so name search beats SKU search):
+  domain=["|", ["name", "ilike", "<part_keyword>"], ["default_code", "ilike", "<part_keyword>"]]
+  fields=["id", "default_code", "name", "list_price", "qty_available"]
+  limit=30
+  → if results > 0 → list them, mark "可能匹配,未在 Related Parts 中关联".
+  → if 0 → go to STEP 4.
+
+STEP 4: odoo_search combining BOTH the main model name AND the part keyword:
+  Look up main model's NAME (not SKU) first via odoo_search_products_by_sku,
+  then search:
+  domain=[["name", "ilike", "<part_keyword>"], ["name", "ilike", "<one keyword from main model name>"]]
+  Example: main FLM-ST2-SS is "Sandwich Prep Table" → search name ilike "sneeze guard" AND ilike "sandwich"
+
+STEP 5: search_knowledge as last resort (spec sheets sometimes list parts).
+  query="<main_sku> <part_keyword> parts" or use translated keywords.
+
+ONLY say "未找到" / "not found" AFTER ALL 5 STEPS executed and all empty.
+NEVER stop at step 1 or 2 just because they returned empty — the part very often
+exists as a regular product but isn't yet linked in x_studio_related_parts.
 
 ═══ SCENARIO B: User asks about a part by name only (no main model in this turn) ═══
 Examples:
@@ -2419,13 +2440,12 @@ Examples:
   - "search for compressor"
 
 WORKFLOW:
-1. Use odoo_search on product.product:
-   domain=[["name", "ilike", "<keyword>"], ["company_id", "=", 1]]
-   (or default_code ilike if user gave a SKU-like keyword)
+1. odoo_search on product.product:
+   domain=["|", ["name", "ilike", "<keyword>"], ["default_code", "ilike", "<keyword>"]]
    fields=["id", "default_code", "name", "list_price", "qty_available"]
 2. If conversation history mentions a specific main model earlier (e.g. user previously
    said "我有台 PC11-NG"), then ALSO call odoo_get_related_parts on that model and
-   CROSS-REFERENCE: parts in BOTH lists are the most relevant.
+   CROSS-REFERENCE: parts in BOTH lists are most relevant.
 3. List results with relevance hint:
    - "Most likely match" first if cross-referencing found one
    - Then other matches
@@ -2434,8 +2454,8 @@ WORKFLOW:
 
 ═══ GENERAL RULES ═══
 - NEVER claim a part doesn't exist if you only ran SKU pattern search (e.g. default_code ilike "PC11")
-- Always prefer odoo_get_related_parts when there's a main model context
-- Always prefer name search over SKU search for accessories (their SKUs are unpredictable)
+- Always prefer odoo_get_related_parts when there's a main model context, but DON'T stop there
+- Always prefer NAME search over SKU search for accessories (their SKUs are unpredictable)
 - If found multiple candidates, ask user to confirm rather than guess
 
 BULK PURCHASE ORDER WORKFLOW (when user gives a list of SKUs OR PI/PO documents):
