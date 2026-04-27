@@ -7834,15 +7834,9 @@ async def _build_odoo_bot_user_content(text: str, attachments: list, user_lang: 
     Build the 'content' field for the user message in the Anthropic API.
     - If no attachments: return plain text string.
     - If attachments: return a list of content blocks (text + image/document blocks).
-    
-    Images → native Anthropic 'image' blocks (Claude sees them visually)
-    PDFs → 'document' blocks (Claude reads them like images)
-    Excel/CSV → extract to plain text, append to message
-    Word (docx) → extract to plain text, append to message
-    Unknown → just mention filename
     """
     if not attachments:
-        return text
+        return text or ""
 
     blocks = []
     extracted_texts = []
@@ -7850,84 +7844,103 @@ async def _build_odoo_bot_user_content(text: str, attachments: list, user_lang: 
 
     for att in attachments:
         try:
-            raw = base64.b64decode(att.data_base64)
+            # att may be a Pydantic model OR a dict, handle both safely
+            if hasattr(att, "data_base64"):
+                att_name = att.name
+                att_mime = att.mimetype or ""
+                att_data = att.data_base64 or ""
+            elif isinstance(att, dict):
+                att_name = att.get("name", "unnamed")
+                att_mime = att.get("mimetype", "") or ""
+                att_data = att.get("data_base64", "") or ""
+            else:
+                skipped.append(str(att)[:40] + " (unknown type)")
+                continue
+
+            if not att_data:
+                skipped.append(f"{att_name} (empty data)")
+                continue
+
+            try:
+                raw = base64.b64decode(att_data)
+            except Exception:
+                skipped.append(f"{att_name} (decode error)")
+                continue
+
+            if len(raw) > ODOO_BOT_MAX_ATTACHMENT_SIZE:
+                skipped.append(f"{att_name} (too large: {len(raw) / 1024 / 1024:.1f}MB > 10MB)")
+                continue
+
+            mime = att_mime.lower()
+            # Auto-detect from extension if mime missing
+            if not mime:
+                lname = att_name.lower()
+                if lname.endswith(".pdf"):
+                    mime = "application/pdf"
+                elif lname.endswith(".png"):
+                    mime = "image/png"
+                elif lname.endswith((".jpg", ".jpeg")):
+                    mime = "image/jpeg"
+                elif lname.endswith(".gif"):
+                    mime = "image/gif"
+                elif lname.endswith(".webp"):
+                    mime = "image/webp"
+                elif lname.endswith(".xlsx"):
+                    mime = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                elif lname.endswith(".xls"):
+                    mime = "application/vnd.ms-excel"
+                elif lname.endswith(".csv"):
+                    mime = "text/csv"
+                elif lname.endswith(".docx"):
+                    mime = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+                elif lname.endswith(".doc"):
+                    mime = "application/msword"
+
+            # ── Image: pass directly to Claude as image block ──
+            if mime in ODOO_BOT_IMAGE_MIMES:
+                blocks.append({
+                    "type": "image",
+                    "source": {"type": "base64", "media_type": mime, "data": att_data}
+                })
+                print(f"[ODOO-BOT] attached image: {att_name} ({len(raw) / 1024:.1f}KB)")
+                continue
+
+            # ── PDF: Anthropic 'document' block ──
+            if mime in ODOO_BOT_PDF_MIMES:
+                blocks.append({
+                    "type": "document",
+                    "source": {"type": "base64", "media_type": "application/pdf", "data": att_data}
+                })
+                print(f"[ODOO-BOT] attached PDF: {att_name} ({len(raw) / 1024:.1f}KB)")
+                continue
+
+            # ── Excel / CSV: extract to text ──
+            if mime in ODOO_BOT_EXCEL_MIMES:
+                try:
+                    excel_text = _extract_excel_text(raw, mime, att_name)
+                    extracted_texts.append(f"\n\n--- File: {att_name} ---\n{excel_text}")
+                    print(f"[ODOO-BOT] extracted Excel/CSV: {att_name}")
+                except Exception as e:
+                    skipped.append(f"{att_name} (Excel parse error: {e})")
+                continue
+
+            # ── Word: extract to text ──
+            if mime in ODOO_BOT_WORD_MIMES:
+                try:
+                    word_text = _extract_word_text(raw, mime, att_name)
+                    extracted_texts.append(f"\n\n--- File: {att_name} ---\n{word_text}")
+                    print(f"[ODOO-BOT] extracted Word: {att_name}")
+                except Exception as e:
+                    skipped.append(f"{att_name} (Word parse error: {e})")
+                continue
+
+            skipped.append(f"{att_name} (unsupported type: {mime})")
         except Exception as e:
-            skipped.append(f"{att.name} (decode error)")
-            continue
+            print(f"[ODOO-BOT] attachment processing error: {e}")
+            import traceback; traceback.print_exc()
+            skipped.append(f"<error: {str(e)[:50]}>")
 
-        if len(raw) > ODOO_BOT_MAX_ATTACHMENT_SIZE:
-            skipped.append(f"{att.name} (too large: {len(raw) / 1024 / 1024:.1f}MB > 10MB)")
-            continue
-
-        mime = (att.mimetype or "").lower()
-        # Auto-detect from extension if mime missing
-        if not mime:
-            lname = att.name.lower()
-            if lname.endswith(".pdf"):
-                mime = "application/pdf"
-            elif lname.endswith((".png",)):
-                mime = "image/png"
-            elif lname.endswith((".jpg", ".jpeg")):
-                mime = "image/jpeg"
-            elif lname.endswith(".gif"):
-                mime = "image/gif"
-            elif lname.endswith(".webp"):
-                mime = "image/webp"
-            elif lname.endswith(".xlsx"):
-                mime = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-            elif lname.endswith(".xls"):
-                mime = "application/vnd.ms-excel"
-            elif lname.endswith(".csv"):
-                mime = "text/csv"
-            elif lname.endswith(".docx"):
-                mime = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
-            elif lname.endswith(".doc"):
-                mime = "application/msword"
-
-        b64 = att.data_base64
-
-        # ── Image: pass directly to Claude as image block ──
-        if mime in ODOO_BOT_IMAGE_MIMES:
-            blocks.append({
-                "type": "image",
-                "source": {"type": "base64", "media_type": mime, "data": b64}
-            })
-            print(f"[ODOO-BOT] attached image: {att.name} ({len(raw) / 1024:.1f}KB)")
-            continue
-
-        # ── PDF: pass as Anthropic 'document' block (Claude can read PDFs natively) ──
-        if mime in ODOO_BOT_PDF_MIMES:
-            blocks.append({
-                "type": "document",
-                "source": {"type": "base64", "media_type": "application/pdf", "data": b64}
-            })
-            print(f"[ODOO-BOT] attached PDF: {att.name} ({len(raw) / 1024:.1f}KB)")
-            continue
-
-        # ── Excel / CSV: extract to text ──
-        if mime in ODOO_BOT_EXCEL_MIMES:
-            try:
-                excel_text = _extract_excel_text(raw, mime, att.name)
-                extracted_texts.append(f"\n\n--- File: {att.name} ---\n{excel_text}")
-                print(f"[ODOO-BOT] extracted Excel/CSV: {att.name}")
-            except Exception as e:
-                skipped.append(f"{att.name} (Excel parse error: {e})")
-            continue
-
-        # ── Word: extract to text ──
-        if mime in ODOO_BOT_WORD_MIMES:
-            try:
-                word_text = _extract_word_text(raw, mime, att.name)
-                extracted_texts.append(f"\n\n--- File: {att.name} ---\n{word_text}")
-                print(f"[ODOO-BOT] extracted Word: {att.name}")
-            except Exception as e:
-                skipped.append(f"{att.name} (Word parse error: {e})")
-            continue
-
-        # ── Unknown ──
-        skipped.append(f"{att.name} (unsupported type: {mime})")
-
-    # Compose final text: original message + extracted text + skipped notice
+    # Compose final text
     final_text = text or ""
     if extracted_texts:
         final_text += "".join(extracted_texts)
@@ -7938,11 +7951,7 @@ async def _build_odoo_bot_user_content(text: str, attachments: list, user_lang: 
             final_text += "\n\n⚠️ Could not process attachments: " + ", ".join(skipped)
 
     if not final_text.strip():
-        # User sent only files with no text — give a default prompt
-        if user_lang == "zh":
-            final_text = "请帮我分析这些附件。"
-        else:
-            final_text = "Please help me analyze these attachments."
+        final_text = "请帮我分析这些附件。" if user_lang == "zh" else "Please help me analyze these attachments."
 
     blocks.append({"type": "text", "text": final_text})
     return blocks
@@ -8107,7 +8116,13 @@ async def odoo_bot_chat(req: OdooBotRequest):
     conv = ODOO_BOT_HISTORY[uid]
 
     # Build the user message — text only, OR multimodal if attachments are present
-    user_content = await _build_odoo_bot_user_content(req.message, req.attachments, user_lang)
+    try:
+        user_content = await _build_odoo_bot_user_content(req.message, req.attachments, user_lang)
+    except Exception as e:
+        print(f"[ODOO-BOT] _build_odoo_bot_user_content error: {e}")
+        import traceback; traceback.print_exc()
+        # Fallback to plain text only
+        user_content = req.message or ""
     conv.append({"role": "user", "content": user_content})
     # Trim to last N messages
     if len(conv) > ODOO_BOT_MAX_HISTORY:
