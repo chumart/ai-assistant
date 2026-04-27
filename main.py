@@ -7623,6 +7623,177 @@ class OdooBotRequest(BaseModel):
 
 # In-memory conversation history per Odoo user (last 10 turns)
 ODOO_BOT_HISTORY: dict = {}  # uid -> list of {role, content}
+
+
+# Map tool name → friendly progress label (zh + en) shown in Discuss as "正在..."/"Working on..."
+TOOL_PROGRESS_LABELS_ZH = {
+    "list_reminders":              "🔍 正在查询提醒列表...",
+    "create_reminder":             "⏰ 正在创建提醒...",
+    "cancel_reminder":             "🗑 正在取消提醒...",
+    "update_reminder":             "✏️ 正在更新提醒...",
+    "list_events":                 "📅 正在查询日程...",
+    "create_event":                "📅 正在创建日程...",
+    "delete_event":                "🗑 正在删除日程...",
+    "set_my_contact":              "📇 正在更新联系方式...",
+    "odoo_query":                  "🔍 正在查询 Odoo 数据...",
+    "odoo_query_count":            "🔢 正在统计...",
+    "odoo_search_product":         "📦 正在搜索产品...",
+    "odoo_search_partner":         "👤 正在搜索客户...",
+    "odoo_check_stock":            "📦 正在查库存...",
+    "odoo_recent_sales":           "💰 正在查最近销售...",
+    "odoo_restock_analysis":       "📦 正在分析补货...",
+    "odoo_create_record":          "✏️ 正在创建记录...",
+    "odoo_update_record":          "✏️ 正在更新记录...",
+    "odoo_add_order_line":         "➕ 正在添加订单行...",
+    "odoo_confirm_order":          "✅ 正在确认订单...",
+    "odoo_update_vendor_price":    "💲 正在更新供应商价格...",
+    "odoo_create_invoice_from_so": "📄 正在创建发票...",
+    "odoo_register_payment":       "💰 正在登记付款...",
+    "odoo_export_invoice_pdf":     "📥 正在导出 PDF...",
+    "release_so":                  "🚀 正在 release 订单...",
+    "check_so_payment_status":     "🔎 正在查 SO 付款状态...",
+    "search_knowledge_base":       "📚 正在搜索知识库...",
+    "get_monthly_tax":             "📊 正在生成月度税报表...",
+    "get_quarterly_tax":           "📊 正在生成季度税报表...",
+    "get_monthly_sales":           "📊 正在生成销售提成报表...",
+    "find_missing_tax":            "🔍 正在检查缺税订单...",
+    "save_user_memory":            "💾 正在保存记忆...",
+    "search_user_memories":        "🧠 正在查询历史记忆...",
+}
+
+TOOL_PROGRESS_LABELS_EN = {
+    "list_reminders":              "🔍 Fetching reminders...",
+    "create_reminder":             "⏰ Creating reminder...",
+    "cancel_reminder":             "🗑 Cancelling reminder...",
+    "update_reminder":             "✏️ Updating reminder...",
+    "list_events":                 "📅 Fetching events...",
+    "create_event":                "📅 Creating event...",
+    "delete_event":                "🗑 Deleting event...",
+    "set_my_contact":              "📇 Updating contact...",
+    "odoo_query":                  "🔍 Querying Odoo...",
+    "odoo_query_count":            "🔢 Counting records...",
+    "odoo_search_product":         "📦 Searching products...",
+    "odoo_search_partner":         "👤 Searching customers...",
+    "odoo_check_stock":            "📦 Checking stock...",
+    "odoo_recent_sales":           "💰 Fetching recent sales...",
+    "odoo_restock_analysis":       "📦 Analyzing restock...",
+    "odoo_create_record":          "✏️ Creating record...",
+    "odoo_update_record":          "✏️ Updating record...",
+    "odoo_add_order_line":         "➕ Adding order line...",
+    "odoo_confirm_order":          "✅ Confirming order...",
+    "odoo_update_vendor_price":    "💲 Updating vendor price...",
+    "odoo_create_invoice_from_so": "📄 Creating invoice...",
+    "odoo_register_payment":       "💰 Registering payment...",
+    "odoo_export_invoice_pdf":     "📥 Exporting PDF...",
+    "release_so":                  "🚀 Releasing order...",
+    "check_so_payment_status":     "🔎 Checking payment status...",
+    "search_knowledge_base":       "📚 Searching knowledge base...",
+    "get_monthly_tax":             "📊 Generating monthly tax report...",
+    "get_quarterly_tax":           "📊 Generating quarterly tax report...",
+    "get_monthly_sales":           "📊 Generating sales commission report...",
+    "find_missing_tax":            "🔍 Checking missing tax...",
+    "save_user_memory":            "💾 Saving memory...",
+    "search_user_memories":        "🧠 Searching past memories...",
+}
+
+
+def _detect_user_language(text: str) -> str:
+    """Detect if user message is Chinese or English. Returns 'zh' or 'en'.
+    Threshold: if >= 20% of characters are CJK, treat as Chinese."""
+    if not text:
+        return "en"
+    cjk_count = sum(1 for ch in text if '\u4e00' <= ch <= '\u9fff')
+    if cjk_count == 0:
+        return "en"
+    if cjk_count / max(len(text), 1) >= 0.2:
+        return "zh"
+    return "en"
+
+
+# Specific labels for common Odoo models when tool is odoo_query / odoo_query_count
+ODOO_MODEL_LABELS = {
+    "sale.order":          ("🛒 正在查销售订单 (SO)...",  "🛒 Querying Sales Orders..."),
+    "purchase.order":      ("📋 正在查采购单 (PO)...",    "📋 Querying Purchase Orders..."),
+    "stock.picking":       ("🚚 正在查送货单...",         "🚚 Querying delivery orders..."),
+    "stock.move":          ("📦 正在查库存移动...",       "📦 Querying stock moves..."),
+    "stock.move.line":     ("📦 正在查库存明细...",       "📦 Querying stock move lines..."),
+    "stock.quant":         ("📦 正在查库存余额...",       "📦 Querying stock quantities..."),
+    "product.template":    ("🏷 正在查产品...",           "🏷 Querying products..."),
+    "product.product":     ("🏷 正在查产品明细...",       "🏷 Querying product variants..."),
+    "res.partner":         ("👤 正在查客户/供应商...",    "👤 Querying contacts..."),
+    "account.move":        ("📄 正在查发票...",           "📄 Querying invoices..."),
+    "account.payment":     ("💰 正在查付款记录...",       "💰 Querying payments..."),
+    "account.move.line":   ("📊 正在查账目...",           "📊 Querying journal items..."),
+    "repair.order":        ("🔧 正在查维修单...",         "🔧 Querying repair orders..."),
+    "mrp.production":      ("⚙️ 正在查生产单...",         "⚙️ Querying manufacturing orders..."),
+    "hr.employee":         ("👷 正在查员工...",           "👷 Querying employees..."),
+    "crm.lead":            ("🎯 正在查商机...",           "🎯 Querying leads..."),
+}
+
+
+def _get_tool_progress_label(tool_name: str, lang: str, tool_input: dict = None) -> str:
+    """Get progress label in user's language. For odoo_query/odoo_query_count,
+    use a model-specific label if available."""
+    # 对 odoo_query / odoo_query_count 做特殊处理: 根据 model 给具体提示
+    if tool_name in ("odoo_query", "odoo_query_count") and tool_input:
+        model = tool_input.get("model", "")
+        if model in ODOO_MODEL_LABELS:
+            zh_label, en_label = ODOO_MODEL_LABELS[model]
+            return zh_label if lang == "zh" else en_label
+
+    table = TOOL_PROGRESS_LABELS_ZH if lang == "zh" else TOOL_PROGRESS_LABELS_EN
+    if lang == "zh":
+        return table.get(tool_name, f"⚙️ 正在执行 {tool_name}...")
+    return table.get(tool_name, f"⚙️ Running {tool_name}...")
+
+
+async def _odoo_bot_post_progress(channel_id: int, text: str):
+    """Post a progress update message to Odoo Discuss channel as the ChumartAI bot.
+    Called between tool iterations so user sees what the bot is doing in real time."""
+    if not channel_id:
+        return
+    try:
+        cookies = await odoo_get_session()
+        # Find the bot partner
+        bot_partner_r = await _odoo_call("res.partner", "search_read",
+            [[["name", "=ilike", "ChumartAI"]]],
+            {"fields": ["id"], "limit": 1},
+            cookies=cookies)
+        if not bot_partner_r:
+            return
+        bot_partner_id = bot_partner_r[0]["id"]
+
+        # Post the progress message as the bot
+        async with httpx.AsyncClient(timeout=15, follow_redirects=True) as c:
+            await c.post(f"{ODOO_URL}/web/dataset/call_kw", json={
+                "jsonrpc": "2.0", "method": "call", "id": 1,
+                "params": {
+                    "model": "discuss.channel",
+                    "method": "message_post",
+                    "args": [[channel_id]],
+                    "kwargs": {
+                        "body": f"<i>{text}</i>",
+                        "message_type": "comment",
+                        "subtype_xmlid": "mail.mt_comment",
+                        "author_id": bot_partner_id,
+                    }
+                }
+            }, cookies=cookies)
+    except Exception as e:
+        print(f"[ODOO-BOT] post_progress error: {e}")
+
+
+async def _odoo_call(model: str, method: str, args: list, kwargs: dict, cookies=None):
+    """Generic Odoo RPC call helper."""
+    if not cookies:
+        cookies = await odoo_get_session()
+    async with httpx.AsyncClient(timeout=30, follow_redirects=True) as c:
+        r = await c.post(f"{ODOO_URL}/web/dataset/call_kw", json={
+            "jsonrpc": "2.0", "method": "call", "id": 1,
+            "params": {"model": model, "method": method, "args": args, "kwargs": kwargs}
+        }, cookies=cookies)
+        d = r.json()
+        return d.get("result")
 ODOO_BOT_MAX_HISTORY = 20    # messages (10 turns)
 
 @app.post("/odoo-bot/chat")
@@ -7717,8 +7888,14 @@ ODOO DISCUSS BOT RULES (you are responding inside Odoo Discuss chat, NOT the web
                     tool_results = []
                     for block in d.get("content", []):
                         if block.get("type") == "tool_use":
-                            print(f"[ODOO-BOT] tool: {block['name']}")
-                            result = await run_tool(block["name"], block.get("input", {}), context=tool_context)
+                            tool_name = block["name"]
+                            tool_input = block.get("input", {})
+                            print(f"[ODOO-BOT] tool: {tool_name}")
+                            # 发个进度消息让用户知道 bot 在做什么 (语言根据用户输入自动判断)
+                            user_lang = _detect_user_language(req.message)
+                            progress_label = _get_tool_progress_label(tool_name, user_lang, tool_input)
+                            await _odoo_bot_post_progress(req.channel_id, progress_label)
+                            result = await run_tool(tool_name, tool_input, context=tool_context)
                             tool_results.append({"type": "tool_result", "tool_use_id": block["id"], "content": result})
                     current_messages.append({"role": "assistant", "content": d["content"]})
                     current_messages.append({"role": "user", "content": tool_results})
