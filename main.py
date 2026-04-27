@@ -9010,34 +9010,22 @@ async def login(req: LoginRequest):
                 "ttl_hours": ttl_hours,
             }
 
-            # mobile 额外存到 DB (服务器重启后仍能找回)
-            if is_mobile:
-                try:
-                    conn = await get_db_conn()
-                    if conn:
-                        try:
-                            expires_at = datetime.datetime.now(UTC_TZ) + datetime.timedelta(hours=ttl_hours)
-                            await conn.execute("""
-                                CREATE TABLE IF NOT EXISTS user_sessions (
-                                    token TEXT PRIMARY KEY,
-                                    uid INTEGER NOT NULL,
-                                    username TEXT,
-                                    name TEXT,
-                                    role TEXT,
-                                    client_type TEXT,
-                                    created_at TIMESTAMPTZ DEFAULT NOW(),
-                                    expires_at TIMESTAMPTZ NOT NULL
-                                )
-                            """)
-                            await conn.execute("""
-                                INSERT INTO user_sessions (token, uid, username, name, role, client_type, expires_at)
-                                VALUES ($1, $2, $3, $4, $5, $6, $7)
-                                ON CONFLICT (token) DO UPDATE SET expires_at = EXCLUDED.expires_at
-                            """, session_token, uid, req.username, name, role, "mobile", expires_at)
-                        finally:
-                            await conn.close()
-                except Exception as e:
-                    print(f"WARN: failed to persist mobile session to DB: {e}")
+            # 持久化到 DB (web 和 mobile 都存,服务器重启后还能恢复)
+            try:
+                conn = await get_db_conn()
+                if conn:
+                    try:
+                        expires_at = datetime.datetime.now(UTC_TZ) + datetime.timedelta(hours=ttl_hours)
+                        await conn.execute("""
+                            INSERT INTO user_sessions (token, uid, username, name, role, client_type, expires_at)
+                            VALUES ($1, $2, $3, $4, $5, $6, $7)
+                            ON CONFLICT (token) DO UPDATE SET expires_at = EXCLUDED.expires_at
+                        """, session_token, uid, req.username, name, role,
+                             "mobile" if is_mobile else "web", expires_at)
+                    finally:
+                        await conn.close()
+            except Exception as e:
+                print(f"WARN: failed to persist session to DB: {e}")
 
             print(f"LOGIN: uid={uid} name={name} role={role} client={req.client_type} ttl={ttl_hours}h token={session_token[:8]}...")
 
