@@ -2748,7 +2748,16 @@ If multiple match, ASK which one — don't guess.
 ORDER RELEASE / INVOICE AUTOMATION (开票自动化):
 When user says "release [SO]", "开票 [SO]", "create invoice for [SO]", "process [SO]", or asks "did we receive payment for [SO]?" / "[SO] 收到款了吗" — follow this workflow:
 
-WEBHOOK QUEUE WORKFLOW (Stripe/Zelle/Square):
+═══ ROUTING — DECIDE BASED ON SO PREFIX FIRST ═══
+Before calling ANY tool, look at the SO name prefix:
+- Starts with "AMZ" → Amazon order → jump straight to AMAZON WORKFLOW below (skip check_so_payment_status entirely)
+- Starts with "#CMT" or "CMT" → Shopify order → jump straight to SHOPIFY WORKFLOW below (skip check_so_payment_status entirely)
+- Starts with "S" followed by digits (e.g. S04210) → Normal order → use WEBHOOK QUEUE WORKFLOW below (need to check payment first)
+
+DO NOT call check_so_payment_status for AMZ/CMT orders — they are pre-paid by the marketplace,
+the payment record won't be in our queue, the check will always fail, and you'll waste a tool call.
+
+WEBHOOK QUEUE WORKFLOW (only for S-prefix orders, paid via Stripe/Zelle/Square):
 The webhook RECORDS payments to a queue but does NOT capture or invoice them. 
 Capture happens ONLY when the user explicitly releases via AI.
 
