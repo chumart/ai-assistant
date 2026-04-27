@@ -5721,7 +5721,7 @@ async def run_tool(name, inp, context=None):
                     print(f"[RELEASE] Stripe PI {first_pi_id} status={pi_status}")
                     if pi_status not in ("requires_capture", "succeeded"):
                         return json.dumps({
-                            "error": f"Stripe PI {first_pi_id} 状态异常: {pi_status},无法 release。",
+                            "error": f"Stripe PaymentIntent {first_pi_id} is in unexpected state: {pi_status}. Cannot release.",
                         })
                 except stripe.error.StripeError as e:
                     return json.dumps({"error": f"Stripe API error: {str(e)}"})
@@ -5771,7 +5771,7 @@ async def run_tool(name, inp, context=None):
                             return json.dumps({
                                 "error": f"Stripe capture failed for {first_pi_id}: status={cap_status}",
                                 "invoice_created": invoice_name,
-                                "warning": "Invoice 已创建但 capture 失败,需要人工处理。",
+                                "warning": "Invoice was created but Stripe capture failed. Manual intervention required.",
                             })
                         captured_pis.append(first_pi_id)
                     elif pi_status == "succeeded":
@@ -5781,7 +5781,7 @@ async def run_tool(name, inp, context=None):
                     return json.dumps({
                         "error": f"Stripe capture error: {str(e)}",
                         "invoice_created": invoice_name,
-                        "warning": "Invoice 已创建但 capture 失败,需要人工处理。",
+                        "warning": "Invoice was created but Stripe capture failed. Manual intervention required.",
                     })
 
             # ============================================
@@ -5806,15 +5806,20 @@ async def run_tool(name, inp, context=None):
                     duplicate_pi_ids=duplicate_pis_to_cancel,
                 )
 
-            # 构建消息
+            # Build a structured (mostly language-neutral) message.
+            # The AI will rephrase this for the user in their language.
             duplicate_warning = ""
             if duplicate_pis_to_cancel:
+                dup_list = "\n".join(
+                    f"  • {pid} (https://dashboard.stripe.com/payments/{pid})"
+                    for pid in duplicate_pis_to_cancel
+                )
                 duplicate_warning = (
-                    f"\n\n⚠️ 警告: 检测到 {len(duplicate_pis_to_cancel)} 笔重复 Stripe 付款已拦截:\n"
-                    + "\n".join(f"  • {pid} (https://dashboard.stripe.com/payments/{pid})"
-                                for pid in duplicate_pis_to_cancel)
-                    + "\n请去 Stripe Dashboard 手动 cancel,否则 7 天后会自动释放回客户。\n"
-                    + "邮件已发送到 di@chumartusa.com 和 ashley@chumartusa.com。"
+                    f"\n\n[WARNING] {len(duplicate_pis_to_cancel)} duplicate Stripe payment(s) detected and blocked (NOT captured):\n"
+                    f"{dup_list}\n"
+                    f"Action required: please go to Stripe Dashboard and manually cancel them, "
+                    f"otherwise they auto-release back to customer after 7 days. "
+                    f"Email alert sent to di@chumartusa.com and ashley@chumartusa.com."
                 )
 
             return json.dumps({
@@ -5829,9 +5834,9 @@ async def run_tool(name, inp, context=None):
                 "duplicate_stripe_pis": duplicate_pis_to_cancel,
                 "pdf_url": r3.get("download_url", ""),
                 "message": (
-                    f"✅ {so_name} ({partner_name}) 已 release\n"
-                    f"发票: {invoice_name} (${so_amount:,.2f})\n"
-                    f"付款方式: {payment_method_label}\n"
+                    f"✅ SO {so_name} ({partner_name}) released successfully.\n"
+                    f"Invoice: {invoice_name} (${so_amount:,.2f})\n"
+                    f"Payment method: {payment_method_label}\n"
                     f"PDF: {r3.get('download_url', 'N/A')}"
                     + duplicate_warning
                 ),
@@ -5988,7 +5993,7 @@ async def run_tool(name, inp, context=None):
                 "id": updated["id"],
                 "content": updated["content"],
                 "fire_at_la": fire_la.strftime("%Y-%m-%d %H:%M") if fire_la else None,
-                "message": f"提醒已更新: {updated['content']} → {fire_la.strftime('%Y-%m-%d %H:%M') if fire_la else 'N/A'}",
+                "message": f"Reminder updated: {updated['content']} → {fire_la.strftime('%Y-%m-%d %H:%M') if fire_la else 'N/A'}",
             }, ensure_ascii=False)
         finally:
             await conn.close()
@@ -7633,12 +7638,18 @@ async def admin_pending_payments():
 # Odoo Discuss Bot endpoint
 # ─────────────────────────────────────────────
 
+class OdooBotAttachment(BaseModel):
+    name: str                       # Filename
+    mimetype: str = ""              # e.g. image/png, application/pdf
+    data_base64: str                # Base64-encoded file content
+
 class OdooBotRequest(BaseModel):
     uid: int                    # Odoo user ID who sent the message
     message: str                # The message text
     channel_id: int = 0         # Discuss channel ID (for reply routing)
     author_name: str = ""       # Display name of the sender
     bot_secret: str = ""        # Shared secret to authenticate Odoo → Railway
+    attachments: list[OdooBotAttachment] = []   # Files attached to the Discuss message
 
 # In-memory conversation history per Odoo user (last 10 turns)
 ODOO_BOT_HISTORY: dict = {}  # uid -> list of {role, content}
@@ -7768,6 +7779,186 @@ def _get_tool_progress_label(tool_name: str, lang: str, tool_input: dict = None)
     return table.get(tool_name, f"⚙️ Running {tool_name}...")
 
 
+ODOO_BOT_MAX_ATTACHMENT_SIZE = 10 * 1024 * 1024  # 10 MB per file
+ODOO_BOT_IMAGE_MIMES = {"image/png", "image/jpeg", "image/jpg", "image/gif", "image/webp"}
+ODOO_BOT_PDF_MIMES = {"application/pdf"}
+ODOO_BOT_EXCEL_MIMES = {
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    "application/vnd.ms-excel",
+    "text/csv",
+}
+ODOO_BOT_WORD_MIMES = {
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    "application/msword",
+}
+
+
+async def _build_odoo_bot_user_content(text: str, attachments: list, user_lang: str = "zh") -> list | str:
+    """
+    Build the 'content' field for the user message in the Anthropic API.
+    - If no attachments: return plain text string.
+    - If attachments: return a list of content blocks (text + image/document blocks).
+    
+    Images → native Anthropic 'image' blocks (Claude sees them visually)
+    PDFs → 'document' blocks (Claude reads them like images)
+    Excel/CSV → extract to plain text, append to message
+    Word (docx) → extract to plain text, append to message
+    Unknown → just mention filename
+    """
+    if not attachments:
+        return text
+
+    blocks = []
+    extracted_texts = []
+    skipped = []
+
+    for att in attachments:
+        try:
+            raw = base64.b64decode(att.data_base64)
+        except Exception as e:
+            skipped.append(f"{att.name} (decode error)")
+            continue
+
+        if len(raw) > ODOO_BOT_MAX_ATTACHMENT_SIZE:
+            skipped.append(f"{att.name} (too large: {len(raw) / 1024 / 1024:.1f}MB > 10MB)")
+            continue
+
+        mime = (att.mimetype or "").lower()
+        # Auto-detect from extension if mime missing
+        if not mime:
+            lname = att.name.lower()
+            if lname.endswith(".pdf"):
+                mime = "application/pdf"
+            elif lname.endswith((".png",)):
+                mime = "image/png"
+            elif lname.endswith((".jpg", ".jpeg")):
+                mime = "image/jpeg"
+            elif lname.endswith(".gif"):
+                mime = "image/gif"
+            elif lname.endswith(".webp"):
+                mime = "image/webp"
+            elif lname.endswith(".xlsx"):
+                mime = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            elif lname.endswith(".xls"):
+                mime = "application/vnd.ms-excel"
+            elif lname.endswith(".csv"):
+                mime = "text/csv"
+            elif lname.endswith(".docx"):
+                mime = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+            elif lname.endswith(".doc"):
+                mime = "application/msword"
+
+        b64 = att.data_base64
+
+        # ── Image: pass directly to Claude as image block ──
+        if mime in ODOO_BOT_IMAGE_MIMES:
+            blocks.append({
+                "type": "image",
+                "source": {"type": "base64", "media_type": mime, "data": b64}
+            })
+            print(f"[ODOO-BOT] attached image: {att.name} ({len(raw) / 1024:.1f}KB)")
+            continue
+
+        # ── PDF: pass as Anthropic 'document' block (Claude can read PDFs natively) ──
+        if mime in ODOO_BOT_PDF_MIMES:
+            blocks.append({
+                "type": "document",
+                "source": {"type": "base64", "media_type": "application/pdf", "data": b64}
+            })
+            print(f"[ODOO-BOT] attached PDF: {att.name} ({len(raw) / 1024:.1f}KB)")
+            continue
+
+        # ── Excel / CSV: extract to text ──
+        if mime in ODOO_BOT_EXCEL_MIMES:
+            try:
+                excel_text = _extract_excel_text(raw, mime, att.name)
+                extracted_texts.append(f"\n\n--- File: {att.name} ---\n{excel_text}")
+                print(f"[ODOO-BOT] extracted Excel/CSV: {att.name}")
+            except Exception as e:
+                skipped.append(f"{att.name} (Excel parse error: {e})")
+            continue
+
+        # ── Word: extract to text ──
+        if mime in ODOO_BOT_WORD_MIMES:
+            try:
+                word_text = _extract_word_text(raw, mime, att.name)
+                extracted_texts.append(f"\n\n--- File: {att.name} ---\n{word_text}")
+                print(f"[ODOO-BOT] extracted Word: {att.name}")
+            except Exception as e:
+                skipped.append(f"{att.name} (Word parse error: {e})")
+            continue
+
+        # ── Unknown ──
+        skipped.append(f"{att.name} (unsupported type: {mime})")
+
+    # Compose final text: original message + extracted text + skipped notice
+    final_text = text or ""
+    if extracted_texts:
+        final_text += "".join(extracted_texts)
+    if skipped:
+        if user_lang == "zh":
+            final_text += "\n\n⚠️ 以下附件无法处理: " + ", ".join(skipped)
+        else:
+            final_text += "\n\n⚠️ Could not process attachments: " + ", ".join(skipped)
+
+    if not final_text.strip():
+        # User sent only files with no text — give a default prompt
+        if user_lang == "zh":
+            final_text = "请帮我分析这些附件。"
+        else:
+            final_text = "Please help me analyze these attachments."
+
+    blocks.append({"type": "text", "text": final_text})
+    return blocks
+
+
+def _extract_excel_text(raw: bytes, mime: str, filename: str, max_rows: int = 200) -> str:
+    """Extract a plain-text representation of an Excel/CSV file."""
+    import io
+    if mime == "text/csv":
+        text = raw.decode("utf-8", errors="replace")
+        lines = text.splitlines()[:max_rows]
+        return "\n".join(lines)
+
+    # xlsx / xls — use openpyxl for xlsx, xlrd is gone; fall back to pandas if available
+    try:
+        from openpyxl import load_workbook
+        wb = load_workbook(io.BytesIO(raw), data_only=True, read_only=True)
+        out = []
+        for sheet_name in wb.sheetnames[:5]:  # max 5 sheets
+            ws = wb[sheet_name]
+            out.append(f"[Sheet: {sheet_name}]")
+            for i, row in enumerate(ws.iter_rows(values_only=True)):
+                if i >= max_rows:
+                    out.append(f"... (truncated after {max_rows} rows)")
+                    break
+                out.append("\t".join(str(c) if c is not None else "" for c in row))
+        return "\n".join(out)
+    except ImportError:
+        return f"[Excel file {filename} — openpyxl not installed, install via pip]"
+    except Exception as e:
+        return f"[Excel file {filename} — parse error: {e}]"
+
+
+def _extract_word_text(raw: bytes, mime: str, filename: str) -> str:
+    """Extract plain text from a .docx file."""
+    import io
+    try:
+        from docx import Document  # python-docx package
+        doc = Document(io.BytesIO(raw))
+        paragraphs = [p.text for p in doc.paragraphs if p.text.strip()]
+        # Also extract table cells
+        for table in doc.tables:
+            for row in table.rows:
+                cells = [cell.text.strip() for cell in row.cells]
+                paragraphs.append("\t".join(cells))
+        return "\n".join(paragraphs)
+    except ImportError:
+        return f"[Word file {filename} — python-docx not installed]"
+    except Exception as e:
+        return f"[Word file {filename} — parse error: {e}]"
+
+
 async def _odoo_bot_post_progress(channel_id: int, text: str):
     """Post a progress update message to Odoo Discuss channel as the ChumartAI bot.
     Called between tool iterations so user sees what the bot is doing in real time."""
@@ -7843,8 +8034,12 @@ async def odoo_bot_chat(req: OdooBotRequest):
     if expected_secret and req.bot_secret != expected_secret:
         return {"error": "Invalid bot_secret"}
 
-    if not req.message.strip():
-        return {"reply": "请输入您的问题。"}
+    # Detect user language up-front (用于所有面向用户的字符串)
+    user_lang = _detect_user_language(req.message)
+
+    # Allow attachments with no text (e.g. just a file)
+    if not req.message.strip() and not req.attachments:
+        return {"reply": "请输入您的问题。" if user_lang == "zh" else "Please enter your question."}
 
     uid = req.uid
     author = req.author_name or f"User#{uid}"
@@ -7874,7 +8069,10 @@ async def odoo_bot_chat(req: OdooBotRequest):
     if uid not in ODOO_BOT_HISTORY:
         ODOO_BOT_HISTORY[uid] = []
     conv = ODOO_BOT_HISTORY[uid]
-    conv.append({"role": "user", "content": req.message})
+
+    # Build the user message — text only, OR multimodal if attachments are present
+    user_content = await _build_odoo_bot_user_content(req.message, req.attachments, user_lang)
+    conv.append({"role": "user", "content": user_content})
     # Trim to last N messages
     if len(conv) > ODOO_BOT_MAX_HISTORY:
         conv = conv[-ODOO_BOT_MAX_HISTORY:]
@@ -7918,7 +8116,9 @@ ODOO DISCUSS BOT RULES (you are responding inside Odoo Discuss chat, NOT the web
                 d = r.json()
                 if "error" in d:
                     print(f"[ODOO-BOT] API error: {d['error']}")
-                    return {"reply": f"AI 错误: {d['error'].get('message', str(d['error']))}"}
+                    err_msg = d['error'].get('message', str(d['error']))
+                    err_prefix = "AI 错误" if user_lang == "zh" else "AI error"
+                    return {"reply": f"{err_prefix}: {err_msg}"}
 
                 if d.get("stop_reason") == "tool_use":
                     tool_results = []
@@ -7927,8 +8127,7 @@ ODOO DISCUSS BOT RULES (you are responding inside Odoo Discuss chat, NOT the web
                             tool_name = block["name"]
                             tool_input = block.get("input", {})
                             print(f"[ODOO-BOT] tool: {tool_name}")
-                            # 发个进度消息让用户知道 bot 在做什么 (语言根据用户输入自动判断)
-                            user_lang = _detect_user_language(req.message)
+                            # 发个进度消息让用户知道 bot 在做什么 (使用顶部已检测的 user_lang)
                             progress_label = _get_tool_progress_label(tool_name, user_lang, tool_input)
                             await _odoo_bot_post_progress(req.channel_id, progress_label)
                             result = await run_tool(tool_name, tool_input, context=tool_context)
@@ -7941,10 +8140,11 @@ ODOO DISCUSS BOT RULES (you are responding inside Odoo Discuss chat, NOT the web
             reply = "".join(b.get("text", "") for b in d.get("content", []) if b.get("type") == "text")
     except Exception as e:
         print(f"[ODOO-BOT] exception: {e}")
-        reply = f"AI 请求失败: {str(e)}"
+        err_prefix = "AI 请求失败" if user_lang == "zh" else "AI request failed"
+        reply = f"{err_prefix}: {str(e)}"
 
     if not reply:
-        reply = "抱歉，没有生成回复。"
+        reply = "抱歉，没有生成回复。" if user_lang == "zh" else "Sorry, no reply was generated."
 
     # Save to history
     conv.append({"role": "assistant", "content": reply})
