@@ -7533,8 +7533,9 @@ async def stripe_webhook(request: Request):
     payload = await request.body()
     sig_header = request.headers.get("stripe-signature", "")
 
+    # 验证签名（但不用返回的 StripeObject，直接 parse raw payload 为 dict）
     try:
-        event = stripe.Webhook.construct_event(payload, sig_header, STRIPE_WEBHOOK_SECRET)
+        stripe.Webhook.construct_event(payload, sig_header, STRIPE_WEBHOOK_SECRET)
     except ValueError:
         print("[STRIPE] Invalid payload")
         from fastapi.responses import JSONResponse
@@ -7544,16 +7545,19 @@ async def stripe_webhook(request: Request):
         from fastapi.responses import JSONResponse
         return JSONResponse({"error": "Invalid signature"}, status_code=400)
 
-    event_type = event["type"]
+    # 直接 parse raw JSON → 普通 dict，避免 StripeObject 折腾
+    try:
+        event = json.loads(payload)
+    except Exception as e:
+        print(f"[STRIPE] JSON parse failed: {e}")
+        from fastapi.responses import JSONResponse
+        return JSONResponse({"error": "JSON parse failed"}, status_code=400)
+
+    event_type = event.get("type", "")
     print(f"[STRIPE] Event: {event_type}")
 
     if event_type in ("payment_intent.amount_capturable_updated", "payment_intent.requires_capture"):
-        # StripeObject → plain dict (不能用 dict()，要用 stripe 自带的序列化)
-        pi_obj = event["data"]["object"]
-        try:
-            pi = json.loads(json.dumps(pi_obj, default=str))
-        except Exception:
-            pi = {k: pi_obj[k] for k in pi_obj}
+        pi = event.get("data", {}).get("object", {})  # 已经是普通 dict
         pi_id = pi.get("id", "")
         amount_capturable = pi.get("amount_capturable", 0) or 0
         amount = (pi.get("amount", 0) or 0) / 100.0
