@@ -7774,16 +7774,21 @@ async def _odoo_bot_post_progress(channel_id: int, text: str):
         return
     try:
         cookies = await odoo_get_session()
-        # Find the bot partner
+        # Find the bot partner — 名字可能是 "ChumartAI" 或 "Chumart AI"(有空格)
+        # 用 ilike + % 通配符,大小写也无所谓
         bot_partner_r = await _odoo_call("res.partner", "search_read",
-            [[["name", "=ilike", "ChumartAI"]]],
-            {"fields": ["id"], "limit": 1},
+            [[["name", "ilike", "chumart%ai"]]],
+            {"fields": ["id", "name"], "limit": 5},
             cookies=cookies)
         if not bot_partner_r:
-            print(f"[ODOO-BOT] post_progress: ChumartAI bot partner not found")
+            print(f"[ODOO-BOT] post_progress: no partner found matching 'chumart%ai'")
             return
-        bot_partner_id = bot_partner_r[0]["id"]
-        print(f"[ODOO-BOT] post_progress → channel_id={channel_id}, bot_partner_id={bot_partner_id}, text={text[:40]}")
+        # 如果有多个,优先选名字精确匹配 ChumartAI 或 Chumart AI 的
+        exact = [p for p in bot_partner_r
+                 if p.get("name", "").lower().replace(" ", "") == "chumartai"]
+        bot_partner_id = (exact[0] if exact else bot_partner_r[0])["id"]
+        bot_partner_name = (exact[0] if exact else bot_partner_r[0])["name"]
+        print(f"[ODOO-BOT] post_progress → channel_id={channel_id}, bot_partner='{bot_partner_name}' (id={bot_partner_id}), text={text[:40]}")
 
         # Post the progress message as the bot
         async with httpx.AsyncClient(timeout=15, follow_redirects=True) as c:
