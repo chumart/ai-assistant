@@ -7770,6 +7770,7 @@ async def _odoo_bot_post_progress(channel_id: int, text: str):
     """Post a progress update message to Odoo Discuss channel as the ChumartAI bot.
     Called between tool iterations so user sees what the bot is doing in real time."""
     if not channel_id:
+        print(f"[ODOO-BOT] post_progress skipped: no channel_id")
         return
     try:
         cookies = await odoo_get_session()
@@ -7779,12 +7780,14 @@ async def _odoo_bot_post_progress(channel_id: int, text: str):
             {"fields": ["id"], "limit": 1},
             cookies=cookies)
         if not bot_partner_r:
+            print(f"[ODOO-BOT] post_progress: ChumartAI bot partner not found")
             return
         bot_partner_id = bot_partner_r[0]["id"]
+        print(f"[ODOO-BOT] post_progress → channel_id={channel_id}, bot_partner_id={bot_partner_id}, text={text[:40]}")
 
         # Post the progress message as the bot
         async with httpx.AsyncClient(timeout=15, follow_redirects=True) as c:
-            await c.post(f"{ODOO_URL}/web/dataset/call_kw", json={
+            r = await c.post(f"{ODOO_URL}/web/dataset/call_kw", json={
                 "jsonrpc": "2.0", "method": "call", "id": 1,
                 "params": {
                     "model": "discuss.channel",
@@ -7798,8 +7801,15 @@ async def _odoo_bot_post_progress(channel_id: int, text: str):
                     }
                 }
             }, cookies=cookies)
+            d = r.json()
+            if "error" in d:
+                print(f"[ODOO-BOT] post_progress Odoo error: {d['error']}")
+            elif "result" in d:
+                print(f"[ODOO-BOT] post_progress OK: msg_id={d.get('result')}")
     except Exception as e:
-        print(f"[ODOO-BOT] post_progress error: {e}")
+        import traceback
+        print(f"[ODOO-BOT] post_progress exception: {e}")
+        traceback.print_exc()
 
 
 async def _odoo_call(model: str, method: str, args: list, kwargs: dict, cookies=None):
