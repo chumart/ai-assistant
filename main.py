@@ -2570,7 +2570,7 @@ REMINDER MANAGEMENT (提醒管理) — STRICT RULES:
 ⚠️ CRITICAL ANTI-HALLUCINATION RULE ⚠️
 DO NOT respond with "已取消" / "cancelled" / "已删除" / "已更新" UNLESS:
   (a) You actually called cancel_reminder/update_reminder in THIS turn, AND
-  (b) The tool returned {"ok": true}
+  (b) The tool returned ok=true
 If you only THINK you cancelled something, you DIDN'T. Tool calls are the only way to make changes.
 If user says "你刚才不是取消了吗?" / "didn't you already cancel?" — that means YOU LIED last time.
 You must apologize, call the tool now, and verify with list_reminders.
