@@ -349,11 +349,16 @@ async def init_db():
                 token       TEXT PRIMARY KEY,
                 uid         INTEGER NOT NULL,
                 username    TEXT,
+                name        TEXT,
                 role        TEXT,
+                client_type TEXT DEFAULT 'web',
                 created_at  TIMESTAMPTZ DEFAULT NOW(),
                 expires_at  TIMESTAMPTZ NOT NULL
             )
         """)
+        # Add missing columns if table existed from older version (idempotent)
+        await conn.execute("ALTER TABLE user_sessions ADD COLUMN IF NOT EXISTS name TEXT")
+        await conn.execute("ALTER TABLE user_sessions ADD COLUMN IF NOT EXISTS client_type TEXT DEFAULT 'web'")
         await conn.execute("""
             CREATE INDEX IF NOT EXISTS user_sessions_uid_idx
             ON user_sessions(uid, expires_at DESC)
@@ -2550,14 +2555,28 @@ Then ask: "你能提供更多信息吗？比如客户名、准确的金额或日
 
 DO NOT say "我找到一条银行对账记录" as an answer — the user is usually asking this FROM the bank line view, so that would just echo their input.
 
-REMINDER MANAGEMENT (提醒管理):
+REMINDER MANAGEMENT (提醒管理) — STRICT RULES:
 - "改一下我的X提醒到Y" / "reschedule X to Y" / "把X提醒改成Y时间" → MUST use update_reminder. 
   STEPS: (1) call list_reminders, (2) find the matching reminder's id, (3) call update_reminder with id + new fire_at.
-  DO NOT call create_reminder + cancel_reminder as a workaround — that creates duplicates (one cancel without one create = orphan).
-- "取消我的X提醒" / "cancel my X reminder" → call list_reminders first to find id, then cancel_reminder(id).
+  DO NOT call create_reminder + cancel_reminder as a workaround — that creates duplicates.
+- "取消我的X提醒" / "cancel my X reminder" / "取消第N个" / "delete reminder N" → 
+  MANDATORY STEPS:
+  (1) call list_reminders to get current id mapping
+  (2) call cancel_reminder(id=X) — YOU MUST ACTUALLY CALL THIS TOOL
+  (3) call list_reminders AGAIN to verify it's gone
+  (4) Only then reply to user with the result
 - "我有什么提醒" / "list my reminders" → list_reminders.
-- NEVER claim a reminder was deleted/cancelled if you didn't actually call cancel_reminder. NEVER claim a reminder was updated if you didn't actually call update_reminder. After ANY change, call list_reminders again to verify and tell user the actual state.
-- If user references a reminder by content (not id), use list_reminders to find candidates. If multiple match, ASK which one — don't guess.
+
+⚠️ CRITICAL ANTI-HALLUCINATION RULE ⚠️
+DO NOT respond with "已取消" / "cancelled" / "已删除" / "已更新" UNLESS:
+  (a) You actually called cancel_reminder/update_reminder in THIS turn, AND
+  (b) The tool returned {"ok": true}
+If you only THINK you cancelled something, you DIDN'T. Tool calls are the only way to make changes.
+If user says "你刚才不是取消了吗?" / "didn't you already cancel?" — that means YOU LIED last time.
+You must apologize, call the tool now, and verify with list_reminders.
+
+When user references a reminder by content (not id), use list_reminders to find candidates. 
+If multiple match, ASK which one — don't guess.
 
 ORDER RELEASE / INVOICE AUTOMATION (开票自动化):
 When user says "release [SO]", "开票 [SO]", "create invoice for [SO]", "process [SO]", or asks "did we receive payment for [SO]?" / "[SO] 收到款了吗" — follow this workflow:
