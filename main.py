@@ -81,7 +81,7 @@ FILE_CACHE: dict = {}  # file_id -> {b64, media_type, name, created_at}
 # Server-side session store: token -> {uid, role, username, created_at}
 # This prevents clients from forging their own role
 SESSION_STORE: dict = {}
-SESSION_TTL_HOURS = 12  # Sessions expire after 12 hours
+SESSION_TTL_HOURS = 12  # Sessions expire after 12 hours (mobile clients can request 30 days)
 FILE_CACHE_TTL_HOURS = 2  # Uploaded files expire after 2 hours
 
 def cleanup_caches():
@@ -97,6 +97,66 @@ def cleanup_caches():
         del FILE_CACHE[f]
     if expired_sessions or expired_files:
         print(f"CACHE CLEANUP: removed {len(expired_sessions)} sessions, {len(expired_files)} files")
+
+
+async def db_save_session(token: str, uid: int, username: str, role: str):
+    """Persist a session to DB so it survives server restarts."""
+    conn = await get_db_conn()
+    if not conn:
+        return
+    try:
+        expires_at = datetime.datetime.now(UTC_TZ) + datetime.timedelta(hours=SESSION_TTL_HOURS)
+        await conn.execute("""
+            INSERT INTO user_sessions (token, uid, username, role, expires_at)
+            VALUES ($1, $2, $3, $4, $5)
+            ON CONFLICT (token) DO UPDATE SET
+                uid = EXCLUDED.uid, username = EXCLUDED.username,
+                role = EXCLUDED.role, expires_at = EXCLUDED.expires_at
+        """, token, uid, username, role, expires_at)
+    except Exception as e:
+        print(f"db_save_session error: {e}")
+    finally:
+        await conn.close()
+
+
+async def db_load_session(token: str) -> dict | None:
+    """Load a session from DB. Returns None if expired or missing."""
+    if not token:
+        return None
+    conn = await get_db_conn()
+    if not conn:
+        return None
+    try:
+        row = await conn.fetchrow("""
+            SELECT uid, username, role, expires_at FROM user_sessions
+            WHERE token = $1 AND expires_at > NOW()
+        """, token)
+        if not row:
+            return None
+        return {
+            "uid": row["uid"],
+            "username": row["username"],
+            "role": row["role"],
+            "created_at": datetime.datetime.now(),  # for compat with in-memory format
+        }
+    except Exception as e:
+        print(f"db_load_session error: {e}")
+        return None
+    finally:
+        await conn.close()
+
+
+async def db_delete_session(token: str):
+    """Delete a session from DB (logout)."""
+    conn = await get_db_conn()
+    if not conn:
+        return
+    try:
+        await conn.execute("DELETE FROM user_sessions WHERE token = $1", token)
+    except Exception as e:
+        print(f"db_delete_session error: {e}")
+    finally:
+        await conn.close()
 
 # Target websites for knowledge base
 TARGET_SITES = [
@@ -282,6 +342,21 @@ async def init_db():
                 phone      TEXT,
                 updated_at TIMESTAMPTZ DEFAULT NOW()
             )
+        """)
+        # Persistent user sessions (survives server restarts) — for 30-day login
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS user_sessions (
+                token       TEXT PRIMARY KEY,
+                uid         INTEGER NOT NULL,
+                username    TEXT,
+                role        TEXT,
+                created_at  TIMESTAMPTZ DEFAULT NOW(),
+                expires_at  TIMESTAMPTZ NOT NULL
+            )
+        """)
+        await conn.execute("""
+            CREATE INDEX IF NOT EXISTS user_sessions_uid_idx
+            ON user_sessions(uid, expires_at DESC)
         """)
         # Pending payments — accumulates partial payments from different channels
         # until total >= SO amount, then triggers auto-invoice
@@ -1946,7 +2021,7 @@ TOOLS = [
     },
     {
         "name": "create_reminder",
-        "description": "Schedule a reminder that notifies the user via email/SMS/voice call at a specified time. Use when user says '提醒我...', 'remind me...', '下个月X号提醒我'. fire_at must be ISO datetime (naive = LA time). Default channel is email. Add 'sms' for text, 'call' for phone call.",
+        "description": "Schedule a reminder that notifies the user via email/SMS/voice call at a specified time. Use when user says '提醒我...', 'remind me...', '下个月X号提醒我'. fire_at must be ISO datetime (naive = LA time). Default channel is email. Add 'sms' for text, 'call' for phone call. CRITICAL: Always compute the date from the 'today' value in your system prompt — do NOT guess. '明天/tomorrow' = today's date + 1 day (use the explicit 'tomorrow' value in your system prompt). When user mentions a weekday like '下周一', count forward from today's weekday. Always confirm the resolved date in your reply (e.g. '已设置 4月28日(周一) 09:00 的提醒')",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -2028,13 +2103,19 @@ TOOLS = [
 ]
 
 def get_system_prompt(role: str = "guest", user_name: str = "", user_id: int = 0, free_mode: bool = False, memories: list = []):
-    today = datetime.date.today().strftime("%Y年%m月%d日")
     now_dt = datetime.datetime.now(LA_TZ)
+    today_la = now_dt.date()
+    today = today_la.strftime("%Y年%m月%d日")
     now_la = now_dt.strftime("%Y-%m-%d %H:%M %Z")
     weekday_names = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
     weekday_cn = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
     dow_en = weekday_names[now_dt.weekday()]
     dow_cn = weekday_cn[now_dt.weekday()]
+    # Pre-compute tomorrow & day-after explicitly so AI doesn't have to guess
+    tomorrow_la = today_la + datetime.timedelta(days=1)
+    tomorrow_str = tomorrow_la.strftime("%Y年%m月%d日")
+    tomorrow_dow_cn = weekday_cn[tomorrow_la.weekday()]
+    tomorrow_dow_en = weekday_names[tomorrow_la.weekday()]
     perms = ROLE_PERMISSIONS.get(role, ROLE_PERMISSIONS["guest"])
 
     # Build permission-specific rules
@@ -2133,7 +2214,9 @@ COST/MARGIN RULES (NO ACCESS):
 
     # Free mode: ONLY when admin explicitly toggles it on
     if role == "admin" and free_mode:
-        return f"""今天是{today}（{dow_cn}/{dow_en}），当前时间(洛杉矶): {now_la}。你是 Chumart AI，Chumart 管理员的专属私人助手。
+        return f"""今天是{today}（{dow_cn}/{dow_en}），当前时间(洛杉矶): {now_la}。
+明天是{tomorrow_str}（{tomorrow_dow_cn}/{tomorrow_dow_en}）。
+你是 Chumart AI，Chumart 管理员的专属私人助手。
 你支持中英文，用用户的语言回复。{memory_block}
 
 【你的能力没有限制】
@@ -2163,7 +2246,9 @@ COST/MARGIN RULES (NO ACCESS):
     if memories:
         memory_block = f"\n\nUSER MEMORY (personalization context):\n" + "\n".join(f"- {m}" for m in memories)
 
-    return f"""今天是{today}（{dow_cn}/{dow_en}），当前时间(洛杉矶): {now_la}。You are Chumart Assistant, an enterprise AI assistant.
+    return f"""今天是{today}（{dow_cn}/{dow_en}），当前时间(洛杉矶): {now_la}。
+明天是{tomorrow_str}（{tomorrow_dow_cn}/{tomorrow_dow_en}）。
+You are Chumart Assistant, an enterprise AI assistant.
 You support both English and Chinese - reply in the same language the user uses.
 
 CURRENT USER: {user_name} | ROLE: {perms['label']} | UID: {user_id}{memory_block}
@@ -6451,22 +6536,64 @@ def resolve_session(req: ChatRequest) -> dict:
     Returns dict with uid, role, user_name."""
     if req.session_token and req.session_token in SESSION_STORE:
         s = SESSION_STORE[req.session_token]
-        # Check expiry
+        # 用每个 session 自己的 TTL (web=12h, mobile=30天)
+        ttl = s.get("ttl_hours", SESSION_TTL_HOURS)
         age = (datetime.datetime.now() - s["created_at"]).total_seconds()
-        if age < SESSION_TTL_HOURS * 3600:
+        if age < ttl * 3600:
             return {"uid": s["uid"], "role": s["role"], "user_name": s["name"]}
         else:
             del SESSION_STORE[req.session_token]
-    # No valid token — treat as guest (prevents role spoofing)
+    # No valid token in memory — treat as guest
     if req.session_token:
         print(f"SECURITY: invalid/expired session_token, treating as guest")
         return {"uid": 0, "role": "guest", "user_name": ""}
     # No token at all — legacy mode (backward compat during transition)
     return {"uid": req.user_id, "role": req.role, "user_name": req.user_name}
 
+
+async def resolve_session_with_db(req: ChatRequest) -> dict:
+    """Same as resolve_session but also checks DB (for mobile sessions that survived restart).
+    If found in DB, restores to in-memory cache."""
+    # 先查内存
+    if req.session_token and req.session_token in SESSION_STORE:
+        return resolve_session(req)
+
+    # 内存没有 → 查 DB (mobile session 重启后会落在这里)
+    if req.session_token:
+        try:
+            conn = await get_db_conn()
+            if conn:
+                try:
+                    row = await conn.fetchrow("""
+                        SELECT uid, username, name, role, client_type, created_at
+                        FROM user_sessions
+                        WHERE token = $1 AND expires_at > NOW()
+                    """, req.session_token)
+                    if row:
+                        # 恢复到内存
+                        ttl_hours = 24 * 30 if row["client_type"] == "mobile" else SESSION_TTL_HOURS
+                        SESSION_STORE[req.session_token] = {
+                            "uid": row["uid"],
+                            "username": row["username"],
+                            "name": row["name"],
+                            "role": row["role"],
+                            "created_at": row["created_at"].replace(tzinfo=None) if row["created_at"] else datetime.datetime.now(),
+                            "ttl_hours": ttl_hours,
+                        }
+                        print(f"SESSION: restored from DB for uid={row['uid']} client={row['client_type']}")
+                        return {"uid": row["uid"], "role": row["role"], "user_name": row["name"]}
+                finally:
+                    await conn.close()
+        except Exception as e:
+            print(f"resolve_session_with_db error: {e}")
+        print(f"SECURITY: invalid/expired session_token, treating as guest")
+        return {"uid": 0, "role": "guest", "user_name": ""}
+    # No token at all — legacy mode
+    return {"uid": req.user_id, "role": req.role, "user_name": req.user_name}
+
 @app.post("/chat")
 async def chat(req: ChatRequest, background_tasks: BackgroundTasks):
-    sess = resolve_session(req)
+    sess = await resolve_session_with_db(req)
     verified_role = sess["role"]
     verified_uid = sess["uid"]
     verified_name = sess["user_name"]
@@ -6640,7 +6767,7 @@ async def chat_stream(req: ChatRequest, background_tasks: BackgroundTasks):
                 except BaseException:
                     pass
 
-    sess = resolve_session(req)
+    sess = await resolve_session_with_db(req)
     verified_role = sess["role"]
     verified_uid = sess["uid"]
     verified_name = sess["user_name"]
@@ -8543,6 +8670,7 @@ USER_ODOO_SESSIONS: dict = {}
 class LoginRequest(BaseModel):
     username: str
     password: str
+    client_type: str = "web"   # "web" (12h, in-memory) or "mobile" (30 days, DB-persisted)
 
 @app.post("/auth/login")
 async def login(req: LoginRequest):
@@ -8573,17 +8701,53 @@ async def login(req: LoginRequest):
             permissions = ROLE_PERMISSIONS.get(role, ROLE_PERMISSIONS["guest"])
 
             # Generate server-side session token
-            # Client will send this in X-Session-Token header; backend resolves uid/role from it
             session_token = str(uuid.uuid4())
             cleanup_caches()
+
+            # 决定 TTL: mobile 30 天 (DB 持久化), web 12 小时 (内存)
+            is_mobile = (req.client_type or "").lower() == "mobile"
+            ttl_hours = 24 * 30 if is_mobile else SESSION_TTL_HOURS
+
+            # 内存缓存所有 session (web 直接用,mobile 也用内存做加速)
             SESSION_STORE[session_token] = {
                 "uid": uid,
                 "username": req.username,
                 "name": name,
                 "role": role,
-                "created_at": datetime.datetime.now()
+                "created_at": datetime.datetime.now(),
+                "ttl_hours": ttl_hours,
             }
-            print(f"LOGIN: uid={uid} name={name} role={role} token={session_token[:8]}...")
+
+            # mobile 额外存到 DB (服务器重启后仍能找回)
+            if is_mobile:
+                try:
+                    conn = await get_db_conn()
+                    if conn:
+                        try:
+                            expires_at = datetime.datetime.now(UTC_TZ) + datetime.timedelta(hours=ttl_hours)
+                            await conn.execute("""
+                                CREATE TABLE IF NOT EXISTS user_sessions (
+                                    token TEXT PRIMARY KEY,
+                                    uid INTEGER NOT NULL,
+                                    username TEXT,
+                                    name TEXT,
+                                    role TEXT,
+                                    client_type TEXT,
+                                    created_at TIMESTAMPTZ DEFAULT NOW(),
+                                    expires_at TIMESTAMPTZ NOT NULL
+                                )
+                            """)
+                            await conn.execute("""
+                                INSERT INTO user_sessions (token, uid, username, name, role, client_type, expires_at)
+                                VALUES ($1, $2, $3, $4, $5, $6, $7)
+                                ON CONFLICT (token) DO UPDATE SET expires_at = EXCLUDED.expires_at
+                            """, session_token, uid, req.username, name, role, "mobile", expires_at)
+                        finally:
+                            await conn.close()
+                except Exception as e:
+                    print(f"WARN: failed to persist mobile session to DB: {e}")
+
+            print(f"LOGIN: uid={uid} name={name} role={role} client={req.client_type} ttl={ttl_hours}h token={session_token[:8]}...")
 
             return {
                 "success":       True,
@@ -8593,7 +8757,8 @@ async def login(req: LoginRequest):
                 "role":          role,
                 "role_label":    permissions["label"],
                 "permissions":   permissions,
-                "session_token": session_token,  # Frontend stores and sends this
+                "session_token": session_token,
+                "expires_in_hours": ttl_hours,
             }
     except Exception as e:
         return {"success": False, "error": str(e)}
