@@ -69,6 +69,10 @@ GMAIL_CREDENTIALS_JSON  = os.getenv("GMAIL_CREDENTIALS_JSON", "")
 GMAIL_USER_EMAIL        = os.getenv("GMAIL_USER_EMAIL", "")
 ZELLE_BANK_SENDER       = os.getenv("ZELLE_BANK_SENDER", "")
 
+# PrintNode — cloud printing service
+PRINTNODE_API_KEY       = os.getenv("PRINTNODE_API_KEY", "")
+PRINTNODE_DEFAULT_PRINTER_ID = os.getenv("PRINTNODE_DEFAULT_PRINTER_ID", "")  # optional — default printer if AI doesn't specify
+
 LA_TZ = ZoneInfo("America/Los_Angeles")
 UTC_TZ = datetime.timezone.utc
 
@@ -2013,6 +2017,34 @@ TOOLS = [
         }
     },
     {
+        "name": "list_printers",
+        "description": (
+            "List all printers available via PrintNode (the cloud printing service). "
+            "Returns each printer's id, name, computer name, state (online/offline), and whether it's the default. "
+            "Use when user asks 'what printers are available?' or before printing to let user pick."
+        ),
+        "input_schema": {"type": "object", "properties": {}}
+    },
+    {
+        "name": "print_invoice",
+        "description": (
+            "Print an invoice PDF on a physical printer via PrintNode. "
+            "Use AFTER odoo_export_invoice_pdf has been called and we have an invoice_id. "
+            "If printer_id is not provided, uses the default printer from env. "
+            "Returns the print job id and status."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "invoice_id": {"type": "integer", "description": "The account.move ID to print"},
+                "printer_id": {"type": "integer", "description": "Optional PrintNode printer ID. If omitted, uses default."},
+                "copies": {"type": "integer", "description": "Number of copies (default 1)"},
+                "title": {"type": "string", "description": "Optional title for the print job (shown in PrintNode dashboard)"}
+            },
+            "required": ["invoice_id"]
+        }
+    },
+    {
         "name": "check_so_payment_status",
         "description": (
             "Check whether a Sales Order has received payment(s) and whether it can be released (invoiced). "
@@ -2750,18 +2782,27 @@ WHAT release_so DOES NOT DO:
   - Does NOT reconcile invoice with payments (Odoo handles this, or user does it manually)
   - Does NOT confirm SO automatically (user must do this in Odoo first)
 
-SHOPIFY (#CMT) and AMAZON (AMZ) — SEPARATE WORKFLOW:
-  These don't go through the webhook queue. Use legacy tools directly:
+SHOPIFY (#CMT) and AMAZON (AMZ) — SEPARATE WORKFLOW (4 steps, fully automated):
+  These orders are pre-paid by the marketplace and don't go through the webhook queue.
+  Run all 4 steps in sequence WITHOUT asking the user between steps:
   1. odoo_create_invoice_from_so(so_name="CMT12345", payment_method="Shopify Payment")
      - For #CMT: payment_method="Shopify Payment", journal="Revenue and COGS"
      - For AMZ: payment_method="Amazon Payment", journal="Amazon PLAT BUS CHECKING"
   2. odoo_register_payment(invoice_id=XXX, journal_name=...)
   3. odoo_export_invoice_pdf(invoice_id=XXX)
+  4. print_invoice(invoice_id=XXX)  ← physically prints via PrintNode
+  Report results with PDF link AND print job confirmation.
 
 CASH PAYMENTS (no webhook):
   If user manually says "客户付了现金 $X for S0xxx":
   1. Confirm with user: "确认收到现金 $X for S0xxx?"
-  2. If confirmed: odoo_create_invoice_from_so(payment_method="Cash") → register_payment(journal="Cash") → export_pdf
+  2. If confirmed: odoo_create_invoice_from_so(payment_method="Cash") → register_payment(journal="Cash") → export_pdf → print_invoice
+
+PRINTING (打印):
+  Use print_invoice tool to physically print via PrintNode after the invoice is created.
+  - Default printer is configured via PRINTNODE_DEFAULT_PRINTER_ID env var.
+  - If user wants a different printer, call list_printers first to show choices.
+  - "再打印一次" / "reprint X" / "print invoice X again" → call print_invoice(invoice_id=X) directly.
 
 PERMISSION: Only admin and finance roles can release.
   If a sales role tries, reply: "需要财务或管理员确认后才能开票。"
@@ -5918,6 +5959,130 @@ async def run_tool(name, inp, context=None):
             print(f"EXPORT_PDF error: {e}")
             return json.dumps({"error": f"Failed to export PDF: {str(e)}"})
 
+    if name == "list_printers":
+        """List all printers available via PrintNode."""
+        if not PRINTNODE_API_KEY:
+            return json.dumps({"error": "PrintNode not configured (set PRINTNODE_API_KEY env var)"})
+        try:
+            # PrintNode auth: HTTP Basic with api_key as username, no password
+            auth_b64 = base64.b64encode(f"{PRINTNODE_API_KEY}:".encode()).decode()
+            async with httpx.AsyncClient(timeout=15) as c:
+                r = await c.get("https://api.printnode.com/printers",
+                                headers={"Authorization": f"Basic {auth_b64}"})
+                if r.status_code != 200:
+                    return json.dumps({"error": f"PrintNode API error: HTTP {r.status_code} — {r.text[:200]}"})
+                printers = r.json()
+            # Trim each printer to useful fields
+            results = []
+            for p in printers:
+                results.append({
+                    "id": p.get("id"),
+                    "name": p.get("name"),
+                    "computer": (p.get("computer") or {}).get("name"),
+                    "state": p.get("state"),  # online / offline
+                    "default": p.get("default", False),
+                    "description": p.get("description"),
+                })
+            return json.dumps({
+                "printers": results,
+                "count": len(results),
+                "default_printer_id_env": PRINTNODE_DEFAULT_PRINTER_ID or None,
+            }, ensure_ascii=False)
+        except Exception as e:
+            print(f"LIST_PRINTERS error: {e}")
+            return json.dumps({"error": f"Failed to list printers: {str(e)}"})
+
+    if name == "print_invoice":
+        """Print an invoice PDF via PrintNode."""
+        if not PRINTNODE_API_KEY:
+            return json.dumps({"error": "PrintNode not configured (set PRINTNODE_API_KEY env var)"})
+
+        invoice_id = inp.get("invoice_id")
+        if not invoice_id:
+            return json.dumps({"error": "invoice_id is required"})
+        printer_id = inp.get("printer_id") or PRINTNODE_DEFAULT_PRINTER_ID
+        if not printer_id:
+            return json.dumps({"error": "No printer_id provided and PRINTNODE_DEFAULT_PRINTER_ID not set. Call list_printers first."})
+        try:
+            printer_id = int(printer_id)
+        except (TypeError, ValueError):
+            return json.dumps({"error": f"Invalid printer_id: {printer_id}"})
+
+        copies = int(inp.get("copies") or 1)
+        title = inp.get("title") or f"Invoice {invoice_id}"
+
+        try:
+            cookies = await odoo_get_session()
+
+            # 1) Get invoice info for nicer title
+            inv_r = json.loads(await odoo_query("account.move",
+                [["id", "=", invoice_id]],
+                ["id", "name", "partner_id", "amount_total"],
+                limit=1, cookies=cookies))
+            if not isinstance(inv_r, list) or not inv_r:
+                return json.dumps({"error": f"Invoice {invoice_id} not found"})
+            inv = inv_r[0]
+            inv_name = inv.get("name") or f"Invoice {invoice_id}"
+            partner_name = (inv.get("partner_id") or [0, ""])[1]
+            if title == f"Invoice {invoice_id}":
+                title = f"{inv_name} — {partner_name}"
+
+            # 2) Generate PDF (use Chumart custom template, fallback to default)
+            async with httpx.AsyncClient(timeout=60, follow_redirects=True) as c:
+                pdf_url = f"{ODOO_URL}/report/pdf/oscg_sdcmt_report.report_cmt_invoice2/{invoice_id}"
+                r = await c.get(pdf_url, cookies=cookies)
+                if r.status_code != 200:
+                    print(f"[PRINT] custom template failed (HTTP {r.status_code}), using default")
+                    fallback_url = f"{ODOO_URL}/report/pdf/account.report_invoice/{invoice_id}"
+                    r = await c.get(fallback_url, cookies=cookies)
+                    if r.status_code != 200:
+                        return json.dumps({"error": f"PDF generation failed: HTTP {r.status_code}"})
+                pdf_bytes = r.content
+                if len(pdf_bytes) < 100:
+                    return json.dumps({"error": "PDF generation returned empty file"})
+
+            # 3) Submit to PrintNode
+            pdf_b64 = base64.b64encode(pdf_bytes).decode("ascii")
+            auth_b64 = base64.b64encode(f"{PRINTNODE_API_KEY}:".encode()).decode()
+
+            payload = {
+                "printerId": printer_id,
+                "title": title,
+                "contentType": "pdf_base64",
+                "content": pdf_b64,
+                "source": "Chumart AI",
+                "qty": copies,
+            }
+
+            async with httpx.AsyncClient(timeout=30) as c:
+                r = await c.post("https://api.printnode.com/printjobs",
+                                 headers={"Authorization": f"Basic {auth_b64}",
+                                          "Content-Type": "application/json"},
+                                 json=payload)
+                if r.status_code not in (200, 201):
+                    return json.dumps({"error": f"PrintNode submit failed: HTTP {r.status_code} — {r.text[:300]}"})
+                # PrintNode returns the job id as a plain integer (not JSON object)
+                try:
+                    job_id = r.json()
+                except Exception:
+                    job_id = r.text.strip()
+
+            print(f"[PRINT] Invoice {inv_name} → PrintNode printer={printer_id}, job_id={job_id}, copies={copies}")
+            return json.dumps({
+                "success": True,
+                "invoice_name": inv_name,
+                "printer_id": printer_id,
+                "job_id": job_id,
+                "copies": copies,
+                "pdf_size_kb": len(pdf_bytes) // 1024,
+                "message": f"Invoice {inv_name} sent to printer (job #{job_id})",
+            }, ensure_ascii=False)
+
+        except Exception as e:
+            print(f"PRINT_INVOICE error: {e}")
+            import traceback; traceback.print_exc()
+            return json.dumps({"error": f"Failed to print invoice: {str(e)}"})
+
     if name == "check_so_payment_status":
         """检查 SO 状态 + 已收款情况，判断是否可以 release。"""
         so_name = (inp.get("so_name") or "").strip()
@@ -6131,6 +6296,20 @@ async def run_tool(name, inp, context=None):
             r3 = json.loads(r3_str) if isinstance(r3_str, str) else r3_str
 
             # ============================================
+            # Step 4b: Auto-print via PrintNode (if configured)
+            # ============================================
+            print_result = None
+            if PRINTNODE_API_KEY and PRINTNODE_DEFAULT_PRINTER_ID:
+                try:
+                    pr_str = await run_tool("print_invoice", {
+                        "invoice_id": invoice_id,
+                    }, context=ctx_local)
+                    print_result = json.loads(pr_str) if isinstance(pr_str, str) else pr_str
+                except Exception as e:
+                    print(f"[RELEASE] auto-print failed (non-fatal): {e}")
+                    print_result = {"error": str(e)}
+
+            # ============================================
             # Step 5: 标记队列为 released + 通知重复
             # ============================================
             await _mark_received_payments_released(so_name, invoice_name)
@@ -6171,11 +6350,14 @@ async def run_tool(name, inp, context=None):
                 "captured_stripe_pis": captured_pis,
                 "duplicate_stripe_pis": duplicate_pis_to_cancel,
                 "pdf_url": r3.get("download_url", ""),
+                "print_result": print_result,
                 "message": (
                     f"✅ SO {so_name} ({partner_name}) released successfully.\n"
                     f"Invoice: {invoice_name} (${so_amount:,.2f})\n"
                     f"Payment method: {payment_method_label}\n"
                     f"PDF: {r3.get('download_url', 'N/A')}"
+                    + (f"\n🖨 Printed (job #{print_result.get('job_id')})" if print_result and print_result.get("success") else "")
+                    + (f"\n⚠️ Print failed: {print_result.get('error')}" if print_result and print_result.get("error") else "")
                     + duplicate_warning
                 ),
             }, ensure_ascii=False)
@@ -7059,7 +7241,7 @@ async def chat(req: ChatRequest, background_tasks: BackgroundTasks):
     # Filter tools based on permissions
     allowed_tools = []
     finance_tools = {"get_monthly_tax", "get_quarterly_tax", "get_monthly_sales", "get_missing_tax", "odoo_match_payment_to_customer"}
-    write_tools = {"odoo_create_record", "odoo_add_order_line", "odoo_confirm_order", "odoo_update_record", "odoo_update_vendor_price", "odoo_create_invoice_from_so", "odoo_register_payment", "odoo_export_invoice_pdf", "release_so"}
+    write_tools = {"odoo_create_record", "odoo_add_order_line", "odoo_confirm_order", "odoo_update_record", "odoo_update_vendor_price", "odoo_create_invoice_from_so", "odoo_register_payment", "odoo_export_invoice_pdf", "release_so", "print_invoice"}
     # Tools that expose vendor names, prices, PO costs — only admin / finance / purchase should see these
     cost_tools = {"odoo_find_recent_purchases_by_skus", "odoo_get_product_vendors", "odoo_create_bulk_po", "get_po_with_so_links", "odoo_restock_analysis"}
     for tool in TOOLS:
@@ -7233,7 +7415,7 @@ async def chat_stream(req: ChatRequest, background_tasks: BackgroundTasks):
     # Filter tools based on permissions
     allowed_tools = []
     finance_tools = {"get_monthly_tax", "get_quarterly_tax", "get_monthly_sales", "get_missing_tax", "odoo_match_payment_to_customer"}
-    write_tools = {"odoo_create_record", "odoo_add_order_line", "odoo_confirm_order", "odoo_update_record", "odoo_update_vendor_price", "odoo_create_invoice_from_so", "odoo_register_payment", "odoo_export_invoice_pdf", "release_so"}
+    write_tools = {"odoo_create_record", "odoo_add_order_line", "odoo_confirm_order", "odoo_update_record", "odoo_update_vendor_price", "odoo_create_invoice_from_so", "odoo_register_payment", "odoo_export_invoice_pdf", "release_so", "print_invoice"}
     # Tools that expose vendor names, prices, PO costs — only admin / finance / purchase should see these
     cost_tools = {"odoo_find_recent_purchases_by_skus", "odoo_get_product_vendors", "odoo_create_bulk_po", "get_po_with_so_links", "odoo_restock_analysis"}
     for tool in TOOLS:
@@ -8020,6 +8202,8 @@ TOOL_PROGRESS_LABELS_ZH = {
     "odoo_create_invoice_from_so": "📄 正在创建发票...",
     "odoo_register_payment":       "💰 正在登记付款...",
     "odoo_export_invoice_pdf":     "📥 正在导出 PDF...",
+    "print_invoice":               "🖨 正在打印发票...",
+    "list_printers":               "🖨 正在列出可用打印机...",
     "release_so":                  "🚀 正在 release 订单...",
     "check_so_payment_status":     "🔎 正在查 SO 付款状态...",
     "search_knowledge_base":       "📚 正在搜索知识库...",
@@ -8057,6 +8241,8 @@ TOOL_PROGRESS_LABELS_EN = {
     "odoo_create_invoice_from_so": "📄 Creating invoice...",
     "odoo_register_payment":       "💰 Registering payment...",
     "odoo_export_invoice_pdf":     "📥 Exporting PDF...",
+    "print_invoice":               "🖨 Printing invoice...",
+    "list_printers":               "🖨 Listing available printers...",
     "release_so":                  "🚀 Releasing order...",
     "check_so_payment_status":     "🔎 Checking payment status...",
     "search_knowledge_base":       "📚 Searching knowledge base...",
@@ -8402,7 +8588,7 @@ async def odoo_bot_chat(req: OdooBotRequest):
     # Filter tools by permission (same logic as /chat)
     allowed_tools = []
     finance_tools = {"get_monthly_tax", "get_quarterly_tax", "get_monthly_sales", "get_missing_tax", "odoo_match_payment_to_customer"}
-    write_tools = {"odoo_create_record", "odoo_add_order_line", "odoo_confirm_order", "odoo_update_record", "odoo_update_vendor_price", "odoo_create_invoice_from_so", "odoo_register_payment", "odoo_export_invoice_pdf", "release_so"}
+    write_tools = {"odoo_create_record", "odoo_add_order_line", "odoo_confirm_order", "odoo_update_record", "odoo_update_vendor_price", "odoo_create_invoice_from_so", "odoo_register_payment", "odoo_export_invoice_pdf", "release_so", "print_invoice"}
     cost_tools = {"odoo_find_recent_purchases_by_skus", "odoo_get_product_vendors", "odoo_create_bulk_po", "get_po_with_so_links", "odoo_restock_analysis"}
     for tool in TOOLS:
         tname = tool["name"]
