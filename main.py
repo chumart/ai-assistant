@@ -10,6 +10,8 @@ import uuid
 import re
 import asyncio
 import datetime
+import hmac
+import hashlib
 from urllib.parse import urljoin, urlparse
 from typing import Optional
 from zoneinfo import ZoneInfo
@@ -56,6 +58,16 @@ SENDGRID_FROM_NAME = os.getenv("SENDGRID_FROM_NAME", "Chumart AI")
 TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID", "")
 TWILIO_AUTH_TOKEN   = os.getenv("TWILIO_AUTH_TOKEN", "")
 TWILIO_FROM_NUMBER  = os.getenv("TWILIO_FROM_NUMBER", "")
+
+# Payment Channels — Stripe / Square / Zelle
+STRIPE_SECRET_KEY       = os.getenv("STRIPE_SECRET_KEY", "")
+STRIPE_WEBHOOK_SECRET   = os.getenv("STRIPE_WEBHOOK_SECRET", "")
+SQUARE_ACCESS_TOKEN           = os.getenv("SQUARE_ACCESS_TOKEN", "")
+SQUARE_WEBHOOK_SIGNATURE_KEY  = os.getenv("SQUARE_WEBHOOK_SIGNATURE_KEY", "")
+SQUARE_ENVIRONMENT            = os.getenv("SQUARE_ENVIRONMENT", "production")
+GMAIL_CREDENTIALS_JSON  = os.getenv("GMAIL_CREDENTIALS_JSON", "")
+GMAIL_USER_EMAIL        = os.getenv("GMAIL_USER_EMAIL", "")
+ZELLE_BANK_SENDER       = os.getenv("ZELLE_BANK_SENDER", "")
 
 LA_TZ = ZoneInfo("America/Los_Angeles")
 UTC_TZ = datetime.timezone.utc
@@ -271,6 +283,25 @@ async def init_db():
                 updated_at TIMESTAMPTZ DEFAULT NOW()
             )
         """)
+        # Pending payments — accumulates partial payments from different channels
+        # until total >= SO amount, then triggers auto-invoice
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS pending_payments (
+                id           SERIAL PRIMARY KEY,
+                so_name      TEXT NOT NULL,
+                so_id        INTEGER,
+                so_amount    NUMERIC(12,2) NOT NULL,
+                channel      TEXT NOT NULL,
+                amount       NUMERIC(12,2) NOT NULL,
+                reference    TEXT DEFAULT '',
+                status       TEXT DEFAULT 'pending',
+                created_at   TIMESTAMPTZ DEFAULT NOW()
+            )
+        """)
+        await conn.execute("""
+            CREATE INDEX IF NOT EXISTS pending_payments_so_idx
+            ON pending_payments(so_name) WHERE status = 'pending'
+        """)
         print("DB initialized OK")
     except Exception as e:
         print(f"DB init error: {e}")
@@ -331,7 +362,7 @@ async def audit_odoo_write(
 @app.on_event("startup")
 async def startup():
     print("=" * 60)
-    print("CHUMART AI BACKEND — BUILD: reminder-v1 (2026-04-26)")
+    print("CHUMART AI BACKEND — BUILD: payment-channels-v1 (2026-04-26)")
     print("=" * 60)
     await init_db()
     # Start reminder scanner (checks every 60 seconds for due reminders)
@@ -339,6 +370,10 @@ async def startup():
         from apscheduler.schedulers.asyncio import AsyncIOScheduler
         scheduler = AsyncIOScheduler()
         scheduler.add_job(_check_due_reminders, "interval", seconds=60)
+        # Zelle Gmail monitor (every 90 seconds)
+        if GMAIL_CREDENTIALS_JSON and GMAIL_USER_EMAIL:
+            scheduler.add_job(_check_zelle_emails, "interval", seconds=90)
+            print("Zelle Gmail monitor started (90s interval)")
         scheduler.start()
         print("Reminder scheduler started (60s interval)")
     except ImportError:
@@ -6969,6 +7004,43 @@ async def invoice_stats(year: int, month: int):
     return await monthly_tax(year, month)
 
 
+@app.get("/admin/pending-payments")
+async def admin_pending_payments():
+    """View all pending partial payments awaiting combo completion."""
+    conn = await get_db_conn()
+    if not conn:
+        return {"error": "DB unavailable"}
+    try:
+        rows = await conn.fetch("""
+            SELECT so_name, so_amount,
+                   array_agg(channel) as channels,
+                   array_agg(amount) as amounts,
+                   SUM(amount) as accumulated,
+                   so_amount - SUM(amount) as remaining,
+                   MIN(created_at) as first_payment,
+                   MAX(created_at) as last_payment
+            FROM pending_payments
+            WHERE status = 'pending'
+            GROUP BY so_name, so_amount, so_id
+            ORDER BY MAX(created_at) DESC
+        """)
+        result = []
+        for r in rows:
+            result.append({
+                "so_name": r["so_name"],
+                "so_amount": float(r["so_amount"]),
+                "channels": list(r["channels"]),
+                "amounts": [float(a) for a in r["amounts"]],
+                "accumulated": float(r["accumulated"]),
+                "remaining": float(r["remaining"]),
+                "first_payment": r["first_payment"].isoformat() if r["first_payment"] else None,
+                "last_payment": r["last_payment"].isoformat() if r["last_payment"] else None,
+            })
+        return {"pending": result, "count": len(result)}
+    finally:
+        await conn.close()
+
+
 # ─────────────────────────────────────────────
 # Odoo Discuss Bot endpoint
 # ─────────────────────────────────────────────
@@ -7108,6 +7180,693 @@ async def odoo_bot_reset(uid: int = 0, bot_secret: str = ""):
     if uid in ODOO_BOT_HISTORY:
         del ODOO_BOT_HISTORY[uid]
     return {"status": "reset", "uid": uid}
+
+
+
+# ─────────────────────────────────────────────
+# Payment Channels — Stripe / Square / Zelle
+# ─────────────────────────────────────────────
+
+async def _match_so_by_amount_and_customer(
+    amount: float,
+    customer_hint: str = "",
+    reference: str = "",
+    cookies=None,
+    allow_partial: bool = False,
+) -> dict | None:
+    """
+    根据金额 + 客户名/reference 从 Odoo 找到匹配的 SO。
+    allow_partial=True 时，也匹配 SO 金额大于付款金额的（部分付款场景）。
+    同时检查 pending_payments 表，看是否有已记录的部分付款。
+    """
+    if not cookies:
+        cookies = await odoo_get_session()
+
+    # 1) 按 SO name 直接查
+    if reference:
+        so_r = json.loads(await odoo_query("sale.order",
+            [["name", "=", reference], ["company_id", "=", 1],
+             ["state", "in", ["sale", "done"]]],
+            ["id", "name", "partner_id", "amount_total", "invoice_status", "invoice_ids"],
+            limit=1, cookies=cookies))
+        if isinstance(so_r, list) and so_r:
+            return so_r[0]
+
+    # 2) 精确金额匹配（±0.01 容差），未完全开票
+    domain = [
+        ["company_id", "=", 1],
+        ["state", "in", ["sale", "done"]],
+        ["invoice_status", "!=", "invoiced"],
+        ["amount_total", ">=", amount - 0.01],
+        ["amount_total", "<=", amount + 0.01],
+    ]
+    so_list = json.loads(await odoo_query("sale.order", domain,
+        ["id", "name", "partner_id", "amount_total", "invoice_status", "invoice_ids"],
+        limit=20, order="id desc", cookies=cookies))
+
+    if isinstance(so_list, list) and so_list:
+        if len(so_list) == 1:
+            return so_list[0]
+        # 多个结果 → 用 customer_hint 模糊匹配
+        if customer_hint:
+            hint_lower = customer_hint.lower()
+            for so in so_list:
+                partner_name = (so.get("partner_id") or [0, ""])[1].lower()
+                if hint_lower in partner_name or partner_name in hint_lower:
+                    return so
+        return so_list[0]
+
+    # 3) 如果精确匹配没结果 + 允许部分付款 → 查金额更大的 SO
+    if allow_partial and amount > 0:
+        # 先看 pending_payments 里有没有已记录的部分付款（同一个 SO 在等后续款项）
+        conn = await get_db_conn()
+        if conn:
+            try:
+                pending_rows = await conn.fetch("""
+                    SELECT DISTINCT so_name, so_id, so_amount FROM pending_payments
+                    WHERE status = 'pending'
+                    ORDER BY created_at DESC LIMIT 20
+                """)
+                for row in pending_rows:
+                    # 检查 pending 里的 SO 是否还有剩余
+                    pending_total = await conn.fetchval("""
+                        SELECT COALESCE(SUM(amount), 0) FROM pending_payments
+                        WHERE so_name = $1 AND status = 'pending'
+                    """, row["so_name"])
+                    remaining = float(row["so_amount"]) - float(pending_total)
+                    # 如果这笔付款接近剩余金额，很可能就是给这个 SO 的
+                    if abs(remaining - amount) < 0.01 or (remaining > 0 and amount <= remaining + 0.01):
+                        so_r = json.loads(await odoo_query("sale.order",
+                            [["name", "=", row["so_name"]], ["company_id", "=", 1]],
+                            ["id", "name", "partner_id", "amount_total", "invoice_status", "invoice_ids"],
+                            limit=1, cookies=cookies))
+                        if isinstance(so_r, list) and so_r:
+                            print(f"[COMBO] Matched partial payment ${amount} to pending SO {row['so_name']} (remaining=${remaining:.2f})")
+                            return so_r[0]
+            finally:
+                await conn.close()
+
+        # 搜索金额更大的 SO（可能是第一笔部分付款）
+        domain_partial = [
+            ["company_id", "=", 1],
+            ["state", "in", ["sale", "done"]],
+            ["invoice_status", "!=", "invoiced"],
+            ["amount_total", ">", amount + 0.01],
+        ]
+        so_partial = json.loads(await odoo_query("sale.order", domain_partial,
+            ["id", "name", "partner_id", "amount_total", "invoice_status", "invoice_ids"],
+            limit=10, order="id desc", cookies=cookies))
+
+        if isinstance(so_partial, list) and so_partial and customer_hint:
+            hint_lower = customer_hint.lower()
+            for so in so_partial:
+                partner_name = (so.get("partner_id") or [0, ""])[1].lower()
+                if hint_lower in partner_name or partner_name in hint_lower:
+                    print(f"[COMBO] Matched partial payment ${amount} to SO {so['name']} (total=${so['amount_total']})")
+                    return so
+
+    return None
+
+
+async def _record_partial_payment(
+    so_name: str,
+    so_id: int,
+    so_amount: float,
+    channel: str,
+    amount: float,
+    reference: str = "",
+) -> dict:
+    """
+    记录一笔部分付款到 pending_payments 表。
+    检查累计金额：如果 >= SO 总额，返回 {"ready": True, payments: [...]}
+    否则返回 {"ready": False, "accumulated": X, "remaining": Y}
+    """
+    conn = await get_db_conn()
+    if not conn:
+        return {"error": "DB not available"}
+    try:
+        # 先检查是否有重复（同 channel + 相近金额 + 5分钟内）
+        dup = await conn.fetchrow("""
+            SELECT id FROM pending_payments
+            WHERE so_name = $1 AND channel = $2
+              AND amount = $3 AND status = 'pending'
+              AND created_at > NOW() - INTERVAL '5 minutes'
+        """, so_name, channel, amount)
+        if dup:
+            print(f"[COMBO] Duplicate payment detected: {so_name} {channel} ${amount}")
+            # 即使重复，也检查累计
+        else:
+            await conn.execute("""
+                INSERT INTO pending_payments (so_name, so_id, so_amount, channel, amount, reference)
+                VALUES ($1, $2, $3, $4, $5, $6)
+            """, so_name, so_id, so_amount, channel, amount, reference)
+
+        # 查累计
+        rows = await conn.fetch("""
+            SELECT id, channel, amount, reference FROM pending_payments
+            WHERE so_name = $1 AND status = 'pending'
+            ORDER BY created_at
+        """, so_name)
+
+        accumulated = sum(float(r["amount"]) for r in rows)
+        remaining = so_amount - accumulated
+
+        print(f"[COMBO] SO {so_name}: accumulated=${accumulated:.2f} / total=${so_amount:.2f}, remaining=${remaining:.2f}")
+
+        if remaining <= 0.01:  # 容差 1 分钱
+            payments = [{"channel": r["channel"], "amount": float(r["amount"]), "reference": r["reference"]} for r in rows]
+            return {"ready": True, "accumulated": accumulated, "payments": payments}
+        else:
+            return {"ready": False, "accumulated": accumulated, "remaining": remaining, "so_amount": so_amount}
+    finally:
+        await conn.close()
+
+
+async def _mark_payments_done(so_name: str):
+    """把 SO 的所有 pending payments 标记为 done"""
+    conn = await get_db_conn()
+    if not conn:
+        return
+    try:
+        await conn.execute("""
+            UPDATE pending_payments SET status = 'done'
+            WHERE so_name = $1 AND status = 'pending'
+        """, so_name)
+    finally:
+        await conn.close()
+
+
+def _build_combo_payment_method(payments: list) -> str:
+    """
+    根据多笔部分付款构建 payment_method 字符串。
+    单笔: "Stripe"
+    多笔: "Combo(Stripe+Zelle)"
+    """
+    channels = list(dict.fromkeys(p["channel"] for p in payments))  # 保持顺序去重
+    if len(channels) == 1:
+        return channels[0]
+    return f"Combo({'+'.join(channels)})"
+
+
+async def _auto_invoice_pipeline(
+    so_name: str,
+    payment_method: str,
+    journal_name: str,
+    skip_register: bool = False,
+    source: str = "webhook",
+    amount: float = None,
+    so_id: int = None,
+    so_amount: float = None,
+    is_combo_ready: bool = False,
+    combo_payments: list = None,
+) -> dict:
+    """
+    统一的自动开票流水线。
+    
+    两种模式:
+    1. 单笔全额付款 → 直接开票 (is_combo_ready=False, amount >= so_amount)
+    2. 部分付款 → 先记录到 pending_payments，凑齐后才开票
+    
+    当 is_combo_ready=True 时，说明已经凑齐，combo_payments 包含所有部分付款明细。
+    """
+    print(f"[{source.upper()}] Auto-invoice pipeline: SO={so_name}, method={payment_method}, "
+          f"amount=${amount}, so_amount=${so_amount}, combo_ready={is_combo_ready}")
+
+    # --- 如果没有明确说已凑齐，检查是否需要走 combo 逻辑 ---
+    if not is_combo_ready and so_amount and amount:
+        # 判断：这笔付款是否覆盖全部金额？（容差 1 分钱）
+        if amount < so_amount - 0.01:
+            # 部分付款 → 记录并检查累计
+            record_result = await _record_partial_payment(
+                so_name=so_name,
+                so_id=so_id or 0,
+                so_amount=so_amount,
+                channel=payment_method,
+                amount=amount,
+                reference=f"{source}:{datetime.datetime.now(datetime.timezone.utc).isoformat()}",
+            )
+            if record_result.get("error"):
+                return record_result
+
+            if not record_result.get("ready"):
+                # 还没凑齐，不开票
+                return {
+                    "status": "partial_recorded",
+                    "so_name": so_name,
+                    "channel": payment_method,
+                    "this_payment": amount,
+                    "accumulated": record_result["accumulated"],
+                    "remaining": record_result["remaining"],
+                    "so_amount": record_result["so_amount"],
+                    "message": f"Partial payment ${amount:,.2f} recorded for {so_name}. "
+                               f"Accumulated: ${record_result['accumulated']:,.2f} / ${record_result['so_amount']:,.2f}. "
+                               f"Remaining: ${record_result['remaining']:,.2f}",
+                }
+            else:
+                # 凑齐了！切换到 combo 模式
+                is_combo_ready = True
+                combo_payments = record_result["payments"]
+                payment_method = _build_combo_payment_method(combo_payments)
+                print(f"[{source.upper()}] Combo payment complete! method={payment_method}")
+
+    ctx = {"uid": 0, "username": f"auto-{source}", "role": "admin"}
+
+    # Step 1: 创建 Invoice
+    result1 = await run_tool("odoo_create_invoice_from_so", {
+        "so_name": so_name,
+        "payment_method": payment_method,
+    }, context=ctx)
+    r1 = json.loads(result1) if isinstance(result1, str) else result1
+
+    if r1.get("already_invoiced"):
+        invoice_id = r1["invoice_id"]
+        print(f"[{source.upper()}] SO {so_name} already invoiced: {r1.get('invoice_name')}")
+    elif r1.get("success"):
+        invoice_id = r1["invoice_id"]
+    else:
+        return {"error": f"Create invoice failed: {r1.get('error', 'unknown')}"}
+
+    # Step 2: Register Payment
+    # Stripe 单独付全款时跳过（Odoo 自动处理）
+    # Combo 模式: 统一走 Revenue and COGS
+    if is_combo_ready:
+        # Combo: 用总金额 register 一次（Odoo 端用 Revenue and COGS）
+        skip_register = False
+        journal_name = "Revenue and COGS"
+
+    if not skip_register:
+        result2 = await run_tool("odoo_register_payment", {
+            "invoice_id": invoice_id,
+            "journal_name": journal_name,
+            "amount": amount if not is_combo_ready else None,  # combo 模式用发票全额
+        }, context=ctx)
+        r2 = json.loads(result2) if isinstance(result2, str) else result2
+        if not r2.get("success") and not r2.get("already_paid"):
+            return {"error": f"Register payment failed: {r2.get('error', 'unknown')}"}
+
+    # Step 3: Export PDF
+    result3 = await run_tool("odoo_export_invoice_pdf", {
+        "invoice_id": invoice_id,
+    }, context=ctx)
+    r3 = json.loads(result3) if isinstance(result3, str) else result3
+
+    # 标记 pending payments 为 done
+    if is_combo_ready:
+        await _mark_payments_done(so_name)
+
+    return {
+        "success": True,
+        "so_name": so_name,
+        "invoice_id": invoice_id,
+        "invoice_name": r1.get("invoice_name", ""),
+        "payment_method": payment_method,
+        "pdf_url": r3.get("download_url", ""),
+        "source": source,
+        "combo": is_combo_ready,
+        "combo_payments": combo_payments if is_combo_ready else None,
+    }
+
+
+# ---- Stripe Webhook ----
+
+# Notification recipients for payment alerts
+PAYMENT_ALERT_EMAILS = ["di@chumartusa.com", "ashley@chumartusa.com"]
+
+async def _notify_stripe_duplicate(so_name: str, amount: float, keep_pi_id: str, duplicate_pi_ids: list):
+    """通知管理员 Stripe 检测到同一 SO 的重复付款"""
+    dup_lines = "\n".join(
+        f"  - {pid}  →  https://dashboard.stripe.com/payments/{pid}"
+        for pid in duplicate_pi_ids
+    )
+    subject = f"⚠️ Stripe 重复付款 — {so_name} (${amount:,.2f})"
+    body = (
+        f"SO {so_name} 在 Stripe 存在多笔相同金额的待 capture 付款。\n"
+        f"AI 已自动 capture 第一笔，其余已拦截。\n\n"
+        f"✅ 已 capture:\n"
+        f"  - {keep_pi_id}  →  https://dashboard.stripe.com/payments/{keep_pi_id}\n\n"
+        f"❌ 已拦截（需要人工 cancel）:\n{dup_lines}\n\n"
+        f"请登录 Stripe Dashboard 取消多余的付款。\n"
+        f"7 天内未 capture 的付款会自动释放回客户。"
+    )
+    for email in PAYMENT_ALERT_EMAILS:
+        ok, err = await _send_email(email, subject, body)
+        if ok:
+            print(f"[STRIPE] Duplicate alert sent to {email}")
+        else:
+            print(f"[STRIPE] Failed to send alert to {email}: {err}")
+
+
+@app.post("/stripe/webhook")
+async def stripe_webhook(request: Request):
+    """
+    Stripe webhook — Odoo 发付款链接 → 客户付款 → requires_capture。
+    
+    核心逻辑（capture 前检测重复）:
+    1. 从 description 读 SO 编号
+    2. 调 Stripe API 搜索同一 SO 的所有 requires_capture 的 PaymentIntent
+    3. 如果 > 1 个 → 只 capture 第一个，其余拦截 + 通知管理员
+    4. capture 成功 → 自动开票
+    """
+    import stripe
+    stripe.api_key = STRIPE_SECRET_KEY
+
+    payload = await request.body()
+    sig_header = request.headers.get("stripe-signature", "")
+
+    try:
+        event = stripe.Webhook.construct_event(payload, sig_header, STRIPE_WEBHOOK_SECRET)
+    except ValueError:
+        print("[STRIPE] Invalid payload")
+        from fastapi.responses import JSONResponse
+        return JSONResponse({"error": "Invalid payload"}, status_code=400)
+    except stripe.error.SignatureVerificationError:
+        print("[STRIPE] Invalid signature")
+        from fastapi.responses import JSONResponse
+        return JSONResponse({"error": "Invalid signature"}, status_code=400)
+
+    event_type = event["type"]
+    print(f"[STRIPE] Event: {event_type}")
+
+    if event_type == "payment_intent.requires_capture":
+        pi = event["data"]["object"]
+        pi_id = pi["id"]
+        amount = pi["amount"] / 100.0
+
+        # --- 从 Odoo 生成的 PaymentIntent 提取信息 ---
+        so_ref = (pi.get("description") or "").strip()
+        billing = pi.get("charges", {}).get("data", [{}])[0].get("billing_details", {})
+        customer_name = (billing.get("name") or "").strip()
+        if not customer_name:
+            customer_name = pi.get("shipping", {}).get("name", "")
+        customer_email = pi.get("receipt_email", "")
+
+        print(f"[STRIPE] requires_capture: pi={pi_id}, ${amount}, SO={so_ref}, customer={customer_name}")
+
+        try:
+            # ============================================
+            # 重复付款检测 — capture 之前查 Stripe
+            # ============================================
+            # 搜索 Stripe 上同一个 SO 的所有 PaymentIntent
+            # Stripe PaymentIntent.list 不支持按 description 过滤，
+            # 所以先查 customer 的最近 PI，再按 description 筛选
+            duplicate_pi_ids = []
+
+            if so_ref:
+                customer_id = pi.get("customer")
+                try:
+                    # 方法1: 按 customer 查最近的 PI
+                    search_params = {"limit": 20}
+                    if customer_id:
+                        search_params["customer"] = customer_id
+                    recent_pis = stripe.PaymentIntent.list(**search_params)
+
+                    # 找出同一个 SO (description) + 同金额 + requires_capture 的
+                    same_so_pis = []
+                    for rpi in recent_pis.data:
+                        if (rpi.description == so_ref
+                                and rpi.amount == pi["amount"]
+                                and rpi.status == "requires_capture"):
+                            same_so_pis.append(rpi.id)
+
+                    if len(same_so_pis) > 1:
+                        # 有重复！按创建时间排序，只保留最早的那个
+                        print(f"[STRIPE] ⚠️ DUPLICATE DETECTED: {len(same_so_pis)} PIs for SO {so_ref}: {same_so_pis}")
+
+                        # 当前这个 PI 是不是最早的？
+                        # same_so_pis 从 Stripe 返回的是按创建时间倒序的
+                        oldest_pi_id = same_so_pis[-1]  # 最后一个 = 最早创建的
+
+                        if pi_id != oldest_pi_id:
+                            # 当前这个不是最早的 → 拦截，不 capture
+                            print(f"[STRIPE] Blocking duplicate: {pi_id} (keeping {oldest_pi_id})")
+                            duplicate_pi_ids = [p for p in same_so_pis if p != oldest_pi_id]
+                            await _notify_stripe_duplicate(so_ref, amount, oldest_pi_id, duplicate_pi_ids)
+                            return {
+                                "status": "duplicate_blocked",
+                                "so_name": so_ref,
+                                "blocked_pi": pi_id,
+                                "kept_pi": oldest_pi_id,
+                                "total_duplicates": len(same_so_pis),
+                                "message": f"Duplicate #{pi_id} blocked for {so_ref}. Admin notified.",
+                            }
+                        else:
+                            # 当前是最早的 → 继续 capture，但通知管理员有重复要 cancel
+                            duplicate_pi_ids = [p for p in same_so_pis if p != pi_id]
+                            print(f"[STRIPE] This is the first PI, will capture. Duplicates to cancel: {duplicate_pi_ids}")
+
+                except stripe.error.StripeError as e:
+                    # 查不到也不要阻止正常流程
+                    print(f"[STRIPE] Duplicate check query failed (non-fatal): {e}")
+
+            # ============================================
+            # Capture 扣款
+            # ============================================
+            captured = stripe.PaymentIntent.capture(pi_id)
+            print(f"[STRIPE] Captured: {pi_id}, status={captured['status']}")
+
+            if captured["status"] != "succeeded":
+                return {"status": "capture_pending"}
+
+            # 如果检测到了重复，通知管理员去 cancel 多余的
+            if duplicate_pi_ids:
+                await _notify_stripe_duplicate(so_ref, amount, pi_id, duplicate_pi_ids)
+
+            # ============================================
+            # 匹配 SO → 自动开票
+            # ============================================
+            cookies = await odoo_get_session()
+            so = await _match_so_by_amount_and_customer(
+                amount=amount,
+                customer_hint=customer_name or customer_email,
+                reference=so_ref,
+                cookies=cookies,
+                allow_partial=True,
+            )
+            if not so:
+                print(f"[STRIPE] No matching SO for ${amount}")
+                return {"status": "no_matching_so", "amount": amount}
+
+            result = await _auto_invoice_pipeline(
+                so_name=so["name"],
+                payment_method="Stripe",
+                journal_name="Revenue and COGS",
+                skip_register=True,
+                source="stripe",
+                amount=amount,
+                so_id=so["id"],
+                so_amount=float(so.get("amount_total", 0)),
+            )
+            print(f"[STRIPE] Pipeline result: {json.dumps(result)}")
+            return result
+
+        except stripe.error.StripeError as e:
+            print(f"[STRIPE] API error: {e}")
+            from fastapi.responses import JSONResponse
+            return JSONResponse({"error": str(e)}, status_code=500)
+        except Exception as e:
+            print(f"[STRIPE] Error: {e}")
+            import traceback; traceback.print_exc()
+            from fastapi.responses import JSONResponse
+            return JSONResponse({"error": str(e)}, status_code=500)
+
+    return {"status": "ok"}
+
+
+# ---- Square Webhook ----
+
+def _verify_square_signature(body: bytes, signature: str, signature_key: str, notification_url: str) -> bool:
+    combined = notification_url.encode("utf-8") + body
+    expected = hmac.new(
+        signature_key.encode("utf-8"),
+        combined,
+        hashlib.sha256
+    ).digest()
+    expected_b64 = base64.b64encode(expected).decode("utf-8")
+    return hmac.compare_digest(expected_b64, signature)
+
+
+@app.post("/square/webhook")
+async def square_webhook(request: Request):
+    """Square webhook: payment.completed → match SO → invoice → register payment → PDF"""
+    body = await request.body()
+    signature = request.headers.get("x-square-hmacsha256-signature", "")
+
+    notification_url = str(request.url)
+    if SQUARE_WEBHOOK_SIGNATURE_KEY and not _verify_square_signature(
+        body, signature, SQUARE_WEBHOOK_SIGNATURE_KEY, notification_url
+    ):
+        print("[SQUARE] Invalid signature")
+        from fastapi.responses import JSONResponse
+        return JSONResponse({"error": "Invalid signature"}, status_code=400)
+
+    event = json.loads(body)
+    event_type = event.get("type", "")
+    print(f"[SQUARE] Event: {event_type}")
+
+    if event_type == "payment.completed":
+        payment = event.get("data", {}).get("object", {}).get("payment", {})
+        amount = payment.get("total_money", {}).get("amount", 0) / 100.0
+        note = payment.get("note", "")
+        customer_id = payment.get("customer_id", "")
+
+        print(f"[SQUARE] Payment: ${amount}, note={note}")
+
+        so_ref = ""
+        if note:
+            m = re.search(r'S\d{5,}', note, re.IGNORECASE)
+            if m:
+                so_ref = m.group(0)
+
+        try:
+            customer_name = ""
+            if customer_id and SQUARE_ACCESS_TOKEN:
+                try:
+                    from square.client import Client as SquareClient
+                    sq_client = SquareClient(access_token=SQUARE_ACCESS_TOKEN, environment=SQUARE_ENVIRONMENT)
+                    cust_r = sq_client.customers.retrieve_customer(customer_id=customer_id)
+                    if cust_r.is_success():
+                        cust = cust_r.body.get("customer", {})
+                        customer_name = f"{cust.get('given_name', '')} {cust.get('family_name', '')}".strip()
+                except Exception as e:
+                    print(f"[SQUARE] Customer lookup failed: {e}")
+
+            cookies = await odoo_get_session()
+            so = await _match_so_by_amount_and_customer(
+                amount=amount,
+                customer_hint=customer_name,
+                reference=so_ref,
+                cookies=cookies,
+                allow_partial=True,
+            )
+            if not so:
+                print(f"[SQUARE] No matching SO for ${amount}")
+                return {"status": "no_matching_so", "amount": amount}
+
+            result = await _auto_invoice_pipeline(
+                so_name=so["name"],
+                payment_method="POS Machine",
+                journal_name="Revenue and COGS",
+                skip_register=False,
+                source="square",
+                amount=amount,
+                so_id=so["id"],
+                so_amount=float(so.get("amount_total", 0)),
+            )
+            print(f"[SQUARE] Pipeline result: {json.dumps(result)}")
+            return result
+
+        except Exception as e:
+            print(f"[SQUARE] Error: {e}")
+            import traceback; traceback.print_exc()
+            from fastapi.responses import JSONResponse
+            return JSONResponse({"error": str(e)}, status_code=500)
+
+    return {"status": "ok"}
+
+
+# ---- Zelle Gmail Monitor ----
+
+async def _check_zelle_emails():
+    """每 90 秒检查 Gmail 的 Zelle 收款通知 → 匹配 SO → 自动开票"""
+    if not GMAIL_CREDENTIALS_JSON or not GMAIL_USER_EMAIL:
+        return
+
+    try:
+        from google.oauth2 import service_account
+        from googleapiclient.discovery import build
+        import base64 as b64
+
+        creds_dict = json.loads(GMAIL_CREDENTIALS_JSON)
+
+        if creds_dict.get("type") == "service_account":
+            creds = service_account.Credentials.from_service_account_info(
+                creds_dict,
+                scopes=["https://www.googleapis.com/auth/gmail.readonly",
+                        "https://www.googleapis.com/auth/gmail.modify"],
+            )
+            creds = creds.with_subject(GMAIL_USER_EMAIL)
+        else:
+            from google.oauth2.credentials import Credentials
+            creds = Credentials.from_authorized_user_info(creds_dict)
+
+        service = build("gmail", "v1", credentials=creds)
+
+        query_parts = ["is:unread"]
+        if ZELLE_BANK_SENDER:
+            query_parts.append(f"from:{ZELLE_BANK_SENDER}")
+        query_parts.append("(subject:Zelle OR subject:received)")
+        query = " ".join(query_parts)
+
+        results = service.users().messages().list(userId="me", q=query, maxResults=10).execute()
+        messages = results.get("messages", [])
+        if not messages:
+            return
+
+        print(f"[ZELLE] Found {len(messages)} unread Zelle notification(s)")
+
+        for msg_meta in messages:
+            msg_id = msg_meta["id"]
+            msg = service.users().messages().get(userId="me", id=msg_id, format="full").execute()
+
+            headers = {h["name"]: h["value"] for h in msg.get("payload", {}).get("headers", [])}
+            subject = headers.get("Subject", "")
+
+            body_text = ""
+            payload = msg.get("payload", {})
+            if payload.get("body", {}).get("data"):
+                body_text = b64.urlsafe_b64decode(payload["body"]["data"]).decode("utf-8", errors="replace")
+            elif payload.get("parts"):
+                for part in payload["parts"]:
+                    if part.get("mimeType") == "text/plain" and part.get("body", {}).get("data"):
+                        body_text = b64.urlsafe_b64decode(part["body"]["data"]).decode("utf-8", errors="replace")
+                        break
+
+            combined = f"{subject} {body_text}"
+            print(f"[ZELLE] Processing: {subject[:80]}")
+
+            amount_match = re.search(r'\$?([\d,]+\.\d{2})', combined)
+            if not amount_match:
+                print(f"[ZELLE] Cannot parse amount from: {subject}")
+                service.users().messages().modify(
+                    userId="me", id=msg_id, body={"removeLabelIds": ["UNREAD"]}
+                ).execute()
+                continue
+
+            amount = float(amount_match.group(1).replace(",", ""))
+
+            sender_match = re.search(r'from\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)', combined)
+            sender_name = sender_match.group(1) if sender_match else ""
+
+            print(f"[ZELLE] Parsed: ${amount} from '{sender_name}'")
+
+            cookies = await odoo_get_session()
+            so = await _match_so_by_amount_and_customer(
+                amount=amount, customer_hint=sender_name, cookies=cookies,
+                allow_partial=True,
+            )
+
+            if so:
+                result = await _auto_invoice_pipeline(
+                    so_name=so["name"],
+                    payment_method="Zelle",
+                    journal_name="Revenue and COGS",
+                    skip_register=False,
+                    source="zelle",
+                    amount=amount,
+                    so_id=so["id"],
+                    so_amount=float(so.get("amount_total", 0)),
+                )
+                print(f"[ZELLE] Pipeline result: {json.dumps(result)}")
+            else:
+                print(f"[ZELLE] No matching SO for ${amount} from {sender_name}")
+
+            service.users().messages().modify(
+                userId="me", id=msg_id, body={"removeLabelIds": ["UNREAD"]}
+            ).execute()
+
+    except Exception as e:
+        print(f"[ZELLE] Check error: {e}")
+        import traceback; traceback.print_exc()
 
 
 @app.get("/health")
