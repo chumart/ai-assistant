@@ -2843,8 +2843,8 @@ PRINTING (打印):
   - If user wants a different printer, call list_printers first to show choices.
   - "再打印一次" / "reprint X" / "print invoice X again" → call print_invoice(invoice_id=X) directly.
 
-PERMISSION: Only admin and finance roles can release.
-  If a sales role tries, reply: "需要财务或管理员确认后才能开票。"
+PERMISSION: Only admin, finance, and sales_manager roles can release.
+  If a sales / warehouse / guest role tries, reply: "需要财务、管理员或销售经理确认后才能开票。"
 
 RESTOCK ANALYSIS (补货分析):
 When the user asks anything like "哪些产品需要补货", "补货分析", "restock analysis", "what needs reordering", "库存预警", "inventory alert", "根据出库看看该采购什么" — follow this workflow:
@@ -7299,12 +7299,17 @@ async def chat(req: ChatRequest, background_tasks: BackgroundTasks):
     # Filter tools based on permissions
     allowed_tools = []
     finance_tools = {"get_monthly_tax", "get_quarterly_tax", "get_monthly_sales", "get_missing_tax", "odoo_match_payment_to_customer"}
-    write_tools = {"odoo_create_record", "odoo_add_order_line", "odoo_confirm_order", "odoo_update_record", "odoo_update_vendor_price", "odoo_create_invoice_from_so", "odoo_register_payment", "odoo_export_invoice_pdf", "release_so", "print_invoice"}
+    # Release-related tools — allowed for can_release_so (admin/finance/sales_manager)
+    release_tools = {"odoo_create_invoice_from_so", "odoo_register_payment", "odoo_export_invoice_pdf", "release_so", "print_invoice", "check_so_payment_status"}
+    # Other write tools (PO, product/price edits) — admin/finance only (NOT sales_manager)
+    write_tools = {"odoo_create_record", "odoo_add_order_line", "odoo_confirm_order", "odoo_update_record", "odoo_update_vendor_price"}
     # Tools that expose vendor names, prices, PO costs — only admin / finance / purchase should see these
     cost_tools = {"odoo_find_recent_purchases_by_skus", "odoo_get_product_vendors", "odoo_create_bulk_po", "get_po_with_so_links", "odoo_restock_analysis"}
     for tool in TOOLS:
         tname = tool["name"]
         if tname in finance_tools and not perms.get("can_see_finance"):
+            continue
+        if tname in release_tools and not perms.get("can_release_so"):
             continue
         if tname in write_tools and not perms.get("can_write_odoo"):
             continue
@@ -7346,7 +7351,7 @@ async def chat(req: ChatRequest, background_tasks: BackgroundTasks):
         memories = await db_get_memory(verified_uid)
 
     # Determine model — admin/finance default to Sonnet, others to Haiku
-    default_model = "claude-sonnet-4-5" if verified_role in ("admin", "finance") else "claude-haiku-4-5-20251001"
+    default_model = "claude-sonnet-4-5" if verified_role in ("admin", "finance", "sales_manager") else "claude-haiku-4-5-20251001"
     if verified_role == "admin" and req.model in ALLOWED_MODELS:
         selected_model = req.model
     elif verified_role != "admin" and req.model in NON_ADMIN_MODELS:
@@ -7473,12 +7478,17 @@ async def chat_stream(req: ChatRequest, background_tasks: BackgroundTasks):
     # Filter tools based on permissions
     allowed_tools = []
     finance_tools = {"get_monthly_tax", "get_quarterly_tax", "get_monthly_sales", "get_missing_tax", "odoo_match_payment_to_customer"}
-    write_tools = {"odoo_create_record", "odoo_add_order_line", "odoo_confirm_order", "odoo_update_record", "odoo_update_vendor_price", "odoo_create_invoice_from_so", "odoo_register_payment", "odoo_export_invoice_pdf", "release_so", "print_invoice"}
+    # Release-related tools — allowed for can_release_so (admin/finance/sales_manager)
+    release_tools = {"odoo_create_invoice_from_so", "odoo_register_payment", "odoo_export_invoice_pdf", "release_so", "print_invoice", "check_so_payment_status"}
+    # Other write tools (PO, product/price edits) — admin/finance only (NOT sales_manager)
+    write_tools = {"odoo_create_record", "odoo_add_order_line", "odoo_confirm_order", "odoo_update_record", "odoo_update_vendor_price"}
     # Tools that expose vendor names, prices, PO costs — only admin / finance / purchase should see these
     cost_tools = {"odoo_find_recent_purchases_by_skus", "odoo_get_product_vendors", "odoo_create_bulk_po", "get_po_with_so_links", "odoo_restock_analysis"}
     for tool in TOOLS:
         tname = tool["name"]
         if tname in finance_tools and not perms.get("can_see_finance"):
+            continue
+        if tname in release_tools and not perms.get("can_release_so"):
             continue
         if tname in write_tools and not perms.get("can_write_odoo"):
             continue
@@ -7513,7 +7523,7 @@ async def chat_stream(req: ChatRequest, background_tasks: BackgroundTasks):
         memories = await db_get_memory(verified_uid)
 
     # Determine model — admin/finance default to Sonnet, others to Haiku
-    default_model = "claude-sonnet-4-5" if verified_role in ("admin", "finance") else "claude-haiku-4-5-20251001"
+    default_model = "claude-sonnet-4-5" if verified_role in ("admin", "finance", "sales_manager") else "claude-haiku-4-5-20251001"
     if verified_role == "admin" and req.model in ALLOWED_MODELS:
         selected_model = req.model
     elif verified_role != "admin" and req.model in NON_ADMIN_MODELS:
@@ -8646,11 +8656,16 @@ async def odoo_bot_chat(req: OdooBotRequest):
     # Filter tools by permission (same logic as /chat)
     allowed_tools = []
     finance_tools = {"get_monthly_tax", "get_quarterly_tax", "get_monthly_sales", "get_missing_tax", "odoo_match_payment_to_customer"}
-    write_tools = {"odoo_create_record", "odoo_add_order_line", "odoo_confirm_order", "odoo_update_record", "odoo_update_vendor_price", "odoo_create_invoice_from_so", "odoo_register_payment", "odoo_export_invoice_pdf", "release_so", "print_invoice"}
+    # Release-related tools — allowed for can_release_so (admin/finance/sales_manager)
+    release_tools = {"odoo_create_invoice_from_so", "odoo_register_payment", "odoo_export_invoice_pdf", "release_so", "print_invoice", "check_so_payment_status"}
+    # Other write tools (PO, product/price edits) — admin/finance only (NOT sales_manager)
+    write_tools = {"odoo_create_record", "odoo_add_order_line", "odoo_confirm_order", "odoo_update_record", "odoo_update_vendor_price"}
     cost_tools = {"odoo_find_recent_purchases_by_skus", "odoo_get_product_vendors", "odoo_create_bulk_po", "get_po_with_so_links", "odoo_restock_analysis"}
     for tool in TOOLS:
         tname = tool["name"]
         if tname in finance_tools and not perms.get("can_see_finance"):
+            continue
+        if tname in release_tools and not perms.get("can_release_so"):
             continue
         if tname in write_tools and not perms.get("can_write_odoo"):
             continue
@@ -8698,7 +8713,7 @@ ODOO DISCUSS BOT RULES (you are responding inside Odoo Discuss chat, NOT the web
     # Haiku for others (faster, cheaper).
     tool_context = {"uid": uid, "username": author, "role": role}
     headers = {"x-api-key": ANTHROPIC_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json"}
-    bot_model = "claude-sonnet-4-5" if role in ("admin", "finance") else "claude-haiku-4-5-20251001"
+    bot_model = "claude-sonnet-4-5" if role in ("admin", "finance", "sales_manager") else "claude-haiku-4-5-20251001"
     print(f"[ODOO-BOT] uid={uid} role={role} model={bot_model}")
 
     try:
@@ -9639,6 +9654,7 @@ ROLE_PERMISSIONS = {
         "can_see_products":   True,
         "can_export":         True,
         "can_write_odoo":     True,
+        "can_release_so":     True,
     },
     "finance": {
         "label": "Finance",
@@ -9649,6 +9665,7 @@ ROLE_PERMISSIONS = {
         "can_see_products":   True,
         "can_export":         True,
         "can_write_odoo":     True,
+        "can_release_so":     True,
     },
     "purchase": {
         "label": "Purchase",
@@ -9659,6 +9676,18 @@ ROLE_PERMISSIONS = {
         "can_see_products":   True,
         "can_export":         True,
         "can_write_odoo":     True,
+        "can_release_so":     False,   # Purchase staff don't release SOs
+    },
+    "sales_manager": {
+        "label": "Sales Manager",
+        "can_see_finance":    False,
+        "can_see_all_sales":  True,    # can see whole team's orders
+        "can_see_cost":       False,
+        "can_see_inventory":  True,
+        "can_see_products":   True,
+        "can_export":         True,
+        "can_write_odoo":     False,   # CANNOT create POs, edit products/prices, etc.
+        "can_release_so":     True,    # CAN release SOs (invoice/payment/print only)
     },
     "sales": {
         "label": "Sales",
@@ -9697,8 +9726,9 @@ ODOO_GROUP_ROLE_MAP = [
     # Finance / Accounting — only real accountants, NOT invoice users
     ("account.group_account_manager",      "finance"),
     ("account.group_account_user",         "finance"),
+    # Sales Manager — checked BEFORE regular sales so manager gets the higher role
+    ("sales_team.group_sale_manager",      "sales_manager"),
     # Sales — checked BEFORE account_invoice so salespeople aren't misclassified
-    ("sales_team.group_sale_manager",      "sales"),
     ("sales_team.group_sale_salesman",     "sales"),
     ("base.group_sale_salesman",           "sales"),
     # Warehouse / Inventory
