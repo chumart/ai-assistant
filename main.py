@@ -302,6 +302,31 @@ async def init_db():
             CREATE INDEX IF NOT EXISTS pending_payments_so_idx
             ON pending_payments(so_name) WHERE status = 'pending'
         """)
+        # Received payments — webhook captures all incoming payments here.
+        # User must explicitly "release" SO via AI to trigger invoice creation.
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS received_payments (
+                id            SERIAL PRIMARY KEY,
+                so_name       TEXT NOT NULL,
+                channel       TEXT NOT NULL,
+                amount        NUMERIC(12,2) NOT NULL,
+                external_ref  TEXT DEFAULT '',
+                customer_name TEXT DEFAULT '',
+                status        TEXT DEFAULT 'received',
+                released_at   TIMESTAMPTZ,
+                invoice_name  TEXT DEFAULT '',
+                created_at    TIMESTAMPTZ DEFAULT NOW()
+            )
+        """)
+        await conn.execute("""
+            CREATE INDEX IF NOT EXISTS received_payments_so_idx
+            ON received_payments(so_name, status, created_at DESC)
+        """)
+        await conn.execute("""
+            CREATE UNIQUE INDEX IF NOT EXISTS received_payments_external_ref_uniq
+            ON received_payments(channel, external_ref)
+            WHERE external_ref != ''
+        """)
         print("DB initialized OK")
     except Exception as e:
         print(f"DB init error: {e}")
@@ -1884,6 +1909,42 @@ TOOLS = [
         }
     },
     {
+        "name": "check_so_payment_status",
+        "description": (
+            "Check whether a Sales Order has received payment(s) and whether it can be released (invoiced). "
+            "Use this when user asks 'has SO X been paid?', 'did we receive payment for X?', or before releasing a SO. "
+            "Returns: SO state (must be 'sale' or 'done' to release), list of received payments from Stripe/Square/Zelle, "
+            "total received amount, SO total amount, whether already invoiced, and whether eligible for release."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "so_name": {"type": "string", "description": "Sales Order name like S04301 or CMT12345"}
+            },
+            "required": ["so_name"]
+        }
+    },
+    {
+        "name": "release_so",
+        "description": (
+            "Release a Sales Order = create invoice + register payment + export PDF. "
+            "USE THIS ONLY AFTER user explicitly confirms (e.g., '确认', 'yes', 'release', '开票'). "
+            "Pre-conditions checked automatically: (1) SO state must be 'sale' or 'done' (confirmed); "
+            "(2) Total received payments must be >= SO amount; (3) SO must not already have a posted/paid invoice. "
+            "If preconditions fail, returns error explaining what's wrong. "
+            "Payment method auto-detected from received_payments: single channel = 'Stripe'/'Zelle'/'POS Machine'; "
+            "multiple = 'Combo(Stripe+Zelle)'. Stripe-only payments skip register_payment (Odoo handles automatically). "
+            "ALWAYS call check_so_payment_status first and show user the details, then ask for confirmation before calling this."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "so_name": {"type": "string", "description": "Sales Order name to release"}
+            },
+            "required": ["so_name"]
+        }
+    },
+    {
         "name": "create_reminder",
         "description": "Schedule a reminder that notifies the user via email/SMS/voice call at a specified time. Use when user says '提醒我...', 'remind me...', '下个月X号提醒我'. fire_at must be ISO datetime (naive = LA time). Default channel is email. Add 'sms' for text, 'call' for phone call.",
         "input_schema": {
@@ -2386,38 +2447,57 @@ Then ask: "你能提供更多信息吗？比如客户名、准确的金额或日
 DO NOT say "我找到一条银行对账记录" as an answer — the user is usually asking this FROM the bank line view, so that would just echo their input.
 
 ORDER RELEASE / INVOICE AUTOMATION (开票自动化):
-When user says "release [SO]", "开票 [SO]", "create invoice for [SO]", "process [SO]", or similar — follow this workflow:
+When user says "release [SO]", "开票 [SO]", "create invoice for [SO]", "process [SO]", or asks "did we receive payment for [SO]?" / "[SO] 收到款了吗" — follow this workflow:
 
-THREE TYPES OF ORDERS — different rules for each:
+WEBHOOK QUEUE WORKFLOW (Stripe/Zelle/Square):
+The webhook RECORDS payments to a queue but does NOT capture or invoice them. 
+Capture happens ONLY when the user explicitly releases via AI.
 
-TYPE 1 — Shopify (#CMT prefix) and Amazon (AMZ prefix):
-  These orders are already paid when they appear in Odoo. PROCEED DIRECTLY:
-  1. Call odoo_create_invoice_from_so(so_name="CMT12345", payment_method="Shopify Payment")
-     - For #CMT orders: payment_method = "Shopify Payment"
-     - For AMZ orders: payment_method = "Amazon Payment"
-  2. Call odoo_register_payment(invoice_id=XXX, journal_name="Revenue and COGS")
-     - For #CMT: journal = "Revenue and COGS"
-     - For AMZ: journal = "Amazon PLAT BUS CHECKING"
-  3. Call odoo_export_invoice_pdf(invoice_id=XXX)
-  4. Reply with: "✅ [SO] 已处理: 发票 [INV] 已创建, 收款已登记, PDF: [link]"
+STEP 1 — Always call check_so_payment_status(so_name) FIRST. It returns:
+  - SO state (must be 'sale' or 'done' to release; 'draft'/'sent' = Quotation, will be rejected)
+  - List of received payments from queue
+  - Total received vs SO amount (must be >= SO amount, otherwise rejected)
+  - can_release: true/false + blockers
 
-TYPE 2 — Normal orders (S prefix):
-  REQUIRES explicit payment confirmation. Do NOT auto-process.
-  1. Ask: "S04100 金额 $X, 确认收到款了吗? 付款方式是什么? (Cash/Zelle/Stripe/Square)"
-  2. Wait for confirmation + payment method
-  3. Then proceed same as above with correct payment_method and journal:
-     - Cash → payment_method="Cash", journal="Cash"
-     - Zelle → payment_method="Zelle", journal="Revenue and COGS"
-     - Stripe → payment_method="Stripe", journal="Revenue and COGS" (may auto-register)
-     - Square → payment_method="POS Machine", journal="Revenue and COGS"
-     - Combo (e.g. Cash+Zelle) → payment_method="Combo(Cash+Zelle)", journal="Revenue and COGS"
+STEP 2 — Show the user the details clearly:
+  "S04301 (Test31): 状态=Sales Order, 总额$2.00
+   检测到 Stripe 付款 $2.00 (pi_xxx)
+   ✅ 是否 capture 并 create invoice 打印发票？"
 
-BATCH RELEASE:
-  If user says "release CMT12345, CMT12346, AMZ-789" — process each one sequentially.
-  Report results as a summary: "✅ 3/3 orders processed: [details]"
+  IF can_release is FALSE:
+   - "S04301 状态是 Quotation,需要先在 Odoo 里 confirm 这个订单"
+   - "S04301 已收款 $2 不够,SO 总额是 $5,还差 $3。无法 release"
+   - "S04301 没有检测到付款"
+   - "S04301 已经开过发票了 INV/2026/XXXX"
 
-PERMISSION: Only admin and finance roles can use these tools.
-  If a sales role tries to release an order, reply: "需要财务或管理员确认后才能开票。"
+STEP 3 — Wait for user confirmation ("是", "确认", "yes", "ok", "release", "确定"). 
+  ONLY THEN call release_so(so_name). It will:
+  - Capture the FIRST Stripe PaymentIntent (older = first)
+  - Create invoice with x_payment_method = "Stripe" (or "Combo(...)" if multiple channels)
+  - Export PDF
+  - If duplicate Stripe payments detected: only first is captured, rest reported back so user can manually cancel in Stripe Dashboard
+  - Email alert sent to di@chumartusa.com and ashley@chumartusa.com if duplicates exist
+
+WHAT release_so DOES NOT DO:
+  - Does NOT register_payment for Stripe/Zelle/Square (Odoo's Stripe integration creates account.payment after capture)
+  - Does NOT reconcile invoice with payments (Odoo handles this, or user does it manually)
+  - Does NOT confirm SO automatically (user must do this in Odoo first)
+
+SHOPIFY (#CMT) and AMAZON (AMZ) — SEPARATE WORKFLOW:
+  These don't go through the webhook queue. Use legacy tools directly:
+  1. odoo_create_invoice_from_so(so_name="CMT12345", payment_method="Shopify Payment")
+     - For #CMT: payment_method="Shopify Payment", journal="Revenue and COGS"
+     - For AMZ: payment_method="Amazon Payment", journal="Amazon PLAT BUS CHECKING"
+  2. odoo_register_payment(invoice_id=XXX, journal_name=...)
+  3. odoo_export_invoice_pdf(invoice_id=XXX)
+
+CASH PAYMENTS (no webhook):
+  If user manually says "客户付了现金 $X for S0xxx":
+  1. Confirm with user: "确认收到现金 $X for S0xxx?"
+  2. If confirmed: odoo_create_invoice_from_so(payment_method="Cash") → register_payment(journal="Cash") → export_pdf
+
+PERMISSION: Only admin and finance roles can release.
+  If a sales role tries, reply: "需要财务或管理员确认后才能开票。"
 
 RESTOCK ANALYSIS (补货分析):
 When the user asks anything like "哪些产品需要补货", "补货分析", "restock analysis", "what needs reordering", "库存预警", "inventory alert", "根据出库看看该采购什么" — follow this workflow:
@@ -5363,6 +5443,257 @@ async def run_tool(name, inp, context=None):
             print(f"EXPORT_PDF error: {e}")
             return json.dumps({"error": f"Failed to export PDF: {str(e)}"})
 
+    if name == "check_so_payment_status":
+        """检查 SO 状态 + 已收款情况，判断是否可以 release。"""
+        so_name = (inp.get("so_name") or "").strip()
+        if not so_name:
+            return json.dumps({"error": "so_name is required"})
+        try:
+            cookies = await odoo_get_session()
+            # 1) 查 SO
+            so_r = json.loads(await odoo_query("sale.order",
+                [["name", "=", so_name], ["company_id", "=", 1]],
+                ["id", "name", "state", "partner_id", "amount_total", "invoice_status", "invoice_ids"],
+                limit=1, cookies=cookies))
+            if not isinstance(so_r, list) or not so_r:
+                return json.dumps({"error": f"SO '{so_name}' not found"})
+            so = so_r[0]
+            so_state = so.get("state", "")
+            so_amount = float(so.get("amount_total") or 0)
+            partner_name = (so.get("partner_id") or [0, ""])[1]
+
+            # 2) 检查已有 invoice
+            existing_invoice = None
+            if so.get("invoice_ids"):
+                inv_r = json.loads(await odoo_query("account.move",
+                    [["id", "in", so["invoice_ids"]],
+                     ["state", "in", ["posted", "draft"]]],
+                    ["id", "name", "state", "payment_state", "amount_total"],
+                    limit=5, cookies=cookies))
+                if isinstance(inv_r, list) and inv_r:
+                    # 优先返回 posted 的
+                    posted = [i for i in inv_r if i.get("state") == "posted"]
+                    existing_invoice = posted[0] if posted else inv_r[0]
+
+            # 3) 查 received_payments 队列
+            payments = await _get_received_payments_for_so(so_name, status="received")
+            total_received = sum(p["amount"] for p in payments)
+
+            # 4) 判断状态
+            can_release = True
+            blockers = []
+            if so_state not in ("sale", "done"):
+                can_release = False
+                blockers.append(f"SO is in state '{so_state}', must be 'sale' (confirmed) or 'done'. Please confirm the SO in Odoo first.")
+            if existing_invoice and existing_invoice.get("state") == "posted" and existing_invoice.get("payment_state") in ("paid", "in_payment"):
+                can_release = False
+                blockers.append(f"SO already has paid invoice {existing_invoice.get('name')}. No action needed.")
+            if total_received < so_amount - 0.01:
+                can_release = False
+                blockers.append(f"Insufficient payment: received ${total_received:,.2f} of ${so_amount:,.2f} (short ${so_amount - total_received:,.2f}).")
+            if not payments:
+                can_release = False
+                blockers.append(f"No payment received yet for {so_name}.")
+
+            return json.dumps({
+                "so_name": so_name,
+                "customer": partner_name,
+                "so_state": so_state,
+                "so_state_label": {"draft": "Quotation", "sent": "Quotation Sent", "sale": "Sales Order (confirmed)", "done": "Locked", "cancel": "Cancelled"}.get(so_state, so_state),
+                "so_amount": so_amount,
+                "total_received": total_received,
+                "remaining": max(0, so_amount - total_received),
+                "received_payments": payments,
+                "existing_invoice": existing_invoice,
+                "can_release": can_release,
+                "blockers": blockers,
+                "message": (
+                    f"SO {so_name} ({partner_name}): state={so_state}, total=${so_amount:,.2f}, "
+                    f"received=${total_received:,.2f} from {len(payments)} payment(s). "
+                    + ("✅ Ready to release." if can_release else "❌ Cannot release: " + "; ".join(blockers))
+                ),
+            }, ensure_ascii=False)
+        except Exception as e:
+            print(f"CHECK_SO_PAYMENT error: {e}")
+            import traceback; traceback.print_exc()
+            return json.dumps({"error": f"Failed to check payment status: {str(e)}"})
+
+    if name == "release_so":
+        """Release SO: capture Stripe → create invoice → export PDF。
+        
+        流程:
+        1. 检查 SO 状态 (必须 sale/done) + 检查队列里的付款
+        2. 重复付款检测 (Stripe 同 SO 多个 PI) → 只 capture 第一个,通知用户去 cancel 其余
+        3. Capture Stripe PaymentIntent (这一步 Odoo 会自动创建 account.payment)
+        4. 创建 Invoice + 设 x_payment_method
+        5. 导出 PDF
+        
+        注意:
+        - 不做 reconcile (Odoo 自动处理或用户手动处理)
+        - 不做 register_payment (Cash 走另一个工具)
+        - 付款不够全额 → 拒绝
+        - SO 是 quotation → 拒绝
+        """
+        so_name = (inp.get("so_name") or "").strip()
+        if not so_name:
+            return json.dumps({"error": "so_name is required"})
+
+        try:
+            # 先检查 SO 状态 + 队列
+            check_result = await run_tool("check_so_payment_status", {"so_name": so_name}, context=ctx)
+            check = json.loads(check_result) if isinstance(check_result, str) else check_result
+            if check.get("error"):
+                return json.dumps(check)
+            if not check.get("can_release"):
+                return json.dumps({
+                    "error": "Cannot release SO",
+                    "blockers": check.get("blockers", []),
+                    "message": check.get("message", ""),
+                })
+
+            payments = check["received_payments"]
+            so_amount = check["so_amount"]
+            partner_name = check.get("customer", "")
+            channels = list(dict.fromkeys(p["channel"] for p in payments))
+
+            # ============================================
+            # Step 1: Stripe 付款的 capture + 重复检测
+            # ============================================
+            stripe_payments = [p for p in payments if p["channel"] == "Stripe"]
+            captured_pis = []
+            duplicate_pis_to_cancel = []
+            capture_errors = []
+
+            if stripe_payments:
+                import stripe
+                stripe.api_key = STRIPE_SECRET_KEY
+
+                # 队列里同一个 SO 的 Stripe 付款按时间排序，第一个 capture，其余拦截
+                # external_ref 是 pi_id
+                stripe_payments_sorted = sorted(stripe_payments, key=lambda p: p.get("created_at", ""))
+
+                # 第一笔 capture
+                first_pi_id = stripe_payments_sorted[0]["external_ref"]
+                try:
+                    # 先查 PI 当前状态 (有可能已被 capture / cancelled)
+                    pi_obj = stripe.PaymentIntent.retrieve(first_pi_id)
+                    pi_status = getattr(pi_obj, "status", "")
+                    print(f"[RELEASE] Stripe PI {first_pi_id} status={pi_status}")
+
+                    if pi_status == "requires_capture":
+                        captured = stripe.PaymentIntent.capture(first_pi_id)
+                        cap_status = getattr(captured, "status", "")
+                        print(f"[RELEASE] Captured {first_pi_id}: {cap_status}")
+                        if cap_status != "succeeded":
+                            return json.dumps({
+                                "error": f"Stripe capture failed for {first_pi_id}: status={cap_status}",
+                            })
+                        captured_pis.append(first_pi_id)
+                    elif pi_status == "succeeded":
+                        # 已经被 capture 过了 (可能 Odoo 之前抓过)
+                        print(f"[RELEASE] {first_pi_id} already captured")
+                        captured_pis.append(first_pi_id)
+                    else:
+                        return json.dumps({
+                            "error": f"Stripe PI {first_pi_id} in unexpected state: {pi_status}",
+                        })
+                except stripe.error.StripeError as e:
+                    return json.dumps({"error": f"Stripe API error capturing {first_pi_id}: {str(e)}"})
+                except Exception as e:
+                    return json.dumps({"error": f"Failed to capture Stripe payment: {str(e)}"})
+
+                # 其余的 → 不 capture，加到 duplicate 列表
+                if len(stripe_payments_sorted) > 1:
+                    duplicate_pis_to_cancel = [p["external_ref"] for p in stripe_payments_sorted[1:]]
+                    print(f"[RELEASE] ⚠️ Duplicate Stripe payments for {so_name}, NOT capturing: {duplicate_pis_to_cancel}")
+
+            # ============================================
+            # Step 2: 决定 payment_method 标签
+            # ============================================
+            if len(channels) == 1:
+                payment_method_label = channels[0]
+            else:
+                payment_method_label = f"Combo({'+'.join(channels)})"
+
+            # ============================================
+            # Step 3: 创建 Invoice + 设 x_payment_method
+            # ============================================
+            ctx_local = {"uid": ctx.get("uid", 0), "username": ctx.get("username", "manual_release"), "role": "admin"}
+
+            r1_str = await run_tool("odoo_create_invoice_from_so", {
+                "so_name": so_name,
+                "payment_method": payment_method_label,
+            }, context=ctx_local)
+            r1 = json.loads(r1_str) if isinstance(r1_str, str) else r1_str
+
+            if r1.get("already_invoiced"):
+                invoice_id = r1["invoice_id"]
+                invoice_name = r1.get("invoice_name", "")
+                print(f"[RELEASE] {so_name} already has invoice {invoice_name}")
+            elif r1.get("success"):
+                invoice_id = r1["invoice_id"]
+                invoice_name = r1.get("invoice_name", "")
+            else:
+                return json.dumps({"error": f"Create invoice failed: {r1.get('error', 'unknown')}"})
+
+            # ============================================
+            # Step 4: Export PDF
+            # ============================================
+            r3_str = await run_tool("odoo_export_invoice_pdf", {
+                "invoice_id": invoice_id,
+            }, context=ctx_local)
+            r3 = json.loads(r3_str) if isinstance(r3_str, str) else r3_str
+
+            # ============================================
+            # Step 5: 标记队列为 released + 通知重复
+            # ============================================
+            await _mark_received_payments_released(so_name, invoice_name)
+
+            # 如果有重复 Stripe PI 没 capture，通知管理员
+            if duplicate_pis_to_cancel:
+                await _notify_stripe_duplicate(
+                    so_name=so_name,
+                    amount=so_amount,
+                    keep_pi_id=captured_pis[0] if captured_pis else "",
+                    duplicate_pi_ids=duplicate_pis_to_cancel,
+                )
+
+            # 构建消息
+            duplicate_warning = ""
+            if duplicate_pis_to_cancel:
+                duplicate_warning = (
+                    f"\n\n⚠️ 警告: 检测到 {len(duplicate_pis_to_cancel)} 笔重复 Stripe 付款已拦截:\n"
+                    + "\n".join(f"  • {pid} (https://dashboard.stripe.com/payments/{pid})"
+                                for pid in duplicate_pis_to_cancel)
+                    + "\n请去 Stripe Dashboard 手动 cancel,否则 7 天后会自动释放回客户。\n"
+                    + "邮件已发送到 di@chumartusa.com 和 ashley@chumartusa.com。"
+                )
+
+            return json.dumps({
+                "success": True,
+                "so_name": so_name,
+                "customer": partner_name,
+                "invoice_id": invoice_id,
+                "invoice_name": invoice_name,
+                "payment_method": payment_method_label,
+                "amount": so_amount,
+                "captured_stripe_pis": captured_pis,
+                "duplicate_stripe_pis": duplicate_pis_to_cancel,
+                "pdf_url": r3.get("download_url", ""),
+                "message": (
+                    f"✅ {so_name} ({partner_name}) 已 release\n"
+                    f"发票: {invoice_name} (${so_amount:,.2f})\n"
+                    f"付款方式: {payment_method_label}\n"
+                    f"PDF: {r3.get('download_url', 'N/A')}"
+                    + duplicate_warning
+                ),
+            }, ensure_ascii=False)
+
+        except Exception as e:
+            print(f"RELEASE_SO error: {e}")
+            import traceback; traceback.print_exc()
+            return json.dumps({"error": f"Failed to release SO: {str(e)}"})
+
     if name == "create_reminder":
         content = (inp.get("content") or "").strip()
         fire_at_str = (inp.get("fire_at") or "").strip()
@@ -6128,7 +6459,7 @@ async def chat(req: ChatRequest, background_tasks: BackgroundTasks):
     # Filter tools based on permissions
     allowed_tools = []
     finance_tools = {"get_monthly_tax", "get_quarterly_tax", "get_monthly_sales", "get_missing_tax", "odoo_match_payment_to_customer"}
-    write_tools = {"odoo_create_record", "odoo_add_order_line", "odoo_confirm_order", "odoo_update_record", "odoo_update_vendor_price", "odoo_create_invoice_from_so", "odoo_register_payment", "odoo_export_invoice_pdf"}
+    write_tools = {"odoo_create_record", "odoo_add_order_line", "odoo_confirm_order", "odoo_update_record", "odoo_update_vendor_price", "odoo_create_invoice_from_so", "odoo_register_payment", "odoo_export_invoice_pdf", "release_so"}
     # Tools that expose vendor names, prices, PO costs — only admin / finance / purchase should see these
     cost_tools = {"odoo_find_recent_purchases_by_skus", "odoo_get_product_vendors", "odoo_create_bulk_po", "get_po_with_so_links", "odoo_restock_analysis"}
     for tool in TOOLS:
@@ -6302,7 +6633,7 @@ async def chat_stream(req: ChatRequest, background_tasks: BackgroundTasks):
     # Filter tools based on permissions
     allowed_tools = []
     finance_tools = {"get_monthly_tax", "get_quarterly_tax", "get_monthly_sales", "get_missing_tax", "odoo_match_payment_to_customer"}
-    write_tools = {"odoo_create_record", "odoo_add_order_line", "odoo_confirm_order", "odoo_update_record", "odoo_update_vendor_price", "odoo_create_invoice_from_so", "odoo_register_payment", "odoo_export_invoice_pdf"}
+    write_tools = {"odoo_create_record", "odoo_add_order_line", "odoo_confirm_order", "odoo_update_record", "odoo_update_vendor_price", "odoo_create_invoice_from_so", "odoo_register_payment", "odoo_export_invoice_pdf", "release_so"}
     # Tools that expose vendor names, prices, PO costs — only admin / finance / purchase should see these
     cost_tools = {"odoo_find_recent_purchases_by_skus", "odoo_get_product_vendors", "odoo_create_bulk_po", "get_po_with_so_links", "odoo_restock_analysis"}
     for tool in TOOLS:
@@ -7082,7 +7413,7 @@ async def odoo_bot_chat(req: OdooBotRequest):
     # Filter tools by permission (same logic as /chat)
     allowed_tools = []
     finance_tools = {"get_monthly_tax", "get_quarterly_tax", "get_monthly_sales", "get_missing_tax", "odoo_match_payment_to_customer"}
-    write_tools = {"odoo_create_record", "odoo_add_order_line", "odoo_confirm_order", "odoo_update_record", "odoo_update_vendor_price", "odoo_create_invoice_from_so", "odoo_register_payment", "odoo_export_invoice_pdf"}
+    write_tools = {"odoo_create_record", "odoo_add_order_line", "odoo_confirm_order", "odoo_update_record", "odoo_update_vendor_price", "odoo_create_invoice_from_so", "odoo_register_payment", "odoo_export_invoice_pdf", "release_so"}
     cost_tools = {"odoo_find_recent_purchases_by_skus", "odoo_get_product_vendors", "odoo_create_bulk_po", "get_po_with_so_links", "odoo_restock_analysis"}
     for tool in TOOLS:
         tname = tool["name"]
@@ -7243,9 +7574,11 @@ async def _match_so_by_amount_and_customer(
         if conn:
             try:
                 pending_rows = await conn.fetch("""
-                    SELECT DISTINCT so_name, so_id, so_amount FROM pending_payments
+                    SELECT so_name, so_id, so_amount, MAX(created_at) AS last_created
+                    FROM pending_payments
                     WHERE status = 'pending'
-                    ORDER BY created_at DESC LIMIT 20
+                    GROUP BY so_name, so_id, so_amount
+                    ORDER BY last_created DESC LIMIT 20
                 """)
                 for row in pending_rows:
                     # 检查 pending 里的 SO 是否还有剩余
@@ -7366,6 +7699,230 @@ def _build_combo_payment_method(payments: list) -> str:
     if len(channels) == 1:
         return channels[0]
     return f"Combo({'+'.join(channels)})"
+
+
+async def _record_received_payment(
+    so_name: str,
+    channel: str,
+    amount: float,
+    external_ref: str = "",
+    customer_name: str = "",
+) -> dict:
+    """
+    把一笔已 capture / 已收到的付款写入 received_payments 队列。
+    不开票！等用户 release。
+    external_ref 用于去重 (Stripe pi_id, Square payment_id, Gmail msg_id)。
+    """
+    conn = await get_db_conn()
+    if not conn:
+        return {"error": "DB not available"}
+    try:
+        # 用 external_ref 去重
+        if external_ref:
+            existing = await conn.fetchrow("""
+                SELECT id, status FROM received_payments
+                WHERE channel = $1 AND external_ref = $2
+            """, channel, external_ref)
+            if existing:
+                return {
+                    "duplicate": True,
+                    "existing_id": existing["id"],
+                    "status": existing["status"],
+                    "message": f"Payment {external_ref} already recorded (status={existing['status']})",
+                }
+
+        row = await conn.fetchrow("""
+            INSERT INTO received_payments (so_name, channel, amount, external_ref, customer_name)
+            VALUES ($1, $2, $3, $4, $5)
+            RETURNING id
+        """, so_name, channel, amount, external_ref, customer_name)
+        return {
+            "success": True,
+            "id": row["id"],
+            "so_name": so_name,
+            "channel": channel,
+            "amount": amount,
+        }
+    finally:
+        await conn.close()
+
+
+async def _get_received_payments_for_so(so_name: str, status: str = "received") -> list:
+    """查某个 SO 的已收款记录"""
+    conn = await get_db_conn()
+    if not conn:
+        return []
+    try:
+        rows = await conn.fetch("""
+            SELECT id, channel, amount, external_ref, customer_name, status, created_at
+            FROM received_payments
+            WHERE so_name = $1 AND status = $2
+            ORDER BY created_at
+        """, so_name, status)
+        return [{
+            "id": r["id"],
+            "channel": r["channel"],
+            "amount": float(r["amount"]),
+            "external_ref": r["external_ref"],
+            "customer_name": r["customer_name"],
+            "created_at": r["created_at"].isoformat() if r["created_at"] else None,
+        } for r in rows]
+    finally:
+        await conn.close()
+
+
+async def _mark_received_payments_released(so_name: str, invoice_name: str):
+    """把 SO 的所有 received payments 标记为 released"""
+    conn = await get_db_conn()
+    if not conn:
+        return
+    try:
+        await conn.execute("""
+            UPDATE received_payments
+            SET status = 'released', released_at = NOW(), invoice_name = $2
+            WHERE so_name = $1 AND status = 'received'
+        """, so_name, invoice_name)
+    finally:
+        await conn.close()
+
+
+async def _reconcile_existing_payments(invoice_id: int, so_amount: float, partner_name: str = "") -> dict:
+    """
+    把 invoice 与已存在的 unreconciled account.payment 关联起来。
+    
+    场景: Stripe/Square/Zelle 付款时 Odoo 已经自动创建了 account.payment 记录 (state=posted, 
+    is_reconciled=False)。我们创建 invoice 后需要手动 reconcile 这些 payment。
+    
+    步骤:
+    1. 找 invoice 对应的 partner
+    2. 找该 partner 名下所有 state=posted, is_reconciled=False 的 account.payment
+    3. 按金额匹配，调用 invoice 的 js_assign_outstanding_line 把 payment 关联进来
+    """
+    try:
+        cookies = await odoo_get_session()
+
+        # 1) 获取 invoice 信息
+        inv_r = json.loads(await odoo_query("account.move",
+            [["id", "=", invoice_id]],
+            ["id", "name", "partner_id", "amount_residual", "state", "line_ids"],
+            limit=1, cookies=cookies))
+        if not isinstance(inv_r, list) or not inv_r:
+            return {"error": f"Invoice {invoice_id} not found"}
+        inv = inv_r[0]
+        partner_id = inv.get("partner_id", [0, ""])[0] if inv.get("partner_id") else 0
+        if not partner_id:
+            return {"error": "Invoice has no partner"}
+
+        residual = float(inv.get("amount_residual") or 0)
+        if residual <= 0.01:
+            return {"already_reconciled": True, "message": "Invoice has no outstanding amount"}
+
+        # 2) 找该 partner 名下未对账的 payment
+        # 注意: account.payment 中的 reconciled_invoices_count 字段或 is_matched 可用
+        payments_r = json.loads(await odoo_query("account.payment",
+            [
+                ["partner_id", "=", partner_id],
+                ["state", "in", ["posted", "in_process"]],
+                ["payment_type", "=", "inbound"],
+                ["is_reconciled", "=", False],
+            ],
+            ["id", "name", "amount", "date", "journal_id", "is_reconciled", "move_id"],
+            limit=20, order="date desc", cookies=cookies))
+
+        if not isinstance(payments_r, list) or not payments_r:
+            return {
+                "no_unreconciled_payments": True,
+                "message": f"No unreconciled payments found for partner. User may need to manually reconcile in Odoo.",
+            }
+
+        # 3) 按金额匹配（先精确，后部分）
+        # 收集需要 reconcile 的 payment IDs
+        target_amount = residual
+        payments_to_reconcile = []
+        accumulated = 0.0
+
+        # 先尝试找一笔精确匹配的
+        exact = [p for p in payments_r if abs(float(p["amount"]) - target_amount) < 0.01]
+        if exact:
+            payments_to_reconcile = [exact[0]]
+            accumulated = float(exact[0]["amount"])
+        else:
+            # 凑金额（可能是 combo 付款）
+            for p in payments_r:
+                if accumulated >= target_amount - 0.01:
+                    break
+                payments_to_reconcile.append(p)
+                accumulated += float(p["amount"])
+
+        if not payments_to_reconcile or accumulated < target_amount - 0.01:
+            return {
+                "insufficient_payments": True,
+                "found_payments": payments_r,
+                "message": f"Found ${accumulated:.2f} unreconciled but invoice needs ${target_amount:.2f}",
+            }
+
+        # 4) 调用 Odoo 的 reconciliation API
+        # 方法: 找到 payment 对应的 move_id 中的 receivable line，然后调用 invoice 的 js_assign_outstanding_line
+        reconciled_ids = []
+        for p in payments_to_reconcile:
+            move_id = p.get("move_id", [0])[0] if p.get("move_id") else 0
+            if not move_id:
+                continue
+
+            # 找 move 中的 receivable line (account_type = 'asset_receivable')
+            move_lines_r = json.loads(await odoo_query("account.move.line",
+                [
+                    ["move_id", "=", move_id],
+                    ["account_type", "=", "asset_receivable"],
+                    ["reconciled", "=", False],
+                ],
+                ["id", "balance"],
+                limit=5, cookies=cookies))
+
+            if not isinstance(move_lines_r, list) or not move_lines_r:
+                continue
+
+            # 调用 invoice.js_assign_outstanding_line 来 reconcile
+            for ml in move_lines_r:
+                async with httpx.AsyncClient(timeout=30, follow_redirects=True) as c:
+                    r = await c.post(f"{ODOO_URL}/web/dataset/call_kw", json={
+                        "jsonrpc": "2.0", "method": "call", "id": 100,
+                        "params": {
+                            "model": "account.move",
+                            "method": "js_assign_outstanding_line",
+                            "args": [[invoice_id], ml["id"]],
+                            "kwargs": {}
+                        }
+                    }, cookies=cookies)
+                    rdata = r.json()
+                    if rdata.get("error"):
+                        print(f"[RECONCILE] Failed to assign payment line {ml['id']}: {rdata['error']}")
+                        continue
+                    reconciled_ids.append(p["id"])
+                    print(f"[RECONCILE] Linked payment {p.get('name')} (${p['amount']}) to invoice {inv.get('name')}")
+                    break
+
+        # 5) 验证 invoice 现在的 payment_state
+        inv_after = json.loads(await odoo_query("account.move",
+            [["id", "=", invoice_id]],
+            ["id", "name", "payment_state", "amount_residual"],
+            limit=1, cookies=cookies))
+        inv_final = inv_after[0] if isinstance(inv_after, list) and inv_after else {}
+
+        return {
+            "success": True,
+            "invoice_id": invoice_id,
+            "reconciled_payment_ids": reconciled_ids,
+            "reconciled_count": len(reconciled_ids),
+            "payment_state": inv_final.get("payment_state"),
+            "amount_residual": inv_final.get("amount_residual", 0),
+            "message": f"Reconciled {len(reconciled_ids)} payment(s) with invoice {inv.get('name')}, payment_state now: {inv_final.get('payment_state')}",
+        }
+
+    except Exception as e:
+        print(f"[RECONCILE] error: {e}")
+        import traceback; traceback.print_exc()
+        return {"error": f"Reconciliation failed: {str(e)}"}
 
 
 async def _auto_invoice_pipeline(
@@ -7579,109 +8136,29 @@ async def stripe_webhook(request: Request):
             customer_name = (shipping.get("name") or "").strip() if isinstance(shipping, dict) else ""
         customer_email = pi.get("receipt_email", "") or ""
 
-        print(f"[STRIPE] capturable: pi={pi_id}, ${amount}, capturable=${amount_capturable/100.0}, SO={so_ref}, customer={customer_name}")
+        print(f"[STRIPE] requires_capture: pi={pi_id}, ${amount}, SO={so_ref}, customer={customer_name}")
 
         try:
             # ============================================
-            # 重复付款检测 — capture 之前查 Stripe
+            # Webhook 只做一件事: 记录 PI 到队列。
+            # 不 capture, 不开票, 不检查重复 — 全部在 release_so 时做。
             # ============================================
-            # 搜索 Stripe 上同一个 SO 的所有 PaymentIntent
-            # Stripe PaymentIntent.list 不支持按 description 过滤，
-            # 所以先查 customer 的最近 PI，再按 description 筛选
-            duplicate_pi_ids = []
-
-            if so_ref:
-                customer_id = pi.get("customer")
-                try:
-                    # 方法1: 按 customer 查最近的 PI
-                    search_params = {"limit": 20}
-                    if customer_id:
-                        search_params["customer"] = customer_id
-                    recent_pis = stripe.PaymentIntent.list(**search_params)
-
-                    # 找出同一个 SO (description) + 同金额 + requires_capture 的
-                    same_so_pis = []
-                    for rpi in recent_pis.data:
-                        if (rpi.description == so_ref
-                                and rpi.amount == pi.get("amount", 0)
-                                and rpi.status == "requires_capture"):
-                            same_so_pis.append(rpi.id)
-
-                    if len(same_so_pis) > 1:
-                        # 有重复！按创建时间排序，只保留最早的那个
-                        print(f"[STRIPE] ⚠️ DUPLICATE DETECTED: {len(same_so_pis)} PIs for SO {so_ref}: {same_so_pis}")
-
-                        # 当前这个 PI 是不是最早的？
-                        # same_so_pis 从 Stripe 返回的是按创建时间倒序的
-                        oldest_pi_id = same_so_pis[-1]  # 最后一个 = 最早创建的
-
-                        if pi_id != oldest_pi_id:
-                            # 当前这个不是最早的 → 拦截，不 capture
-                            print(f"[STRIPE] Blocking duplicate: {pi_id} (keeping {oldest_pi_id})")
-                            duplicate_pi_ids = [p for p in same_so_pis if p != oldest_pi_id]
-                            await _notify_stripe_duplicate(so_ref, amount, oldest_pi_id, duplicate_pi_ids)
-                            return {
-                                "status": "duplicate_blocked",
-                                "so_name": so_ref,
-                                "blocked_pi": pi_id,
-                                "kept_pi": oldest_pi_id,
-                                "total_duplicates": len(same_so_pis),
-                                "message": f"Duplicate #{pi_id} blocked for {so_ref}. Admin notified.",
-                            }
-                        else:
-                            # 当前是最早的 → 继续 capture，但通知管理员有重复要 cancel
-                            duplicate_pi_ids = [p for p in same_so_pis if p != pi_id]
-                            print(f"[STRIPE] This is the first PI, will capture. Duplicates to cancel: {duplicate_pi_ids}")
-
-                except stripe.error.StripeError as e:
-                    # 查不到也不要阻止正常流程
-                    print(f"[STRIPE] Duplicate check query failed (non-fatal): {e}")
-
-            # ============================================
-            # Capture 扣款
-            # ============================================
-            captured = stripe.PaymentIntent.capture(pi_id)
-            print(f"[STRIPE] Captured: {pi_id}, status={captured['status']}")
-
-            if captured["status"] != "succeeded":
-                return {"status": "capture_pending"}
-
-            # 如果检测到了重复，通知管理员去 cancel 多余的
-            if duplicate_pi_ids:
-                await _notify_stripe_duplicate(so_ref, amount, pi_id, duplicate_pi_ids)
-
-            # ============================================
-            # 匹配 SO → 自动开票
-            # ============================================
-            cookies = await odoo_get_session()
-            so = await _match_so_by_amount_and_customer(
+            recorded = await _record_received_payment(
+                so_name=so_ref,
+                channel="Stripe",
                 amount=amount,
-                customer_hint=customer_name or customer_email,
-                reference=so_ref,
-                cookies=cookies,
-                allow_partial=True,
+                external_ref=pi_id,
+                customer_name=customer_name or "",
             )
-            if not so:
-                print(f"[STRIPE] No matching SO for ${amount}")
-                return {"status": "no_matching_so", "amount": amount}
+            print(f"[STRIPE] Recorded to queue: {recorded}")
+            return {
+                "status": "recorded",
+                "so_name": so_ref,
+                "pi_id": pi_id,
+                "amount": amount,
+                "message": f"PaymentIntent {pi_id} recorded for {so_ref or '<no SO>'}, awaiting user release.",
+            }
 
-            result = await _auto_invoice_pipeline(
-                so_name=so["name"],
-                payment_method="Stripe",
-                journal_name="Revenue and COGS",
-                skip_register=True,
-                source="stripe",
-                amount=amount,
-                so_id=so["id"],
-                so_amount=float(so.get("amount_total", 0)),
-            )
-            print(f"[STRIPE] Pipeline result: {json.dumps(result)}")
-            return result
-
-        except stripe.error.StripeError as e:
-            print(f"[STRIPE] API error: {e}")
-            from fastapi.responses import JSONResponse
-            return JSONResponse({"error": str(e)}, status_code=500)
         except Exception as e:
             print(f"[STRIPE] Error: {e}")
             import traceback; traceback.print_exc()
@@ -7725,10 +8202,11 @@ async def square_webhook(request: Request):
     if event_type == "payment.completed":
         payment = event.get("data", {}).get("object", {}).get("payment", {})
         amount = payment.get("total_money", {}).get("amount", 0) / 100.0
+        square_payment_id = payment.get("id", "")
         note = payment.get("note", "")
         customer_id = payment.get("customer_id", "")
 
-        print(f"[SQUARE] Payment: ${amount}, note={note}")
+        print(f"[SQUARE] Payment: id={square_payment_id}, ${amount}, note={note}")
 
         so_ref = ""
         if note:
@@ -7750,29 +8228,34 @@ async def square_webhook(request: Request):
                     print(f"[SQUARE] Customer lookup failed: {e}")
 
             cookies = await odoo_get_session()
-            so = await _match_so_by_amount_and_customer(
-                amount=amount,
-                customer_hint=customer_name,
-                reference=so_ref,
-                cookies=cookies,
-                allow_partial=True,
-            )
-            if not so:
-                print(f"[SQUARE] No matching SO for ${amount}")
-                return {"status": "no_matching_so", "amount": amount}
+            so_name_for_record = so_ref or ""
+            if not so_name_for_record:
+                so = await _match_so_by_amount_and_customer(
+                    amount=amount,
+                    customer_hint=customer_name,
+                    reference="",
+                    cookies=cookies,
+                    allow_partial=False,
+                )
+                if so:
+                    so_name_for_record = so["name"]
 
-            result = await _auto_invoice_pipeline(
-                so_name=so["name"],
-                payment_method="POS Machine",
-                journal_name="Revenue and COGS",
-                skip_register=False,
-                source="square",
+            recorded = await _record_received_payment(
+                so_name=so_name_for_record,
+                channel="POS Machine",
                 amount=amount,
-                so_id=so["id"],
-                so_amount=float(so.get("amount_total", 0)),
+                external_ref=square_payment_id,
+                customer_name=customer_name or "",
             )
-            print(f"[SQUARE] Pipeline result: {json.dumps(result)}")
-            return result
+            print(f"[SQUARE] Recorded payment: {recorded}")
+            return {
+                "status": "captured_and_recorded",
+                "so_name": so_name_for_record,
+                "amount": amount,
+                "channel": "POS Machine",
+                "message": f"Payment ${amount:,.2f} recorded for {so_name_for_record or '<unmatched>'}. "
+                           f"Waiting for user to release via AI.",
+            }
 
         except Exception as e:
             print(f"[SQUARE] Error: {e}")
@@ -7861,23 +8344,18 @@ async def _check_zelle_emails():
             cookies = await odoo_get_session()
             so = await _match_so_by_amount_and_customer(
                 amount=amount, customer_hint=sender_name, cookies=cookies,
-                allow_partial=True,
+                allow_partial=False,
             )
 
-            if so:
-                result = await _auto_invoice_pipeline(
-                    so_name=so["name"],
-                    payment_method="Zelle",
-                    journal_name="Revenue and COGS",
-                    skip_register=False,
-                    source="zelle",
-                    amount=amount,
-                    so_id=so["id"],
-                    so_amount=float(so.get("amount_total", 0)),
-                )
-                print(f"[ZELLE] Pipeline result: {json.dumps(result)}")
-            else:
-                print(f"[ZELLE] No matching SO for ${amount} from {sender_name}")
+            so_name_for_record = so["name"] if so else ""
+            recorded = await _record_received_payment(
+                so_name=so_name_for_record,
+                channel="Zelle",
+                amount=amount,
+                external_ref=msg_id,
+                customer_name=sender_name,
+            )
+            print(f"[ZELLE] Recorded payment: {recorded}")
 
             service.users().messages().modify(
                 userId="me", id=msg_id, body={"removeLabelIds": ["UNREAD"]}
