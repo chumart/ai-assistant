@@ -5407,13 +5407,18 @@ async def run_tool(name, inp, context=None):
             inv_name = inv.get("name", f"INV-{invoice_id}")
 
             # Call Odoo report endpoint to generate PDF
+            # 使用 Chumart 自定义发票模板 oscg_sdcmt_report.report_cmt_invoice2
             async with httpx.AsyncClient(timeout=60, follow_redirects=True) as c:
-                # Odoo 17 report URL pattern
-                report_url = f"{ODOO_URL}/report/pdf/account.report_invoice/{invoice_id}"
+                report_url = f"{ODOO_URL}/report/pdf/oscg_sdcmt_report.report_cmt_invoice2/{invoice_id}"
                 r = await c.get(report_url, cookies=cookies)
 
+                # 如果自定义模板失败,fallback 到默认模板
                 if r.status_code != 200:
-                    return json.dumps({"error": f"PDF generation failed: HTTP {r.status_code}"})
+                    print(f"[EXPORT_PDF] Custom template failed (HTTP {r.status_code}), falling back to default")
+                    fallback_url = f"{ODOO_URL}/report/pdf/account.report_invoice/{invoice_id}"
+                    r = await c.get(fallback_url, cookies=cookies)
+                    if r.status_code != 200:
+                        return json.dumps({"error": f"PDF generation failed: HTTP {r.status_code}"})
 
                 pdf_bytes = r.content
                 if len(pdf_bytes) < 100:
@@ -5557,66 +5562,46 @@ async def run_tool(name, inp, context=None):
             channels = list(dict.fromkeys(p["channel"] for p in payments))
 
             # ============================================
-            # Step 1: Stripe 付款的 capture + 重复检测
-            # ============================================
-            stripe_payments = [p for p in payments if p["channel"] == "Stripe"]
-            captured_pis = []
-            duplicate_pis_to_cancel = []
-            capture_errors = []
-
-            if stripe_payments:
-                import stripe
-                stripe.api_key = STRIPE_SECRET_KEY
-
-                # 队列里同一个 SO 的 Stripe 付款按时间排序，第一个 capture，其余拦截
-                # external_ref 是 pi_id
-                stripe_payments_sorted = sorted(stripe_payments, key=lambda p: p.get("created_at", ""))
-
-                # 第一笔 capture
-                first_pi_id = stripe_payments_sorted[0]["external_ref"]
-                try:
-                    # 先查 PI 当前状态 (有可能已被 capture / cancelled)
-                    pi_obj = stripe.PaymentIntent.retrieve(first_pi_id)
-                    pi_status = getattr(pi_obj, "status", "")
-                    print(f"[RELEASE] Stripe PI {first_pi_id} status={pi_status}")
-
-                    if pi_status == "requires_capture":
-                        captured = stripe.PaymentIntent.capture(first_pi_id)
-                        cap_status = getattr(captured, "status", "")
-                        print(f"[RELEASE] Captured {first_pi_id}: {cap_status}")
-                        if cap_status != "succeeded":
-                            return json.dumps({
-                                "error": f"Stripe capture failed for {first_pi_id}: status={cap_status}",
-                            })
-                        captured_pis.append(first_pi_id)
-                    elif pi_status == "succeeded":
-                        # 已经被 capture 过了 (可能 Odoo 之前抓过)
-                        print(f"[RELEASE] {first_pi_id} already captured")
-                        captured_pis.append(first_pi_id)
-                    else:
-                        return json.dumps({
-                            "error": f"Stripe PI {first_pi_id} in unexpected state: {pi_status}",
-                        })
-                except stripe.error.StripeError as e:
-                    return json.dumps({"error": f"Stripe API error capturing {first_pi_id}: {str(e)}"})
-                except Exception as e:
-                    return json.dumps({"error": f"Failed to capture Stripe payment: {str(e)}"})
-
-                # 其余的 → 不 capture，加到 duplicate 列表
-                if len(stripe_payments_sorted) > 1:
-                    duplicate_pis_to_cancel = [p["external_ref"] for p in stripe_payments_sorted[1:]]
-                    print(f"[RELEASE] ⚠️ Duplicate Stripe payments for {so_name}, NOT capturing: {duplicate_pis_to_cancel}")
-
-            # ============================================
-            # Step 2: 决定 payment_method 标签
+            # Step 1: 决定 payment_method 标签 + 预检 Stripe PI 状态 (还不 capture)
             # ============================================
             if len(channels) == 1:
                 payment_method_label = channels[0]
             else:
                 payment_method_label = f"Combo({'+'.join(channels)})"
 
+            stripe_payments = [p for p in payments if p["channel"] == "Stripe"]
+            captured_pis = []
+            duplicate_pis_to_cancel = []
+            first_pi_id = None
+
+            if stripe_payments:
+                import stripe
+                stripe.api_key = STRIPE_SECRET_KEY
+
+                # 队列里同一个 SO 的 Stripe 付款按时间排序,第一个 capture,其余拦截
+                stripe_payments_sorted = sorted(stripe_payments, key=lambda p: p.get("created_at", ""))
+                first_pi_id = stripe_payments_sorted[0]["external_ref"]
+
+                # 预检第一笔 PI 状态 (确保还能 capture)
+                try:
+                    pi_obj = stripe.PaymentIntent.retrieve(first_pi_id)
+                    pi_status = getattr(pi_obj, "status", "")
+                    print(f"[RELEASE] Stripe PI {first_pi_id} status={pi_status}")
+                    if pi_status not in ("requires_capture", "succeeded"):
+                        return json.dumps({
+                            "error": f"Stripe PI {first_pi_id} 状态异常: {pi_status},无法 release。",
+                        })
+                except stripe.error.StripeError as e:
+                    return json.dumps({"error": f"Stripe API error: {str(e)}"})
+
+                # 标记多余的 PI (这些不会 capture)
+                if len(stripe_payments_sorted) > 1:
+                    duplicate_pis_to_cancel = [p["external_ref"] for p in stripe_payments_sorted[1:]]
+                    print(f"[RELEASE] ⚠️ 检测到 {len(duplicate_pis_to_cancel)} 笔重复 Stripe 付款,只 capture 第一笔: {duplicate_pis_to_cancel}")
+
             # ============================================
-            # Step 3: 创建 Invoice + 设 x_payment_method
+            # Step 2: 先创建 Invoice (Odoo 允许在 capture 前创建)
+            # 这样 capture 后 Odoo 收到 webhook 看到已有 invoice 会自动 reconcile payment
             # ============================================
             ctx_local = {"uid": ctx.get("uid", 0), "username": ctx.get("username", "manual_release"), "role": "admin"}
 
@@ -5633,8 +5618,39 @@ async def run_tool(name, inp, context=None):
             elif r1.get("success"):
                 invoice_id = r1["invoice_id"]
                 invoice_name = r1.get("invoice_name", "")
+                print(f"[RELEASE] Created invoice {invoice_name} (id={invoice_id}) for {so_name}")
             else:
                 return json.dumps({"error": f"Create invoice failed: {r1.get('error', 'unknown')}"})
+
+            # ============================================
+            # Step 3: Capture Stripe (现在 invoice 已经存在,Odoo 会自动 reconcile)
+            # ============================================
+            if first_pi_id:
+                try:
+                    # 重新查一遍状态 (创建 invoice 期间可能状态变了)
+                    pi_obj = stripe.PaymentIntent.retrieve(first_pi_id)
+                    pi_status = getattr(pi_obj, "status", "")
+
+                    if pi_status == "requires_capture":
+                        captured = stripe.PaymentIntent.capture(first_pi_id)
+                        cap_status = getattr(captured, "status", "")
+                        print(f"[RELEASE] Captured {first_pi_id}: {cap_status}")
+                        if cap_status != "succeeded":
+                            return json.dumps({
+                                "error": f"Stripe capture failed for {first_pi_id}: status={cap_status}",
+                                "invoice_created": invoice_name,
+                                "warning": "Invoice 已创建但 capture 失败,需要人工处理。",
+                            })
+                        captured_pis.append(first_pi_id)
+                    elif pi_status == "succeeded":
+                        print(f"[RELEASE] {first_pi_id} already captured")
+                        captured_pis.append(first_pi_id)
+                except stripe.error.StripeError as e:
+                    return json.dumps({
+                        "error": f"Stripe capture error: {str(e)}",
+                        "invoice_created": invoice_name,
+                        "warning": "Invoice 已创建但 capture 失败,需要人工处理。",
+                    })
 
             # ============================================
             # Step 4: Export PDF
