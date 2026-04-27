@@ -7656,6 +7656,7 @@ TOOL_PROGRESS_LABELS_ZH = {
     "set_my_contact":              "📇 正在更新联系方式...",
     "odoo_query":                  "🔍 正在查询 Odoo 数据...",
     "odoo_query_count":            "🔢 正在统计...",
+    "odoo_search":                 "🔍 正在搜索 Odoo 数据...",
     "odoo_search_product":         "📦 正在搜索产品...",
     "odoo_search_partner":         "👤 正在搜索客户...",
     "odoo_check_stock":            "📦 正在查库存...",
@@ -7691,6 +7692,7 @@ TOOL_PROGRESS_LABELS_EN = {
     "set_my_contact":              "📇 Updating contact...",
     "odoo_query":                  "🔍 Querying Odoo...",
     "odoo_query_count":            "🔢 Counting records...",
+    "odoo_search":                 "🔍 Searching Odoo...",
     "odoo_search_product":         "📦 Searching products...",
     "odoo_search_partner":         "👤 Searching customers...",
     "odoo_check_stock":            "📦 Checking stock...",
@@ -7753,8 +7755,8 @@ ODOO_MODEL_LABELS = {
 def _get_tool_progress_label(tool_name: str, lang: str, tool_input: dict = None) -> str:
     """Get progress label in user's language. For odoo_query/odoo_query_count,
     use a model-specific label if available."""
-    # 对 odoo_query / odoo_query_count 做特殊处理: 根据 model 给具体提示
-    if tool_name in ("odoo_query", "odoo_query_count") and tool_input:
+    # 对 odoo_query / odoo_query_count / odoo_search 做特殊处理: 根据 model 给具体提示
+    if tool_name in ("odoo_query", "odoo_query_count", "odoo_search") and tool_input:
         model = tool_input.get("model", "")
         if model in ODOO_MODEL_LABELS:
             zh_label, en_label = ODOO_MODEL_LABELS[model]
@@ -7799,7 +7801,7 @@ async def _odoo_bot_post_progress(channel_id: int, text: str):
                     "method": "message_post",
                     "args": [[channel_id]],
                     "kwargs": {
-                        "body": f"<i>{text}</i>",
+                        "body": text,
                         "message_type": "comment",
                         "subtype_xmlid": "mail.mt_comment",
                         "author_id": bot_partner_id,
