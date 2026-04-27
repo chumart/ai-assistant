@@ -3405,11 +3405,29 @@ async def run_tool(name, inp, context=None):
         main = prod_r[0]
         print(f"[RELATED_PARTS] resolved main: id={main['id']}, sku={main.get('default_code')}")
 
-        # Step 2: x_studio_related_parts is on product.product, related to product.template
+        # Step 2: x_studio_related_parts may exist on product.product OR product.template
+        # Try product.product first (where Studio shows it)
         related_tmpl_ids = main.get("x_studio_related_parts") or []
         if related_tmpl_ids is False:
             related_tmpl_ids = []
-        print(f"[RELATED_PARTS] x_studio_related_parts: {len(related_tmpl_ids)} template id(s) = {related_tmpl_ids[:10]}")
+        print(f"[RELATED_PARTS] from product.product: {len(related_tmpl_ids)} template id(s) = {related_tmpl_ids[:10]}")
+
+        # Fallback: maybe field is stored on product.template instead
+        if not related_tmpl_ids:
+            tmpl_id = main["product_tmpl_id"][0] if isinstance(main.get("product_tmpl_id"), list) else main.get("product_tmpl_id")
+            if tmpl_id:
+                try:
+                    tmpl_r = json.loads(await odoo_query("product.template",
+                        [["id", "=", tmpl_id]],
+                        ["id", "x_studio_related_parts"],
+                        limit=1, cookies=cookies))
+                    if isinstance(tmpl_r, list) and tmpl_r:
+                        tmpl_ids = tmpl_r[0].get("x_studio_related_parts") or []
+                        if tmpl_ids and tmpl_ids is not False:
+                            related_tmpl_ids = tmpl_ids
+                            print(f"[RELATED_PARTS] from product.template: {len(related_tmpl_ids)} template id(s) = {related_tmpl_ids[:10]}")
+                except Exception as e:
+                    print(f"[RELATED_PARTS] template fallback error (non-fatal): {e}")
 
         if not related_tmpl_ids:
             return json.dumps({
