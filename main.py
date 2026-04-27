@@ -7548,10 +7548,11 @@ async def stripe_webhook(request: Request):
     print(f"[STRIPE] Event: {event_type}")
 
     if event_type in ("payment_intent.amount_capturable_updated", "payment_intent.requires_capture"):
-        pi = event["data"]["object"]
-        pi_id = pi["id"]
+        # Stripe returns StripeObject which doesn't support .get() — convert to dict
+        pi = dict(event["data"]["object"])
+        pi_id = pi.get("id", "")
         amount_capturable = pi.get("amount_capturable", 0)
-        amount = pi["amount"] / 100.0
+        amount = pi.get("amount", 0) / 100.0
 
         # 只在有钱可 capture 时处理（amount_capturable > 0）
         if amount_capturable == 0:
@@ -7560,11 +7561,27 @@ async def stripe_webhook(request: Request):
 
         # --- 从 Odoo 生成的 PaymentIntent 提取信息 ---
         so_ref = (pi.get("description") or "").strip()
-        billing = pi.get("charges", {}).get("data", [{}])[0].get("billing_details", {})
-        customer_name = (billing.get("name") or "").strip()
+        # charges 可能也是 StripeObject，安全取值
+        charges_data = pi.get("charges", {})
+        if hasattr(charges_data, "data"):
+            charges_list = charges_data.data
+        elif isinstance(charges_data, dict):
+            charges_list = charges_data.get("data", [])
+        else:
+            charges_list = []
+        first_charge = dict(charges_list[0]) if charges_list else {}
+        billing = first_charge.get("billing_details", {})
+        if hasattr(billing, "get"):
+            customer_name = (billing.get("name") or "").strip()
+        else:
+            customer_name = str(getattr(billing, "name", "") or "").strip()
         if not customer_name:
-            customer_name = pi.get("shipping", {}).get("name", "")
-        customer_email = pi.get("receipt_email", "")
+            shipping = pi.get("shipping", {}) or {}
+            if hasattr(shipping, "get"):
+                customer_name = (shipping.get("name") or "").strip()
+            else:
+                customer_name = str(getattr(shipping, "name", "") or "").strip()
+        customer_email = pi.get("receipt_email", "") or ""
 
         print(f"[STRIPE] capturable: pi={pi_id}, ${amount}, capturable=${amount_capturable/100.0}, SO={so_ref}, customer={customer_name}")
 
@@ -7590,7 +7607,7 @@ async def stripe_webhook(request: Request):
                     same_so_pis = []
                     for rpi in recent_pis.data:
                         if (rpi.description == so_ref
-                                and rpi.amount == pi["amount"]
+                                and rpi.amount == pi.get("amount", 0)
                                 and rpi.status == "requires_capture"):
                             same_so_pis.append(rpi.id)
 
