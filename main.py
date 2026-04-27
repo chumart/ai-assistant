@@ -2425,12 +2425,24 @@ STEP 4: odoo_search combining BOTH the main model name AND the part keyword:
   domain=[["name", "ilike", "<part_keyword>"], ["name", "ilike", "<one keyword from main model name>"]]
   Example: main FLM-ST2-SS is "Sandwich Prep Table" → search name ilike "sneeze guard" AND ilike "sandwich"
 
-STEP 5: search_knowledge as last resort (spec sheets sometimes list parts).
+STEP 5: Try MODEL FAMILY FALLBACK — maybe user typed wrong model number.
+  Many products come in series (ST2/ST3/ST4/ST5/ST6, PLM-49/54/72, etc.).
+  When the exact model has no related parts, search siblings:
+  a) Extract the model prefix (e.g. FLM-ST2-SS → "FLM-ST")
+  b) odoo_search products with default_code ilike "<prefix>" to find sibling models.
+  c) For each sibling, call odoo_get_related_parts(main_product_id=<id>)
+  d) If a sibling has the requested part, tell user:
+     "FLM-ST2-SS 没有配 sneeze guard,但同系列的 FLM-ST5-SS 有 (FLM-ST5-OSG)。
+      请确认你要的是 ST2-SS 还是 ST5-SS?"
+  This prevents giving up when user makes typos in model numbers.
+
+STEP 6: search_knowledge as last resort (spec sheets sometimes list parts).
   query="<main_sku> <part_keyword> parts" or use translated keywords.
 
-ONLY say "未找到" / "not found" AFTER ALL 5 STEPS executed and all empty.
+ONLY say "未找到" / "not found" AFTER ALL 6 STEPS executed and all empty.
 NEVER stop at step 1 or 2 just because they returned empty — the part very often
-exists as a regular product but isn't yet linked in x_studio_related_parts.
+exists as a regular product but isn't yet linked in x_studio_related_parts, OR
+the user may have mistyped the model number (try sibling models in step 5).
 
 ═══ SCENARIO B: User asks about a part by name only (no main model in this turn) ═══
 Examples:
@@ -3354,29 +3366,28 @@ async def run_tool(name, inp, context=None):
         return json.dumps({"results": results, "not_found": not_found}, ensure_ascii=False)
 
     if name == "odoo_get_related_parts":
-        """Get x_studio_related_parts for a main product.
-        Field is on product.template (many2many to product.template).
-        Accepts main_sku or main_product_id.
-        Optional filter_keyword filters the returned parts by name/SKU substring."""
+        """Get x_studio_related_parts for a main product."""
         main_sku = (inp.get("main_sku") or "").strip()
         main_pid = inp.get("main_product_id")
         kw = (inp.get("filter_keyword") or "").strip().lower()
+        print(f"[RELATED_PARTS] called: main_sku={main_sku}, main_pid={main_pid}, kw={kw}")
 
         if not main_sku and not main_pid:
             return json.dumps({"error": "Provide either main_sku or main_product_id"})
 
         cookies = await odoo_get_session()
 
-        # Step 1: Resolve main product → product.template id
+        # Step 1: Resolve main product AND read x_studio_related_parts in one query
+        # (the field is on product.product, NOT product.template!)
         if main_pid:
             prod_r = json.loads(await odoo_query("product.product",
                 [["id", "=", main_pid]],
-                ["id", "default_code", "name", "product_tmpl_id"],
+                ["id", "default_code", "name", "product_tmpl_id", "x_studio_related_parts"],
                 limit=1, cookies=cookies))
         else:
             prod_r = json.loads(await odoo_query("product.product",
                 [["default_code", "=ilike", main_sku], ["active", "=", True]],
-                ["id", "default_code", "name", "product_tmpl_id"],
+                ["id", "default_code", "name", "product_tmpl_id", "x_studio_related_parts"],
                 limit=5, cookies=cookies))
             # Prefer exact case match
             if isinstance(prod_r, list) and prod_r:
@@ -3385,25 +3396,21 @@ async def run_tool(name, inp, context=None):
                     prod_r = [exact[0]]
 
         if not isinstance(prod_r, list) or not prod_r:
+            print(f"[RELATED_PARTS] ❌ main product '{main_sku or main_pid}' not found")
             return json.dumps({
                 "found": False,
                 "message": f"Main product '{main_sku or main_pid}' not found in Odoo",
             })
 
         main = prod_r[0]
-        tmpl_id = main["product_tmpl_id"][0] if isinstance(main.get("product_tmpl_id"), list) else main.get("product_tmpl_id")
-        if not tmpl_id:
-            return json.dumps({"error": f"Main product has no product_tmpl_id: {main}"})
+        print(f"[RELATED_PARTS] resolved main: id={main['id']}, sku={main.get('default_code')}")
 
-        # Step 2: Read x_studio_related_parts (list of product.template IDs)
-        tmpl_r = json.loads(await odoo_query("product.template",
-            [["id", "=", tmpl_id]],
-            ["id", "name", "default_code", "x_studio_related_parts"],
-            limit=1, cookies=cookies))
-        if not isinstance(tmpl_r, list) or not tmpl_r:
-            return json.dumps({"error": f"Could not load product.template {tmpl_id}"})
+        # Step 2: x_studio_related_parts is on product.product, related to product.template
+        related_tmpl_ids = main.get("x_studio_related_parts") or []
+        if related_tmpl_ids is False:
+            related_tmpl_ids = []
+        print(f"[RELATED_PARTS] x_studio_related_parts: {len(related_tmpl_ids)} template id(s) = {related_tmpl_ids[:10]}")
 
-        related_tmpl_ids = tmpl_r[0].get("x_studio_related_parts") or []
         if not related_tmpl_ids:
             return json.dumps({
                 "found": True,
@@ -3414,7 +3421,7 @@ async def run_tool(name, inp, context=None):
                            f"Try keyword search or knowledge base instead.",
             })
 
-        # Step 3: Get product.product info for each related template (we want SKU which is on product.product)
+        # Step 3: Get product.product info for each related template
         related_prods_r = json.loads(await odoo_query("product.product",
             [["product_tmpl_id", "in", related_tmpl_ids], ["active", "=", True]],
             ["id", "default_code", "name", "list_price", "qty_available", "product_tmpl_id"],
@@ -3422,8 +3429,13 @@ async def run_tool(name, inp, context=None):
 
         if not isinstance(related_prods_r, list):
             related_prods_r = []
+        print(f"[RELATED_PARTS] fetched {len(related_prods_r)} active product.product rows")
+        # Print sample of names so we can debug what's actually in there
+        for p in related_prods_r[:5]:
+            print(f"[RELATED_PARTS]   - {p.get('default_code')} | {p.get('name')}")
 
         # Step 4: Apply optional keyword filter
+        unfiltered_count = len(related_prods_r)
         if kw:
             filtered = []
             for p in related_prods_r:
@@ -3431,6 +3443,7 @@ async def run_tool(name, inp, context=None):
                 if kw in hay:
                     filtered.append(p)
             related_prods_r = filtered
+            print(f"[RELATED_PARTS] filtered by '{kw}': {len(related_prods_r)} of {unfiltered_count} match")
 
         # Format output
         results = [{
@@ -3454,7 +3467,7 @@ async def run_tool(name, inp, context=None):
             "total_configured": len(related_tmpl_ids),
             "message": (f"Found {len(results)} related part(s)" +
                         (f" matching '{kw}'" if kw else "") +
-                        (f" out of {len(related_tmpl_ids)} configured" if kw else "")),
+                        (f" out of {unfiltered_count} configured" if kw else "")),
         }, ensure_ascii=False)
 
     if name == "odoo_get_product_vendors":
