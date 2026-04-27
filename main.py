@@ -1906,7 +1906,7 @@ TOOLS = [
     },
     {
         "name": "odoo_create_bulk_po",
-        "description": "Create multiple purchase orders at once, one per vendor. Only call after user has confirmed the full plan. Each PO has one vendor and multiple product lines. CRITICAL: partner_id MUST come from odoo_get_product_vendors' vendor_id field (never user ID, never partner_name string). product_id MUST come from odoo_search_products_by_sku's product_id field (never invented, never product_tmpl_id).",
+        "description": "Create multiple purchase orders at once, one per vendor. Only call after user has confirmed the full plan. Each PO has one vendor and multiple product lines. CRITICAL: partner_id MUST come from odoo_get_product_vendors' vendor_id field (never user ID, never partner_name string). product_id MUST come from odoo_search_products_by_sku's product_id field (never invented, never product_tmpl_id). Optional: partner_ref sets the Vendor Reference field on the PO (e.g. PI number, vendor's own SO number).",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -1917,6 +1917,7 @@ TOOLS = [
                         "properties": {
                             "partner_id": {"type": "integer", "description": "Vendor partner ID — MUST be vendor_id from odoo_get_product_vendors"},
                             "partner_name": {"type": "string"},
+                            "partner_ref": {"type": "string", "description": "Optional: Vendor Reference / 客户参考号 (Odoo field: partner_ref). Example: 'M66-003SP/2026' or 'PI-12345'. Set this when user mentions PI numbers or vendor's reference."},
                             "lines": {
                                 "type": "array",
                                 "items": {
@@ -2365,7 +2366,7 @@ WRITE OPERATION RULES:
 - After creating, always show Odoo direct link from tool result
 - If user role lacks can_write_odoo, politely decline
 
-BULK PURCHASE ORDER WORKFLOW (when user gives a list of SKUs):
+BULK PURCHASE ORDER WORKFLOW (when user gives a list of SKUs OR PI/PO documents):
 Follow these steps in order:
 
 STEP 0 — If user provides SKUs WITHOUT quantities:
@@ -2390,27 +2391,57 @@ STEP 2 — Get all vendors:
   - has_multiple_vendors=true → LIST all vendors with their prices, ask user to choose ONE for that product
   - Only one vendor → auto-assign, no need to ask
 
+STEP 2b — VENDOR SEARCH (when user types vendor name OR PI/PO has vendor info):
+Use a TWO-PASS strategy to balance accuracy and recall:
+
+PASS 1 (preferred — strict): odoo_search with model="res.partner",
+  domain=[["name", "ilike", "<keyword>"], ["supplier_rank", ">", 0]]
+  Use the most distinctive single word from the vendor name (e.g. "hongtai" not "shandong hongtai").
+  If 1 result → use it.
+  If multiple → list them with id+name, ask user to pick.
+  If 0 results → go to PASS 2.
+
+PASS 2 (fallback — looser): odoo_search WITHOUT supplier_rank filter,
+  domain=[["name", "ilike", "<keyword>"]]
+  ⚠️ CRITICAL: results may include non-suppliers (customers, employees, garbage data).
+  - DO NOT auto-pick any result. ALWAYS list ALL matches with id+name+display_name.
+  - Show user: "Found these partners (some may not be suppliers): ..."
+  - Ask user to confirm which one to use, OR offer to create a new vendor.
+  - NEVER fabricate a partner_id from a partner that wasn't returned by either pass.
+
+If BOTH passes return 0 results:
+  Tell user "供应商不存在 / Vendor not found in Odoo".
+  Offer to create a new vendor (use odoo_create_record with model="res.partner", values={"name": "...", "supplier_rank": 1}).
+  Wait for user confirmation before creating.
+
 STEP 3 — Show grouped PO plan:
-  Group products by their chosen vendor. Show a clear table:
+  Group products by their chosen vendor. Show a clear table.
+  IF PI/PO documents were uploaded, EXTRACT and show:
+    - PI/Reference number (e.g. M66-003SP) — to set as Vendor Reference (partner_ref)
+    - Currency, payment terms
+    - Per-line: SKU, qty, unit price
+  Then format:
   "📋 PO Plan — X orders will be created:
 
-  **PO #1 → [Vendor A]**
+  **PO #1 → [Vendor A]**  (Vendor Ref: M66-003SP/2026)
   | SKU | Product | Qty | Unit Price |
   |-----|---------|-----|------------|
   | ... | ...     | ... | ...        |
-
-  **PO #2 → [Vendor B]**
-  | SKU | Product | Qty | Unit Price |
-  ...
 
   Total: X POs, Y line items
   Reply '确认' to create all, or tell me what to change."
 
 STEP 4 — Execute only after confirmation:
-  Call odoo_create_bulk_po with the full plan.
-  IMPORTANT: partner_id in purchase_orders must be the res.partner ID from vendor info (from odoo_get_product_vendors vendor_id field), NOT a user ID or product ID.
-  Report results: PO names (e.g. P00442) + Odoo links for each created PO.
-  If any line_errors exist, tell user which products failed and why.
+  Call odoo_create_bulk_po with the full plan, INCLUDING partner_ref if extracted from PI.
+  IMPORTANT: partner_id in purchase_orders must be the res.partner ID from vendor info, NOT a user ID or product ID.
+  Report results: PO names (e.g. P00442) + Odoo links + Vendor Reference for each created PO.
+
+UPDATING EXISTING PO FIELDS (Vendor Reference, expected date, etc.):
+  When user asks to update an existing PO field like "把 P00466 的 vendor reference 改成 M66-003SP/2026":
+  1. Confirm what change to make
+  2. Call odoo_update_record(model="purchase.order", record_id=<id>, values={"partner_ref": "M66-003SP/2026"})
+  3. Verify by querying the PO again
+  ⚠️ NEVER claim "已更新" if you didn't actually call odoo_update_record. The user can check Odoo directly — do not lie.
 
 ORDER/INVOICE STATE FILTERING (APPLIES TO ALL QUERIES):
 When searching or aggregating purchase orders, sale orders, invoices, or stock pickings, ALWAYS exclude CANCELLED records by default. Cancelled records do not represent real business activity and should not pollute user-facing counts, totals, or lists.
@@ -4865,6 +4896,11 @@ async def run_tool(name, inp, context=None):
                 "company_id": 1,
                 "date_order": now_str,
             }
+            # Set vendor reference (partner_ref) if AI provided one
+            partner_ref = (po.get("partner_ref") or "").strip()
+            if partner_ref:
+                po_vals["partner_ref"] = partner_ref
+                print(f"BULK PO: setting partner_ref='{partner_ref}'")
             # Set buyer (user_id) to the logged-in user if provided
             ctx_uid = ctx.get("uid")
             if ctx_uid and ctx_uid > 0:
