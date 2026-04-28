@@ -476,7 +476,7 @@ async def audit_odoo_write(
 @app.on_event("startup")
 async def startup():
     print("=" * 60)
-    print("CHUMART AI BACKEND — BUILD: release-guard-v16 (2026-04-28)")
+    print("CHUMART AI BACKEND — BUILD: release-guard-v17 (2026-04-28)")
     print("=" * 60)
     await init_db()
     # Start reminder scanner (checks every 60 seconds for due reminders)
@@ -8729,6 +8729,51 @@ def _is_release_intent(text: str) -> bool:
     return False
 
 
+def _is_query_intent(text: str) -> bool:
+    """检测消息是否为查询/列表意图（vs 写操作）。
+    
+    用于区分:
+    - "release AMZ112"  → 写操作 (release intent)
+    - "查下我 release 了哪些"  → 查询 (release 仅作为过去分词出现)
+    
+    中文没有英文的时态标记，光看字面词区分不了 release 是动词还是过去分词。
+    所以补上"含查询词" → 视为查询的规则。
+    
+    返回 True 表示这是查询请求，不应触发"防幻觉历史剥离"或 fast-path。
+    """
+    if not text:
+        return False
+    t = text.lower().strip()
+    
+    # 中文查询词 (放最前是因为最常见)
+    zh_query_words = [
+        "查", "看", "列", "显示", "告诉我", "告诉",
+        "哪些", "哪个", "哪一", "多少", "几个", "几张", "几条", "几单",
+        "列表", "清单", "汇总", "统计", "总共", "一共",
+        "是不是", "有没有", "有几", "是否", "能不能",
+        "记录", "历史",
+    ]
+    for kw in zh_query_words:
+        if kw in t:
+            return True
+    
+    # 英文查询词
+    en_query_patterns = [
+        r"\blist\b", r"\bshow\b", r"\bwhich\b", r"\bwhat\b",
+        r"\bhow many\b", r"\bhow much\b", r"\btell me\b",
+        r"\bdo i have\b", r"\bdo we have\b",
+        r"\bstatus of\b", r"\bcheck\b", r"\bsummary\b",
+        r"\brecent\b", r"\btoday'?s\b", r"\bthis week\b", r"\bthis month\b",
+        r"\bhistory\b", r"\bwere\b", r"\bwas\b", r"\bhave been\b",
+        r"\bany\b.*\b(orders?|invoices?|sales?|releases?)\b",
+    ]
+    for pat in en_query_patterns:
+        if re.search(pat, t):
+            return True
+    
+    return False
+
+
 # ─────────────────────────────────────────────
 # Marketplace release fast-path (v15)
 # ─────────────────────────────────────────────
@@ -8781,6 +8826,11 @@ def _is_simple_marketplace_release(text: str, has_attachments: bool) -> tuple[bo
 
     # 规则 1: 必须有 release 意图关键词
     if not _is_release_intent(raw):
+        return (False, None, None)
+
+    # 规则 1.5 (v17): 查询意图排除 — "查下我 release 了哪些"、"列出最近 release 的单"
+    # 这种是查询不是命令，不能走 fast-path (会导致 fast-path 误以为要执行)
+    if _is_query_intent(raw):
         return (False, None, None)
 
     # 规则 2: 复杂修饰词 → 让 AI 处理
@@ -9542,6 +9592,56 @@ ODOO DISCUSS BOT RULES (you are responding inside Odoo Discuss chat, NOT the web
 - Use simple formatting: **bold** for emphasis, bullet points (•) for lists
 - Maximum reply length: ~500 words. If data is larger, give a summary and offer the download link.
 
+📋 RELEASE HISTORY QUERIES (v17):
+When the user asks "what did I release / 我 release 了哪些 / 查下今天 release 了哪些 /
+列下最近的 release / 今天 release 多少单":
+This is a QUERY (asking about past actions), NOT a release command.
+Do NOT call any release/write tools (odoo_create_invoice_from_so, odoo_register_payment,
+odoo_export_invoice_pdf, print_invoice, release_so).
+
+⚠️ PERMISSION CHECK FIRST:
+Only `admin` and `finance` roles should answer "release history" queries.
+If the user's role is `sales_manager`, `sales`, `warehouse`, or `purchase`, decline politely:
+  "查 release 历史这类操作仅限 finance/admin 角色。如需了解某张具体订单的状态，
+   告诉我订单号或 invoice 号即可。"
+  ("Release history queries are restricted to finance/admin. If you need the status of
+   a specific order, just give me the SO number or invoice number.")
+
+How to answer (admin / finance only):
+
+The business definition of "release" = a posted customer invoice was created today.
+Use TWO sections in the reply:
+
+**Section 1 — Released (state=posted, payment registered):**
+  Search account.move:
+    domain: [
+      ["move_type", "=", "out_invoice"],
+      ["state", "=", "posted"],
+      ["payment_state", "in", ["paid", "in_payment", "partial"]],
+      ["create_date", ">=", "<today YYYY-MM-DD 00:00:00>"],
+      ["company_id", "=", 1],
+    ]
+    fields: name, partner_id, invoice_origin, amount_total, payment_state, x_payment_method
+    order: "create_date desc"
+  
+  For each row, show: invoice_name | SO (invoice_origin) | partner | amount | payment_state.
+
+**Section 2 — In progress (posted but no payment yet, supplementary):**
+  Same query but:
+    ["payment_state", "in", ["not_paid", "reversed"]]
+  Tell the user: "These are posted but payment hasn't been registered yet."
+  This is supplementary — show only if there are entries.
+
+Format: compact bullet list (Discuss-friendly), don't use markdown tables.
+Optionally append the total count at the end.
+
+DO NOT use these wrong filters:
+  ❌ ["state", "=", "done"] on sale.order — Amazon SOs stay "sale" after release
+  ❌ ["create_uid", "=", <user uid>] — invoices are all created by the same service account
+  ❌ ["invoice_user_id", "=", <user uid>] — Amazon SOs' user_id is OdooBot
+  ❌ Filtering by date_order on sale.order — use account.move.create_date instead
+     (more accurate, since SO date_order is the order placement date, not the release date)
+
 🚨 ALREADY-INVOICED HARD RULE (v16):
 If `odoo_create_invoice_from_so` returns `already_invoiced: true`, this means the SO has been
 released BEFORE. You MUST IMMEDIATELY STOP and tell the user. DO NOT call:
@@ -9569,13 +9669,17 @@ This rule has NO exceptions. Even if the user insists, do not continue. Direct t
 
     try:
         async with httpx.AsyncClient(timeout=300) as c:
-            # ── v15 Plan A: anti-hallucination history strip ──
+            # ── v15 Plan A: anti-hallucination history strip (v17 收紧) ──
             # 如果是 release 意图但因为复杂度没走 fast-path (比如混合了查询、
             # 或者 S04 普通订单)，仍然走 AI，但清掉历史。否则 Claude 会模式补全
             # 上次成功的 "Release Complete + INV/2026/xxxx" 模板，编造一个 INV 号。
-            if _is_release_intent(req.message or ""):
+            #
+            # v17: 加了查询意图排除 — "查下我 release 了哪些"这种字面包含 release
+            # 但其实是过去式查询的请求，必须保留完整历史 (否则 AI 答不好)
+            msg = req.message or ""
+            if _is_release_intent(msg) and not _is_query_intent(msg):
                 current_messages = [conv[-1]]
-                print(f"[ANTI-HALLUCINATION] release intent in mixed/complex msg → history stripped (1 msg)")
+                print(f"[ANTI-HALLUCINATION] write release intent → history stripped (1 msg)")
             else:
                 current_messages = list(conv)
             for _ in range(8):  # max tool iterations
