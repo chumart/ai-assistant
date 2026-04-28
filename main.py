@@ -476,7 +476,7 @@ async def audit_odoo_write(
 @app.on_event("startup")
 async def startup():
     print("=" * 60)
-    print("CHUMART AI BACKEND — BUILD: prompt-only-v9 (2026-04-28)")
+    print("CHUMART AI BACKEND — BUILD: payment-hint-v11 (2026-04-28)")
     print("=" * 60)
     await init_db()
     # Start reminder scanner (checks every 60 seconds for due reminders)
@@ -1931,6 +1931,7 @@ TOOLS = [
                 "date": {"type": "string", "description": "Date money was received, YYYY-MM-DD. Optional but highly recommended (narrows search)."},
                 "date_window_days": {"type": "integer", "description": "Search ±N days around date. Default 14. Use 7 for tight matching, 30 for loose."},
                 "customer_hint": {"type": "string", "description": "Customer name from bank memo / Zelle note, if available (e.g. 'CARLOS RODRIGUEZ' or 'Anna Cafe'). Improves match accuracy significantly."},
+                "payment_method_hint": {"type": "string", "description": "Optional payment method hint when known (e.g. 'Zelle', 'Stripe', 'Cash', 'Check', 'ACH', 'Wire', 'Square', 'Shopify Payment', 'Amazon Payment'). This is a STRONG bonus signal but NOT a filter — invoices with mismatched payment_method are still considered (humans sometimes input wrong method). Matches give +15 score, mismatches give -3."},
                 "max_candidates": {"type": "integer", "description": "Max candidates to return. Default 10."}
             },
             "required": ["amount"]
@@ -2217,6 +2218,145 @@ FINANCIAL REPORT RULES (you have access):
 - Monthly sales / commission base -> get_monthly_sales
 - CA invoices missing tax -> get_missing_tax
 - Can query account.move, account.payment with full access
+
+═══ CHUMART ACCOUNTING BACKGROUND (银行账户/对账业务背景) ═══
+Bank accounts (account.journal) we use:
+
+1. **Revenue and COGS** — main operating account
+   - Inbound (收款): customer payments via check/ACH/Zelle/Square/Stripe/Shopify
+   - Outbound (付款): 95%+ of vendor PO bill payments go through this account
+   - 大部分销售收款 + 大部分采购付款都走这里
+
+2. **Expense and Debt** — outbound expense account
+   - Outbound: Zelle payments to people, check disbursements, miscellaneous expenses
+   - 通常不收款,主要是对外的 Zelle/支票支付以及杂项支出
+   - Ashley 等 finance 团队经常需要对账(reconcile/validate)这里的支出
+
+3. **Amazon PLAT BUS CHECKING**
+   - Inbound only: Amazon marketplace payouts (~biweekly)
+   - 只用于接收 Amazon 打进的货款,大约2周1次
+
+4. **PAYROLL**
+   - Outbound only: employee payroll
+   - 只用于发工资
+
+5. **BOA DEBIT CARD** — eBay collections (rare/small)
+6. **NEW CHASE CREDIT CARD 8401** / **Chase Preferred** / **BOA Credit Card** / **Chase Credit Card**
+   - Credit cards for advertising fees, occasional shipping, small charges
+
+═══ RECONCILE / VALIDATE 业务概念 ═══
+"Reconcile" / "对账" / "validate" 在我们这里说的是同一件事:
+银行流水(account.bank.statement.line)进入 Odoo 后会先停在 **Bank Suspense Account** (101402),
+finance 需要在 Banking 模块的 reconciliation 界面把它**匹配**到一笔具体的:
+- 客户发票(account.move, out_invoice) — 收到客户付款
+- 供应商账单(account.move, in_invoice) — 付出供应商款
+- Credit note / 退款单(out_refund 或 in_refund)
+- 直接归到一个会计账户(如 Expense and Debt 的支出)
+匹配后点 **Validate** 按钮完成,该笔流水的状态从 not_matched 变成 reconciled。
+
+═══ "找一笔款属于哪张单" 的查找流程 ═══
+
+⚠️ KEY DISTINCTION — outbound vs inbound have DIFFERENT matching rules:
+
+────── A) OUTBOUND PAYMENT (付款 / 支出 / 我们付出去的钱) ──────
+关键词: "付款", "支出", "付出去的钱", "我们付的", "outbound payment", "vendor payment", "expense"
+
+⚠️ 必须使用完全等额匹配 (NO tolerance) — 因为我们退款做 credit note 时金额一定一致,
+付供应商时也是按发票金额付。任何金额误差都说明不是这笔。
+
+⚠️ Payment method 字段填写情况 (重要 — 影响匹配策略):
+  • Customer Invoice (out_invoice) 的 x_payment_method —— **强制填写**,可信度高
+  • Credit Note (out_refund) 的 x_payment_method —— **强制填写**,可信度高
+  • Vendor Bill (in_invoice) 的 x_payment_method —— **不强制**,经常空白,不要依赖
+  • account.payment 的 payment_method —— 通常有,但偶尔空白
+当字段空白时,不能因此排除该候选 — 要 fall back 到金额+日期+对方匹配。
+
+STEP 1: 先查 credit note (退款单) 是否有金额完全相等的:
+  odoo_search(model="account.move", domain=[
+    ["move_type", "=", "out_refund"],
+    ["state", "=", "posted"],
+    ["amount_total", "=", X],         # 必须完全等额
+    ["company_id", "=", 1],
+  ], fields=["name", "partner_id", "invoice_date", "amount_total", "x_payment_method"])
+  ✅ 这里 x_payment_method 强制填写,可作为强加分项 (匹配 +15 / 不符 -3)
+
+STEP 2: 查 vendor bill (供应商账单) 是否有金额完全相等的或 amount_residual 等于该金额:
+  odoo_search(model="account.move", domain=[
+    ["move_type", "=", "in_invoice"],
+    ["state", "=", "posted"],
+    "|",
+    ["amount_total", "=", X],
+    ["amount_residual", "=", X],      # 部分付款情况
+    ["company_id", "=", 1],
+  ], fields=["name", "partner_id", "invoice_date", "amount_total", "amount_residual", "x_payment_method"])
+  ⚠ 这里 x_payment_method 经常为空 — 即使用户说了 Zelle, 空字段的 vendor bill **依然要保留**为候选,
+    不能因为字段空白就排除它。回复时显示"付款方式: 未填写" 让用户判断,不要标 ⚠ 不符。
+
+STEP 3: 查 account.payment 已登记的 outbound 但未对账:
+  odoo_search(model="account.payment", domain=[
+    ["payment_type", "=", "outbound"],
+    ["amount", "=", X],
+    ["state", "=", "posted"],
+    ["is_reconciled", "=", False],
+    ["company_id", "=", 1],
+  ], fields=["name", "partner_id", "amount", "date", "journal_id", "ref", "payment_method"])
+  # account.payment uses 'payment_method' field (NOT x_payment_method).
+  # 通常有值, 偶尔空白时同样不能排除。
+
+STEP 4: 都没找到 → 告诉用户"在 credit note / vendor bill / unreconciled payment 中均未找到 $X 的精确匹配"。
+
+⛔ DO NOT use amount range (e.g. >=X-1 AND <=X+1) for outbound queries.
+⛔ DO NOT use odoo_match_payment_to_customer for outbound — that tool is for inbound only.
+
+If user provided payment method (e.g. "Zelle 给 PAUL 的 $120"):
+  - 按 model 分别处理:
+    • Credit notes (out_refund): payment method 强加分,不一致明显标 ⚠
+    • Vendor bills (in_invoice): payment method 字段经常空,空白的不算"不一致",**优先按金额排序**,
+      显示"付款方式: 未填写"让用户判断
+    • account.payment: 处理同 vendor bills
+  - DO NOT exclude any candidate based on payment method alone — only use it for ranking among
+    candidates that already match by amount.
+
+────── B) INBOUND PAYMENT (收款 / 客户打的钱) ──────
+关键词: "收款", "客户付的", "收到的钱", "inbound payment", "customer payment"
+
+✅ 收款允许有微小误差 (e.g. ±0.5 美金,因为 Stripe 手续费 / Square fee / wire fee 等)
+   使用 odoo_match_payment_to_customer 工具 — 它内置了智能匹配逻辑(金额、日期窗口、税前后金额),
+   不要自己拼 odoo_search domain。
+
+正常流程:
+  odoo_match_payment_to_customer(amount=X, date_window_days=90,
+                                  customer_hint="<from bank memo>",
+                                  payment_method_hint="<Zelle/Stripe/Cash/Check/ACH/Square...>")
+
+⚠️ ALWAYS pass payment_method_hint when known — bank statement / Zelle screenshot
+   shows the method. The hint becomes a STRONG bonus (+15) on matching invoices,
+   but is NOT a hard filter — invoices with mismatched payment_method still appear
+   (humans sometimes record the wrong method).
+
+如果该工具返回结果不理想,再 fallback 到:
+  odoo_search(model="account.move", domain=[
+    ["move_type", "=", "out_invoice"],
+    ["state", "=", "posted"],
+    ["amount_total", ">=", X - 1],     # 允许小误差
+    ["amount_total", "<=", X + 1],
+    ["payment_state", "in", ["not_paid", "partial"]],
+    ["company_id", "=", 1],
+  ])
+
+────── OUTPUT FORMAT — when reporting matches to the user ──────
+For EVERY candidate (whether inbound or outbound), include payment_method in your reply.
+Format example:
+  • INV/2026/01077 — PHO FILET 2 — $2.38 — 付款方式: Zelle ✓ (与指定一致)
+  • PBNK11/2026/00788 — Bryant Tsan — $120.00 — 付款方式: Zelle (outbound)
+If a candidate's payment_method differs from the user's stated method, mark it like:
+  • INV/2026/01081 — Test31 — $5.00 — 付款方式: Stripe ⚠ (与你说的 Zelle 不符)
+This lets the user immediately see whether the match aligns with their bank statement.
+
+────── 如何判断用户问的是 inbound 还是 outbound ──────
+- 用户明确说了"付款/支出/我们付的/付出去" → outbound (Step A)
+- 用户明确说了"收款/客户付的/收到" → inbound (Step B)
+- 模糊不清(只说"$X 这笔钱") → 主动问用户"这是收到的客户付款,还是支出?",不要猜
 
 COMMISSION REPORT RULES (IMPORTANT — follow this exactly):
 When user mentions "commission", "提成", "销售提成", "佣金", or any combination like "X月commission", "commission统计":
@@ -4429,6 +4569,7 @@ async def run_tool(name, inp, context=None):
         if date_window > 180: date_window = 180
 
         customer_hint = (inp.get("customer_hint") or "").strip()
+        payment_method_hint = (inp.get("payment_method_hint") or "").strip().lower()
         max_candidates = int(inp.get("max_candidates") or 10)
 
         # Amount tolerance: $20 to cover tax rate fluctuations.
@@ -4442,7 +4583,8 @@ async def run_tool(name, inp, context=None):
         near_exact_tol = 1.0  # within $1 = very strong match
 
         print(f"[MATCH_PAYMENT] amount={amount} tolerance=±${tolerance:.2f} "
-              f"window=±{date_window}d hint='{customer_hint}' date={received_date_str}")
+              f"window=±{date_window}d hint='{customer_hint}' "
+              f"payment_method_hint='{payment_method_hint}' date={received_date_str}")
 
         # ── Build date window for searches ─────────────────────
         date_from = date_to = None
@@ -4497,7 +4639,8 @@ async def run_tool(name, inp, context=None):
             "account.payment",
             pay_domain,
             ["id", "name", "amount", "date", "partner_id", "state",
-             "ref", "reconciled_invoice_ids", "payment_type", "journal_id"],
+             "ref", "reconciled_invoice_ids", "payment_type", "journal_id",
+             "payment_method"],     # account.payment uses 'payment_method' (not x_payment_method)
             limit=100, order="date desc"
         ))
         pay_r = pay_r if isinstance(pay_r, list) else []
@@ -4713,11 +4856,57 @@ async def run_tool(name, inp, context=None):
 
         def payment_method_score(x_payment_method_val):
             """Score based on invoice's x_payment_method field.
-            When user mentions Zelle/Wire/bank transfer, Zelle-method invoices
-            get a boost; Cash-method invoices get a penalty."""
+            Priority order:
+              1. If user provided payment_method_hint, that's a STRONG bonus (+15)
+                 when it matches, small penalty (-3) when it doesn't. NOT a filter —
+                 mismatched payment_method invoices are still considered (humans
+                 sometimes input the wrong method).
+              2. Otherwise, fall back to original heuristics (Zelle/Check/Wire = bonus,
+                 Cash/platform = penalty for the typical "received money in bank" case).
+            Note: empty payment_method does NOT incur penalty — vendor bills often
+            leave this field blank as it's not mandatory there. We just can't use
+            this signal for ranking that record."""
             if not x_payment_method_val:
                 return 0, ""
             pm = str(x_payment_method_val).lower()
+
+            # ── Hint-based scoring (preferred when hint is provided) ──
+            if payment_method_hint:
+                hint = payment_method_hint
+                # Normalize common aliases
+                hint_aliases = {
+                    "zelle": ["zelle"],
+                    "stripe": ["stripe"],
+                    "cash": ["cash"],
+                    "check": ["check", "cheque", "支票"],
+                    "ach": ["ach", "wire", "bank transfer", "银行转账"],
+                    "wire": ["wire", "ach", "bank transfer"],
+                    "square": ["square", "pos machine", "pos"],
+                    "shopify payment": ["shopify"],
+                    "amazon payment": ["amazon"],
+                }
+                # Determine which group the hint falls into
+                hint_group = None
+                for group, terms in hint_aliases.items():
+                    if any(t in hint for t in terms):
+                        hint_group = group
+                        break
+                # Determine which group the invoice's payment method falls into
+                pm_group = None
+                for group, terms in hint_aliases.items():
+                    if any(t in pm for t in terms):
+                        pm_group = group
+                        break
+
+                if hint_group and pm_group and hint_group == pm_group:
+                    return 15, f"付款方式: {x_payment_method_val} (匹配用户指定 {payment_method_hint})"
+                elif hint_group and pm_group:
+                    # Different methods — small penalty but still allow as candidate
+                    return -3, f"付款方式: {x_payment_method_val} (与指定 {payment_method_hint} 不符)"
+                # If neither side could be classified, fall through to default
+                return 0, f"付款方式: {x_payment_method_val}"
+
+            # ── No hint — original generic heuristics ──
             if "zelle" in pm:
                 return 10, "付款方式: Zelle"
             elif "ach" in pm:
@@ -4749,7 +4938,9 @@ async def run_tool(name, inp, context=None):
             if d_reason: reasons.append(d_reason)
             cu_score, cu_reason = customer_score(partner_id, partner_name)
             if cu_reason: reasons.append(cu_reason)
-            pm_score, pm_reason = payment_method_score(inv.get("x_payment_method"))
+            # account.payment has its own 'payment_method' field (selection,
+            # same options as invoice's x_payment_method).
+            pm_score, pm_reason = payment_method_score(p.get("payment_method"))
             if pm_reason: reasons.append(pm_reason)
             type_bonus = 5  # payment record is the most direct evidence
 
@@ -4784,6 +4975,7 @@ async def run_tool(name, inp, context=None):
                 "partner_name": partner_name,
                 "state": p.get("state"),
                 "journal": journal[1] if journal else "",
+                "payment_method": p.get("payment_method") or "",   # actual payment_method field
                 "payment_ref": p.get("ref") or "",
                 "linked_invoice_ids": linked_inv,
                 "match_reasons": reasons,
