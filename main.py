@@ -476,7 +476,7 @@ async def audit_odoo_write(
 @app.on_event("startup")
 async def startup():
     print("=" * 60)
-    print("CHUMART AI BACKEND — BUILD: release-perms-v3 (2026-04-28)")
+    print("CHUMART AI BACKEND — BUILD: release-perms-v4 (2026-04-28)")
     print("=" * 60)
     await init_db()
     # Start reminder scanner (checks every 60 seconds for due reminders)
@@ -3253,6 +3253,22 @@ async def run_tool(name, inp, context=None):
         models_with_company = ["account.move","sale.order","purchase.order","account.payment","res.partner","crm.lead","repair.order","stock.picking"]
         if model in models_with_company:
             domain = domain + [["company_id","=",1]]
+        # ── Defense-in-depth: enforce own-data filter for sales role ──
+        # If user can_see_all_sales is False, force user_id filter on relevant models
+        # so they can't peek at other salespeople's orders even if AI forgets the filter.
+        if not role_perms.get("can_see_all_sales"):
+            uid = ctx.get("uid", 0)
+            if uid:
+                if model == "sale.order":
+                    domain = domain + [["user_id", "=", uid]]
+                    print(f"[PERM-FILTER] forced user_id={uid} on sale.order for role={role}")
+                elif model == "account.move":
+                    domain = domain + [["invoice_user_id", "=", uid]]
+                    print(f"[PERM-FILTER] forced invoice_user_id={uid} on account.move for role={role}")
+                elif model in ("account.payment", "purchase.order"):
+                    # Sales role shouldn't query these at all — block
+                    print(f"[PERM-DENY] tool=odoo_search model={model} role={role} reason=restricted_model")
+                    return json.dumps({"error": f"Permission denied: role '{role}' cannot query {model}."})
         return await odoo_query(model, domain, inp["fields"], inp.get("limit",2000), inp.get("order","id desc"))
     if name == "odoo_fields":
         return await odoo_list_fields(inp["model"])
