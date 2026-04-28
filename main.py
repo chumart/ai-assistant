@@ -476,7 +476,7 @@ async def audit_odoo_write(
 @app.on_event("startup")
 async def startup():
     print("=" * 60)
-    print("CHUMART AI BACKEND — BUILD: release-fastpath-v15 (2026-04-28)")
+    print("CHUMART AI BACKEND — BUILD: release-guard-v16 (2026-04-28)")
     print("=" * 60)
     await init_db()
     # Start reminder scanner (checks every 60 seconds for due reminders)
@@ -8737,9 +8737,10 @@ def _is_release_intent(text: str) -> bool:
 # 设计原则: 严格保守 — 宁可漏吞 (走 AI 也无害)，绝不误吞复杂请求。
 
 # AMZ 标准格式: AMZ113-2288586-1962661  (3位前缀 + 7位 + 7位)
+# AMZ 前缀**可选** —— Alex 经常直接 copy Amazon 后台的纯数字 order id (e.g. "112-6760773-5712232")
 # Lookbehind 排除数字/横线 (前缀); negative lookahead 排除后续数字 (后缀)
 # 这样 'releaseAMZxxx' 和 'AMZxxxrelease' 两种黏连都能识别
-_AMZ_SO_RE = re.compile(r"(?<![0-9\-])AMZ\d{3}-\d{7}-\d{7}(?!\d)", re.IGNORECASE)
+_AMZ_SO_RE = re.compile(r"(?<![0-9\-])(?:AMZ)?\d{3}-\d{7}-\d{7}(?!\d)", re.IGNORECASE)
 # Shopify 格式: #CMT1761 或 CMT1761
 _CMT_SO_RE = re.compile(r"(?<![0-9\-])#?CMT\d+(?!\d)", re.IGNORECASE)
 
@@ -8796,19 +8797,27 @@ def _is_simple_marketplace_release(text: str, has_attachments: bool) -> tuple[bo
         return (False, None, None)
 
     if amz_matches:
-        so_name = amz_matches[0].upper()
+        # 归一化: Odoo 数据库存的格式都是 'AMZxxx-xxxxxxx-xxxxxxx'
+        # 用户可能输入纯数字 '112-6760773-5712232' (从 Amazon 后台 copy)
+        # 也可能输入完整 'AMZ112-...'，统一加上 AMZ 前缀
+        raw_so = amz_matches[0].upper()
+        if not raw_so.startswith("AMZ"):
+            so_name = "AMZ" + raw_so
+        else:
+            so_name = raw_so
         mtype = "AMZ"
     else:
         # CMT: 保留原始大小写但去掉 # 前缀，统一用大写
         so_name = cmt_matches[0].lstrip("#").upper()
         mtype = "CMT"
 
-    # 规则 4: 剩余非单号、非关键词字符 ≤ 8 个 (容忍 "release" / "开票" / 标点)
+    # 规则 4: 剩余非单号、非关键词字符 ≤ 8 个 (容忍 "release" / "开票" / "please" / 标点)
     remainder = raw
     remainder = _AMZ_SO_RE.sub("", remainder)
     remainder = _CMT_SO_RE.sub("", remainder)
-    # 去掉常见关键词
-    for kw in ("release", "开票", "出发票", "确认开票", "process", "create invoice"):
+    # 去掉常见关键词 + 礼貌用语 (Alex 经常说 "please release")
+    for kw in ("release", "开票", "出发票", "确认开票", "process", "create invoice",
+               "please", "请", "麻烦", "thanks", "thx", "ty"):
         remainder = re.sub(re.escape(kw), "", remainder, flags=re.IGNORECASE)
     # 去掉所有空白和常见标点
     remainder_compact = re.sub(r"[\s,.\-_:;@#]", "", remainder)
@@ -8948,76 +8957,101 @@ async def _marketplace_release_fastpath(
             steps.append({"name": "create_invoice", "ok": False, "data": {}, "error": result["error"]})
             return (_format_release_report(steps, so_name, "", lang), steps)
         
-        # 注意: already_invoiced 也算一种"成功"（已存在了，继续走付款 + 打印）
+        # ── v16: already_invoiced → 拒绝并返回 ──
+        # 如果 SO 已经有 posted invoice，说明这单**之前已经 release 过了**。
+        # 不能继续走 register_payment + print —— 那会重复打印一份已经处理过的发票，
+        # 浪费纸 + 可能造成财务误解。直接停下，明确告诉用户。
         if result.get("already_invoiced"):
-            invoice_id = result["invoice_id"]
             invoice_name = result.get("invoice_name", "")
-            partner_name = ""  # already_invoiced 路径不返回 partner，后面查
             payment_state = result.get("payment_state", "not_paid")
+            amount = result.get("amount_total")
+            print(f"[FASTPATH] {so_name} REJECTED: already invoiced → {invoice_name}, payment_state={payment_state}")
+            
+            # 翻译 payment_state 给用户看
+            ps_zh = {
+                "paid": "已付款",
+                "in_payment": "支付中",
+                "not_paid": "未付款",
+                "partial": "部分付款",
+                "reversed": "已冲销",
+            }.get(payment_state, payment_state)
+            ps_en = {
+                "paid": "paid",
+                "in_payment": "in payment",
+                "not_paid": "not paid",
+                "partial": "partially paid",
+                "reversed": "reversed",
+            }.get(payment_state, payment_state)
+            
+            if is_zh:
+                reply = (
+                    f"⚠️ **{so_name} 之前已经 release 过了**\n\n"
+                    f"**已存在的发票:** {invoice_name}\n"
+                    f"**金额:** ${amount:,.2f}\n" if amount else ""
+                ) + (
+                    f"**收款状态:** {ps_zh}\n\n"
+                    f"为避免重复打印发票，已停止操作。\n"
+                    f"如果确认需要重新打印，请联系 Admin 手动处理。"
+                )
+            else:
+                reply = (
+                    f"⚠️ **{so_name} has already been released**\n\n"
+                    f"**Existing invoice:** {invoice_name}\n"
+                    f"**Amount:** ${amount:,.2f}\n" if amount else ""
+                ) + (
+                    f"**Payment state:** {ps_en}\n\n"
+                    f"To avoid printing a duplicate invoice, the operation was stopped.\n"
+                    f"If you really need to reprint, please contact Admin to handle it manually."
+                )
+            
+            # 仍然返回 steps 让外层日志能看到
             steps.append({
                 "name": "create_invoice",
-                "ok": True,
-                "data": {
-                    "invoice_id": invoice_id,
-                    "invoice_name": invoice_name,
-                    "amount_total": result.get("amount_total"),
-                    "already_invoiced": True,
-                },
-                "error": None,
+                "ok": False,
+                "data": {"invoice_name": invoice_name, "payment_state": payment_state},
+                "error": "already_invoiced",
             })
-            print(f"[FASTPATH] {so_name} already invoiced → {invoice_name}, payment_state={payment_state}")
-            # 如果已经付清，跳过 register_payment
-            if payment_state in ("paid", "in_payment"):
-                steps.append({
-                    "name": "register_payment",
-                    "ok": True,
-                    "data": {"journal": journal_name, "skipped": True},
-                    "error": None,
-                })
-        else:
-            invoice_id = result["invoice_id"]
-            partner_name = result.get("partner", "")
-            steps.append({
-                "name": "create_invoice",
-                "ok": True,
-                "data": result,
-                "error": None,
-            })
+            return (reply, steps)
+        
+        # 正常路径: 新创建的 invoice
+        invoice_id = result["invoice_id"]
+        partner_name = result.get("partner", "")
+        steps.append({
+            "name": "create_invoice",
+            "ok": True,
+            "data": result,
+            "error": None,
+        })
     except Exception as e:
         steps.append({"name": "create_invoice", "ok": False, "data": {}, "error": str(e)[:200]})
         return (_format_release_report(steps, so_name, partner_name, lang), steps)
     
-    # ── Step 2: register payment (skip 如果已经标记为 skipped) ──
-    pay_already_done = any(
-        s["name"] == "register_payment" and s.get("data", {}).get("skipped")
-        for s in steps
-    )
-    if not pay_already_done:
-        progress_msg = "💰 正在登记收款..." if is_zh else "💰 Registering payment..."
-        await _odoo_bot_post_progress(channel_id, progress_msg)
+    # ── Step 2: register payment ──
+    progress_msg = "💰 正在登记收款..." if is_zh else "💰 Registering payment..."
+    await _odoo_bot_post_progress(channel_id, progress_msg)
+    
+    try:
+        result_str = await run_tool(
+            "odoo_register_payment",
+            {"invoice_id": invoice_id, "journal_name": journal_name},
+            context=ctx,
+        )
+        result = json.loads(result_str) if isinstance(result_str, str) else result_str
         
-        try:
-            result_str = await run_tool(
-                "odoo_register_payment",
-                {"invoice_id": invoice_id, "journal_name": journal_name},
-                context=ctx,
-            )
-            result = json.loads(result_str) if isinstance(result_str, str) else result_str
-            
-            if result.get("error"):
-                steps.append({"name": "register_payment", "ok": False, "data": {}, "error": result["error"]})
-                return (_format_release_report(steps, so_name, partner_name, lang), steps)
-            
-            # already_paid 也算成功
-            steps.append({
-                "name": "register_payment",
-                "ok": True,
-                "data": result,
-                "error": None,
-            })
-        except Exception as e:
-            steps.append({"name": "register_payment", "ok": False, "data": {}, "error": str(e)[:200]})
+        if result.get("error"):
+            steps.append({"name": "register_payment", "ok": False, "data": {}, "error": result["error"]})
             return (_format_release_report(steps, so_name, partner_name, lang), steps)
+        
+        # already_paid 也算成功 (这种情况理论上不会到这里——上面 already_invoiced 已经拦了)
+        steps.append({
+            "name": "register_payment",
+            "ok": True,
+            "data": result,
+            "error": None,
+        })
+    except Exception as e:
+        steps.append({"name": "register_payment", "ok": False, "data": {}, "error": str(e)[:200]})
+        return (_format_release_report(steps, so_name, partner_name, lang), steps)
     
     # ── Step 3: export PDF ──
     progress_msg = "📥 正在导出 PDF..." if is_zh else "📥 Exporting PDF..."
@@ -9507,6 +9541,23 @@ ODOO DISCUSS BOT RULES (you are responding inside Odoo Discuss chat, NOT the web
 - Do NOT use Markdown tables (they render poorly in Discuss) — use compact card-style or bullet lists instead
 - Use simple formatting: **bold** for emphasis, bullet points (•) for lists
 - Maximum reply length: ~500 words. If data is larger, give a summary and offer the download link.
+
+🚨 ALREADY-INVOICED HARD RULE (v16):
+If `odoo_create_invoice_from_so` returns `already_invoiced: true`, this means the SO has been
+released BEFORE. You MUST IMMEDIATELY STOP and tell the user. DO NOT call:
+  - odoo_register_payment (would double-pay an already-paid invoice)
+  - odoo_export_invoice_pdf (the user already has it)
+  - print_invoice (would print a duplicate, wasting paper and confusing the user)
+
+Instead, reply in this format (adjust language to match user):
+  ⚠️ **{so_name} has already been released**
+  **Existing invoice:** {invoice_name}
+  **Payment state:** {payment_state}
+
+  To avoid duplicate processing, the operation was stopped.
+  If you really need to reprint, please contact Admin to handle it manually.
+
+This rule has NO exceptions. Even if the user insists, do not continue. Direct them to Admin.
 """
 
     # Call Claude — Sonnet for admin/finance (better reasoning for reminders/invoicing),
