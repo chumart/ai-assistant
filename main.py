@@ -476,7 +476,7 @@ async def audit_odoo_write(
 @app.on_event("startup")
 async def startup():
     print("=" * 60)
-    print("CHUMART AI BACKEND — BUILD: payment-channels-v1 (2026-04-26)")
+    print("CHUMART AI BACKEND — BUILD: release-perms-v2 (2026-04-28)")
     print("=" * 60)
     await init_db()
     # Start reminder scanner (checks every 60 seconds for due reminders)
