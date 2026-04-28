@@ -2307,7 +2307,8 @@ STEP 2: 查 vendor bill (供应商账单) 是否有金额完全相等的或 amou
     ["company_id", "=", 1],
   ], fields=["name", "partner_id", "invoice_date", "amount_total", "amount_residual", "x_payment_method"])
   ⚠ 这里 x_payment_method 经常为空 — 即使用户说了 Zelle, 空字段的 vendor bill **依然要保留**为候选,
-    不能因为字段空白就排除它。回复时显示"付款方式: 未填写" 让用户判断,不要标 ⚠ 不符。
+    不能因为字段空白就排除它。回复时**不要**提"付款方式: 未填写" 或 "x_payment_method: false" 这种
+    内部字段术语 — 直接不提付款方式那一行即可。用户已经知道自己付款方式是 Zelle。
   ⛔ NO date filter.
 
 STEP 3: 查 account.payment 已登记的 outbound 但未对账:
@@ -2333,10 +2334,16 @@ If user provided payment method (e.g. "Zelle 给 PAUL 的 $120"):
   - 按 model 分别处理:
     • Credit notes (out_refund): payment method 强加分,不一致明显标 ⚠
     • Vendor bills (in_invoice): payment method 字段经常空,空白的不算"不一致",**优先按金额排序**,
-      显示"付款方式: 未填写"让用户判断
+      回复中**不显示**付款方式那一行 (不要说"未填写"/"未记录"等内部字段状态)。
     • account.payment: 处理同 vendor bills
   - DO NOT exclude any candidate based on payment method alone — only use it for ranking among
     candidates that already match by amount.
+
+═══ REPLY HYGIENE — 用户面前不要暴露 Odoo 内部字段细节 ═══
+- ❌ 不要说: "x_payment_method: false", "payment_state: in_payment", "is_reconciled=False"
+- ❌ 不要说: "字段为空", "字段未填写", "x_xxx_yyy 字段"
+- ✅ 应该: 用业务语言描述。如果某个数据点没有,**直接不提**,不要显示其技术状态。
+- ✅ 例外: 当用户明确询问"为什么没找到"或"哪些字段缺失"时,才说明字段情况。
 
 ────── B) INBOUND PAYMENT (收款 / 客户打的钱) ──────
 关键词: "收款", "客户付的", "收到的钱", "inbound payment", "customer payment"
