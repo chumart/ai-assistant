@@ -476,7 +476,7 @@ async def audit_odoo_write(
 @app.on_event("startup")
 async def startup():
     print("=" * 60)
-    print("CHUMART AI BACKEND — BUILD: release-perms-v5 (2026-04-28)")
+    print("CHUMART AI BACKEND — BUILD: prompt-only-v9 (2026-04-28)")
     print("=" * 60)
     await init_db()
     # Start reminder scanner (checks every 60 seconds for due reminders)
@@ -2767,6 +2767,23 @@ NEVER fabricate result fields like invoice numbers, PO numbers, IDs, amounts, jo
 PDF URLs, or success messages. If you're tempted to write "INV/2026/01100" — STOP — that
 number must come from an actual tool result, not from a guess based on a previous invoice
 number being 01099.
+
+🔒 HARD RULE FOR RELEASE/INVOICE INTENT 🔒
+When the user's latest message contains release intent — keywords like:
+  "release", "开票", "出发票", "create invoice", "process AMZ", "process #CMT",
+  "register payment", "登记收款", "print invoice", "打印发票"
+— and an SO identifier (S04xxx, AMZxxx, CMTxxx, #CMTxxx) — your FIRST output block 
+in this turn MUST BE a tool_use block. NOT text.
+
+You MUST start by calling one of these tools (do not output ANY text first):
+  - For S-prefix SOs: check_so_payment_status (then await user confirmation, then release_so)
+  - For AMZ-prefix: odoo_create_invoice_from_so, then odoo_register_payment, 
+    then odoo_export_invoice_pdf, then print_invoice (sequential, all in one turn)
+  - For #CMT/CMT-prefix: same 4-step sequence as AMZ but with payment_method="Shopify Payment"
+
+DO NOT begin your response with "I'll help you release..." or "Let me process..."
+or any narration. The user already knows you're processing — just call the tool.
+Only output text AFTER tool results come back, and only base it on what the tools returned.
 
 If you only THINK something happened, it DIDN'T. Tool calls are the only way to make changes.
 If user says "你刚才不是已经处理了吗?" / "didn't you already do that?" — that means YOU LIED last time.
