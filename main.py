@@ -476,7 +476,7 @@ async def audit_odoo_write(
 @app.on_event("startup")
 async def startup():
     print("=" * 60)
-    print("CHUMART AI BACKEND — BUILD: release-guard-v17 (2026-04-28)")
+    print("CHUMART AI BACKEND — BUILD: release-guard-v17.1 (2026-04-28)")
     print("=" * 60)
     await init_db()
     # Start reminder scanner (checks every 60 seconds for due reminders)
@@ -5448,8 +5448,11 @@ async def run_tool(name, inp, context=None):
         orders = inp.get("purchase_orders", [])
         created = []
         errors = []
-        date_planned = (datetime.datetime.now() + datetime.timedelta(days=7)).strftime("%Y-%m-%d %H:%M:%S")
-        now_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        # v17.1: 显式 UTC，防 Railway 服务器时区配置变动导致 date_order 错位
+        # Odoo 把 datetime 字段当 UTC 存储，UI 用 user 时区显示。
+        # 当前 Railway = UTC，naive datetime.now() 碰巧也是 UTC，但显式更安全。
+        date_planned = (datetime.datetime.now(UTC_TZ) + datetime.timedelta(days=7)).strftime("%Y-%m-%d %H:%M:%S")
+        now_str = datetime.datetime.now(UTC_TZ).strftime("%Y-%m-%d %H:%M:%S")
 
         # Get session: prefer logged-in user's cached Odoo session for proper attribution
         ctx_uid = ctx.get("uid")
@@ -9609,7 +9612,21 @@ If the user's role is `sales_manager`, `sales`, `warehouse`, or `purchase`, decl
 
 How to answer (admin / finance only):
 
-The business definition of "release" = a posted customer invoice was created today.
+The business definition of "release" = a posted customer invoice with invoice_date = today.
+
+🚨 IMPORTANT — Use `invoice_date`, NOT `create_date`:
+- `invoice_date` is the business invoice date (date type, e.g. "2026-04-28")
+- `create_date` is when the DB record was inserted (datetime, UTC-stored, e.g. "2026-04-28 04:00:07 UTC")
+- For Amazon/Shopify orders, the webhook may insert the invoice record at midnight UTC
+  (create_date = today UTC 00:00 = LA yesterday 17:00) but with invoice_date set to
+  YESTERDAY (the order's actual business day). Filtering by create_date would WRONGLY
+  include yesterday's LA orders in "today's release" list due to the UTC-LA timezone offset.
+- `invoice_date` is a date type (no timezone), matches the Odoo UI "Invoice Date" column,
+  and matches monthly_tax / monthly_sales report cutoff. ALWAYS use invoice_date.
+- For "today", use the LA date from the top of this system prompt (the "今天是" line),
+  NOT server-local datetime. Example: if system prompt says "今天是2026年04月28日",
+  use "2026-04-28" as today.
+
 Use TWO sections in the reply:
 
 **Section 1 — Released (state=posted, payment registered):**
@@ -9618,11 +9635,11 @@ Use TWO sections in the reply:
       ["move_type", "=", "out_invoice"],
       ["state", "=", "posted"],
       ["payment_state", "in", ["paid", "in_payment", "partial"]],
-      ["create_date", ">=", "<today YYYY-MM-DD 00:00:00>"],
+      ["invoice_date", "=", "<today YYYY-MM-DD>"],
       ["company_id", "=", 1],
     ]
-    fields: name, partner_id, invoice_origin, amount_total, payment_state, x_payment_method
-    order: "create_date desc"
+    fields: name, partner_id, invoice_origin, amount_total, payment_state, x_payment_method, invoice_date
+    order: "invoice_date desc, id desc"
   
   For each row, show: invoice_name | SO (invoice_origin) | partner | amount | payment_state.
 
@@ -9639,8 +9656,8 @@ DO NOT use these wrong filters:
   ❌ ["state", "=", "done"] on sale.order — Amazon SOs stay "sale" after release
   ❌ ["create_uid", "=", <user uid>] — invoices are all created by the same service account
   ❌ ["invoice_user_id", "=", <user uid>] — Amazon SOs' user_id is OdooBot
-  ❌ Filtering by date_order on sale.order — use account.move.create_date instead
-     (more accurate, since SO date_order is the order placement date, not the release date)
+  ❌ ["create_date", ">=", "<today>"] — webhook may build invoice at midnight with invoice_date=yesterday
+  ❌ Filtering by date_order on sale.order — Amazon SOs use webhook timestamp, not user release time
 
 🚨 ALREADY-INVOICED HARD RULE (v16):
 If `odoo_create_invoice_from_so` returns `already_invoiced: true`, this means the SO has been
