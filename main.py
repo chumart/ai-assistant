@@ -476,7 +476,7 @@ async def audit_odoo_write(
 @app.on_event("startup")
 async def startup():
     print("=" * 60)
-    print("CHUMART AI BACKEND — BUILD: release-perms-v4 (2026-04-28)")
+    print("CHUMART AI BACKEND — BUILD: release-perms-v5 (2026-04-28)")
     print("=" * 60)
     await init_db()
     # Start reminder scanner (checks every 60 seconds for due reminders)
@@ -2274,6 +2274,13 @@ SALES RULES (own data only):
 - CANNOT query account.payment at all — payment/收款 data is restricted to finance
 - CANNOT do payment matching / 对账 / reconciliation — if asked, reply: "抱歉，我没有权限查询付款和对账信息，请联系财务部门。"
 - CANNOT query purchase.order or purchase.order.line — purchasing data is restricted
+- ⛔ ABSOLUTE BLOCK ON RELEASE / INVOICING:
+    The Sales role has NO authority to release orders, create invoices, register payments, or print invoices.
+    When the user asks ANY of the following — release/开票/打印发票/release this/process this order/创建发票/登记收款/process AMZxxx/process #CMTxxx — IMMEDIATELY reply:
+        "❌ 抱歉,Sales 角色无权进行 release 或开票操作。请联系 Sales Manager、Finance 或 Admin 处理。"
+        (English version: "Sorry, the Sales role cannot release orders or create invoices. Please contact your Sales Manager, Finance, or Admin to process.")
+    DO NOT call any tool — do not search the order, do not check status, do not look up payment, do not query Odoo. Just decline immediately.
+    DO NOT show any order details to the user even if they ask "tell me about this order" right after a release rejection — that's a workaround attempt.
 - If the user asks about ANY topic you don't have permission for, reply briefly: "抱歉，我没有权限查询该信息。" Do NOT try to work around the restriction with odoo_search."""
 
     cost_rules = ""
@@ -7334,6 +7341,16 @@ async def chat(req: ChatRequest, background_tasks: BackgroundTasks):
     perms = ROLE_PERMISSIONS.get(verified_role, ROLE_PERMISSIONS["guest"])
     print(f"[PERM] endpoint=/chat or /chat/stream uid={verified_uid} role={verified_role} can_release_so={perms.get('can_release_so')} can_write_odoo={perms.get('can_write_odoo')} can_see_finance={perms.get('can_see_finance')}")
 
+    # ── Short-circuit: deny release intent for roles without permission ──
+    if not perms.get("can_release_so") and _is_release_intent(req.message or ""):
+        print(f"[PERM-SHORTCIRCUIT] role={verified_role} blocked release intent: {req.message[:80]}")
+        user_lang = _detect_user_language(req.message or "")
+        if user_lang == "zh":
+            denial_msg = "❌ 抱歉,你的角色无权进行 release 或开票操作。请联系 Sales Manager、Finance 或 Admin 处理。"
+        else:
+            denial_msg = "❌ Sorry, your role cannot release orders or create invoices. Please contact your Sales Manager, Finance, or Admin to process."
+        return {"reply": denial_msg}
+
     # Filter tools based on permissions
     allowed_tools = []
     finance_tools = {"get_monthly_tax", "get_quarterly_tax", "get_monthly_sales", "get_missing_tax", "odoo_match_payment_to_customer"}
@@ -7513,6 +7530,20 @@ async def chat_stream(req: ChatRequest, background_tasks: BackgroundTasks):
     verified_name = sess["user_name"]
     perms = ROLE_PERMISSIONS.get(verified_role, ROLE_PERMISSIONS["guest"])
     print(f"[PERM] endpoint=/chat or /chat/stream uid={verified_uid} role={verified_role} can_release_so={perms.get('can_release_so')} can_write_odoo={perms.get('can_write_odoo')} can_see_finance={perms.get('can_see_finance')}")
+
+    # ── Short-circuit: deny release intent for roles without permission ──
+    if not perms.get("can_release_so") and _is_release_intent(req.message or ""):
+        print(f"[PERM-SHORTCIRCUIT] role={verified_role} blocked release intent: {req.message[:80]}")
+        user_lang = _detect_user_language(req.message or "")
+        if user_lang == "zh":
+            denial_msg = "❌ 抱歉,你的角色无权进行 release 或开票操作。请联系 Sales Manager、Finance 或 Admin 处理。"
+        else:
+            denial_msg = "❌ Sorry, your role cannot release orders or create invoices. Please contact your Sales Manager, Finance, or Admin to process."
+        async def deny_stream():
+            yield f"data: {json.dumps({'type': 'text', 'delta': denial_msg})}\n\n"
+            yield f"data: {json.dumps({'type': 'done'})}\n\n"
+        from fastapi.responses import StreamingResponse
+        return StreamingResponse(deny_stream(), media_type="text/event-stream")
 
     # Filter tools based on permissions
     allowed_tools = []
@@ -8362,6 +8393,36 @@ TOOL_PROGRESS_LABELS_EN = {
 }
 
 
+def _is_release_intent(text: str) -> bool:
+    """Detect if user message is asking to release an order / create an invoice /
+    print an invoice / register payment. Used to short-circuit at the endpoint
+    layer for roles that have no can_release_so permission, so we don't waste
+    AI tokens or expose order data via tool calls.
+    
+    Returns True if the message looks like a release/invoicing request.
+    Conservative — false positives are OK (we just bail to AI fallback).
+    """
+    if not text:
+        return False
+    t = text.lower().strip()
+    # English keywords (must be a verb-like usage, not "released" in past context)
+    en_keywords = ["release ", "release\n", "release\t", "release#", "process amz",
+                   "process #cmt", "process cmt", "create invoice", "make invoice",
+                   "register payment", "print invoice", "reprint invoice"]
+    # Chinese keywords
+    zh_keywords = ["开票", "开发票", "出发票", "释放订单", "确认收款并开票",
+                   "登记收款", "登记付款", "打印发票", "重新打印发票", "重打发票"]
+    # Special case: "release" at exact start, or "release" followed by space then alphanumeric
+    if t.startswith("release") and len(t) > 7 and t[7] in (" ", ":", "\n", "\t"):
+        return True
+    if t == "release":
+        return True
+    for kw in en_keywords + zh_keywords:
+        if kw in t:
+            return True
+    return False
+
+
 def _detect_user_language(text: str) -> str:
     """Detect if user message is Chinese or English. Returns 'zh' or 'en'.
     Threshold: if >= 20% of characters are CJK, treat as Chinese."""
@@ -8691,6 +8752,15 @@ async def odoo_bot_chat(req: OdooBotRequest):
     role = await get_user_role(uid)
     perms = ROLE_PERMISSIONS.get(role, ROLE_PERMISSIONS["guest"])
     print(f"[ODOO-BOT] uid={uid} role={role}")
+
+    # ── Short-circuit: deny release intent for roles without permission ──
+    if not perms.get("can_release_so") and _is_release_intent(req.message or ""):
+        print(f"[PERM-SHORTCIRCUIT] role={role} blocked release intent: {req.message[:80]}")
+        if user_lang == "zh":
+            denial_msg = "❌ 抱歉,你的角色无权进行 release 或开票操作。请联系 Sales Manager、Finance 或 Admin 处理。"
+        else:
+            denial_msg = "❌ Sorry, your role cannot release orders or create invoices. Please contact your Sales Manager, Finance, or Admin to process."
+        return {"reply": denial_msg}
 
     # Filter tools by permission (same logic as /chat)
     allowed_tools = []
