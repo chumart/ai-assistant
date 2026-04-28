@@ -8415,26 +8415,42 @@ def _is_release_intent(text: str) -> bool:
     print an invoice / register payment. Used to short-circuit at the endpoint
     layer for roles that have no can_release_so permission, so we don't waste
     AI tokens or expose order data via tool calls.
-    
-    Returns True if the message looks like a release/invoicing request.
-    Conservative — false positives are OK (we just bail to AI fallback).
+
+    Uses regex word-boundary matching so:
+    - "release", "Release", "RELEASE" → trigger
+    - "releaseAMZ123", "AMZ123release", "AMZ release" → trigger (no-space variants)
+    - "released", "releasing", "releaser" → does NOT trigger (past/cont/agent forms)
     """
     if not text:
         return False
     t = text.lower().strip()
-    # English keywords (must be a verb-like usage, not "released" in past context)
-    en_keywords = ["release ", "release\n", "release\t", "release#", "process amz",
-                   "process #cmt", "process cmt", "create invoice", "make invoice",
-                   "register payment", "print invoice", "reprint invoice"]
-    # Chinese keywords
-    zh_keywords = ["开票", "开发票", "出发票", "释放订单", "确认收款并开票",
-                   "登记收款", "登记付款", "打印发票", "重新打印发票", "重打发票"]
-    # Special case: "release" at exact start, or "release" followed by space then alphanumeric
-    if t.startswith("release") and len(t) > 7 and t[7] in (" ", ":", "\n", "\t"):
-        return True
-    if t == "release":
-        return True
-    for kw in en_keywords + zh_keywords:
+    en_patterns = [
+        r"\brelease\b",                         # exact word "release"
+        r"\bprocess\s+amz",
+        r"\bprocess\s+#?cmt",
+        r"\bcreate\s+invoice",
+        r"\bmake\s+invoice",
+        r"\bregister\s+payment",
+        r"\bprint\s+invoice",
+        r"\breprint\s+invoice",
+        r"\bopen\s+invoice",
+        # No-space variants: "release" stuck to a digit/#/-/@ that's NOT a letter
+        # — this catches "release1234", "releaseAMZ-..." (after lowercase: "releaseamz" needs separate rule)
+        r"release(?=[0-9#@\-])",
+        # "release" preceded by digit or hyphen (e.g. "amz123release")
+        r"(?<=[0-9\-])release\b",
+        # AMZ/CMT prefix immediately followed by characters and "release" (e.g. "amz123release", "cmtrelease")
+        r"(?:amz|cmt)[a-z0-9\-]*release\b",
+        # "release" + "amz"/"cmt" (e.g. "releaseAMZ" → "releaseamz")
+        r"release(?:amz|cmt)",
+    ]
+    for pat in en_patterns:
+        if re.search(pat, t):
+            return True
+    zh_keywords = ["开票", "开发票", "出发票", "释放订单",
+                   "确认收款并开票", "登记收款", "登记付款",
+                   "打印发票", "重新打印发票", "重打发票"]
+    for kw in zh_keywords:
         if kw in t:
             return True
     return False
