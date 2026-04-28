@@ -476,7 +476,7 @@ async def audit_odoo_write(
 @app.on_event("startup")
 async def startup():
     print("=" * 60)
-    print("CHUMART AI BACKEND — BUILD: outbound-fix-v12 (2026-04-28)")
+    print("CHUMART AI BACKEND — BUILD: partner-fix-v13 (2026-04-28)")
     print("=" * 60)
     await init_db()
     # Start reminder scanner (checks every 60 seconds for due reminders)
@@ -2339,11 +2339,45 @@ If user provided payment method (e.g. "Zelle 给 PAUL 的 $120"):
   - DO NOT exclude any candidate based on payment method alone — only use it for ranking among
     candidates that already match by amount.
 
+═══ DRAFT 状态记录 — 一律排除 ═══
+查任何 invoice (account.move) / payment (account.payment) / SO (sale.order) /
+PO (purchase.order) 时,**永远加** `["state", "=", "posted"]` 过滤(对 sale.order/purchase.order
+则是 state in ['sale','done','purchase'])。
+Draft 是草稿状态,还没真正进入账本,不应作为对账或匹配的依据。
+唯一例外: 用户**明确**问"我有哪些草稿/待审核的单"时才包含 draft。
+
 ═══ REPLY HYGIENE — 用户面前不要暴露 Odoo 内部字段细节 ═══
-- ❌ 不要说: "x_payment_method: false", "payment_state: in_payment", "is_reconciled=False"
-- ❌ 不要说: "字段为空", "字段未填写", "x_xxx_yyy 字段"
-- ✅ 应该: 用业务语言描述。如果某个数据点没有,**直接不提**,不要显示其技术状态。
-- ✅ 例外: 当用户明确询问"为什么没找到"或"哪些字段缺失"时,才说明字段情况。
+绝对不要在用户回复里提 Odoo 字段的英文/技术名称。把字段值翻译成业务语言。
+
+字段名翻译对照表 (任何场景都适用):
+  ❌ "amount_residual = 0"            ✅ "已全额付清" / "已付清"
+  ❌ "amount_residual = 50"           ✅ "未付余额 $50" / "还欠 $50"
+  ❌ "payment_state = paid"           ✅ "已付款"
+  ❌ "payment_state = in_payment"     ✅ "支付中(已登记付款待对账)"
+  ❌ "payment_state = not_paid"       ✅ "未付款"
+  ❌ "payment_state = partial"        ✅ "部分付款"
+  ❌ "state = posted"                 ✅ "已过账" 或不提(默认)
+  ❌ "state = draft"                  ✅ "草稿状态"
+  ❌ "state = cancel"                 ✅ "已取消"
+  ❌ "move_type = out_invoice"        ✅ "客户发票"
+  ❌ "move_type = out_refund"         ✅ "退款单 (credit note)"
+  ❌ "move_type = in_invoice"         ✅ "供应商账单 (vendor bill)"
+  ❌ "move_type = in_refund"          ✅ "供应商退款单"
+  ❌ "is_reconciled = False"          ✅ "未对账"
+  ❌ "is_reconciled = True"           ✅ "已对账"
+  ❌ "x_payment_method = False"       ✅ (字段空 — 直接不提付款方式那一行)
+  ❌ "x_payment_method: Zelle"        ✅ "付款方式: Zelle"
+  ❌ "supplier_rank > 0"              ✅ "是供应商"
+  ❌ "customer_rank > 0"              ✅ "是客户"
+  ❌ "active = False"                 ✅ "已存档" / 不显示
+
+通用规则:
+  ❌ 不要说: "字段为空", "字段未填写", "x_xxx_yyy 字段", "tag XXX"
+  ❌ 不要在回复里出现 model name (account.move, account.payment, sale.order 等)
+  ❌ 不要在回复里出现 field name (amount_total/_residual/_state/state/move_type 等)
+  ✅ 用业务语言描述。如果某个数据点没有,**直接不提**,不要显示其技术状态。
+  ✅ ID/单号 (INV/2026/01100, BILL/2026/04/0017, P00466 等) 是业务编号,可以显示。
+  ✅ 例外: 当用户明确询问"为什么没找到"或"哪些字段缺失"时,才说明字段情况。
 
 ────── B) INBOUND PAYMENT (收款 / 客户打的钱) ──────
 关键词: "收款", "客户付的", "收到的钱", "inbound payment", "customer payment"
@@ -2533,7 +2567,9 @@ KNOWLEDGE BASE RULES (MOST IMPORTANT):
 
 GENERAL ODOO RULES:
 - Always include date filters when user mentions a time period
-- For account.move, sale.order, purchase.order, account.payment, res.partner, crm.lead, repair.order, stock.picking: filtered by company_id=1
+- For account.move, sale.order, purchase.order, account.payment, crm.lead, repair.order, stock.picking: filtered by company_id=1 automatically
+- For res.partner: do NOT add company_id filter — partners are shared across companies
+  (their company_id is usually False/null, so company_id=1 would return 0 results)
 - For product.product, stock.quant: do NOT add company_id filter
 - For stock queries always add ["location_id.usage","=","internal"]
 - For product search use ilike on both name and default_code with OR logic
@@ -3453,7 +3489,11 @@ async def run_tool(name, inp, context=None):
                          f"account.payment by amount instead.",
                 "results": []
             })
-        models_with_company = ["account.move","sale.order","purchase.order","account.payment","res.partner","crm.lead","repair.order","stock.picking"]
+        # NOTE: res.partner is intentionally excluded from auto company_id filter.
+        # Partners are typically shared across companies (company_id is False/null),
+        # so adding company_id=1 would filter them all out.
+        models_with_company = ["account.move","sale.order","purchase.order","account.payment",
+                               "crm.lead","repair.order","stock.picking"]
         if model in models_with_company:
             domain = domain + [["company_id","=",1]]
         # ── Defense-in-depth: enforce own-data filter for sales role ──
@@ -4666,6 +4706,7 @@ async def run_tool(name, inp, context=None):
 
         # ── 2) Search account.payment ──────────────────────────
         # Inbound customer payments in the amount window + date window.
+        # Exclude draft/cancelled — only consider posted payments (real ledger entries).
         pay_domain = [
             ["amount", ">=", amount_low],
             ["amount", "<=", amount_high],
@@ -4673,6 +4714,7 @@ async def run_tool(name, inp, context=None):
             ["date", "<=", date_to],
             ["company_id", "=", 1],
             ["partner_type", "=", "customer"],  # only inbound customer payments
+            ["state", "=", "posted"],            # 排除 draft/cancelled — 草稿付款不算
         ]
         pay_r = json.loads(await odoo_query(
             "account.payment",
