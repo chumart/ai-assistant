@@ -476,7 +476,7 @@ async def audit_odoo_write(
 @app.on_event("startup")
 async def startup():
     print("=" * 60)
-    print("CHUMART AI BACKEND — BUILD: release-perms-v2 (2026-04-28)")
+    print("CHUMART AI BACKEND — BUILD: release-perms-v3 (2026-04-28)")
     print("=" * 60)
     await init_db()
     # Start reminder scanner (checks every 60 seconds for due reminders)
@@ -3222,6 +3222,27 @@ Include rough cost hint for common fixes where relevant ("$10-30 零件" / "$200
 async def run_tool(name, inp, context=None):
     """context = dict with user info: {uid, username, role}"""
     ctx = context or {}
+    # ── Defense-in-depth permission gate ──
+    # Even if the AI tries to invoke a tool that the role's prompt shouldn't allow
+    # (e.g. due to context contamination across roles), block it here.
+    role = ctx.get("role", "guest")
+    role_perms = ROLE_PERMISSIONS.get(role, ROLE_PERMISSIONS["guest"])
+    _release_tools = {"odoo_create_invoice_from_so", "odoo_register_payment", "odoo_export_invoice_pdf", "release_so", "print_invoice", "check_so_payment_status"}
+    _write_tools = {"odoo_create_record", "odoo_add_order_line", "odoo_confirm_order", "odoo_update_record", "odoo_update_vendor_price"}
+    _cost_tools = {"odoo_find_recent_purchases_by_skus", "odoo_get_product_vendors", "odoo_create_bulk_po", "get_po_with_so_links", "odoo_restock_analysis"}
+    _finance_tools = {"get_monthly_tax", "get_quarterly_tax", "get_monthly_sales", "get_missing_tax", "odoo_match_payment_to_customer"}
+    if name in _release_tools and not role_perms.get("can_release_so"):
+        print(f"[PERM-DENY] tool={name} role={role} reason=no_release_permission")
+        return json.dumps({"error": f"Permission denied: role '{role}' cannot use {name}. Need finance/admin/sales_manager."})
+    if name in _write_tools and not role_perms.get("can_write_odoo"):
+        print(f"[PERM-DENY] tool={name} role={role} reason=no_write_permission")
+        return json.dumps({"error": f"Permission denied: role '{role}' cannot use {name}. Need finance/admin/purchase."})
+    if name in _cost_tools and not role_perms.get("can_see_cost"):
+        print(f"[PERM-DENY] tool={name} role={role} reason=no_cost_permission")
+        return json.dumps({"error": f"Permission denied: role '{role}' cannot use {name}. Need finance/admin/purchase."})
+    if name in _finance_tools and not role_perms.get("can_see_finance"):
+        print(f"[PERM-DENY] tool={name} role={role} reason=no_finance_permission")
+        return json.dumps({"error": f"Permission denied: role '{role}' cannot use {name}. Need finance/admin."})
     try:
         print(f"[TOOL] {name} input={json.dumps(inp, ensure_ascii=False, default=str)[:500]}")
     except Exception:
@@ -7295,6 +7316,7 @@ async def chat(req: ChatRequest, background_tasks: BackgroundTasks):
     verified_uid = sess["uid"]
     verified_name = sess["user_name"]
     perms = ROLE_PERMISSIONS.get(verified_role, ROLE_PERMISSIONS["guest"])
+    print(f"[PERM] endpoint=/chat or /chat/stream uid={verified_uid} role={verified_role} can_release_so={perms.get('can_release_so')} can_write_odoo={perms.get('can_write_odoo')} can_see_finance={perms.get('can_see_finance')}")
 
     # Filter tools based on permissions
     allowed_tools = []
@@ -7474,6 +7496,7 @@ async def chat_stream(req: ChatRequest, background_tasks: BackgroundTasks):
     verified_uid = sess["uid"]
     verified_name = sess["user_name"]
     perms = ROLE_PERMISSIONS.get(verified_role, ROLE_PERMISSIONS["guest"])
+    print(f"[PERM] endpoint=/chat or /chat/stream uid={verified_uid} role={verified_role} can_release_so={perms.get('can_release_so')} can_write_odoo={perms.get('can_write_odoo')} can_see_finance={perms.get('can_see_finance')}")
 
     # Filter tools based on permissions
     allowed_tools = []
