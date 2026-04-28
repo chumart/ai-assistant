@@ -476,7 +476,7 @@ async def audit_odoo_write(
 @app.on_event("startup")
 async def startup():
     print("=" * 60)
-    print("CHUMART AI BACKEND — BUILD: release-guard-v17.1 (2026-04-28)")
+    print("CHUMART AI BACKEND — BUILD: force-tool-v18 (2026-04-28)")
     print("=" * 60)
     await init_db()
     # Start reminder scanner (checks every 60 seconds for due reminders)
@@ -515,7 +515,14 @@ def _fmt_la(dt_val: datetime.datetime) -> str:
     return dt_val.astimezone(LA_TZ).strftime("%Y-%m-%d %H:%M %Z")
 
 async def _get_user_contact(uid: int) -> dict:
-    """Find user's email + phone from user_contacts table, fallback to Odoo."""
+    """Find user's email + phone. Lookup priority:
+    1. PostgreSQL user_contacts table (manual override)
+    2. Odoo res.users.mobile_phone (Work Mobile in user profile)
+    3. Odoo res.partner.mobile / .phone (linked contact)
+    
+    Phone numbers are stripped of common formatting (spaces, dashes, parens)
+    but should ideally be stored in E.164 format (+13105551234) for Twilio.
+    """
     email = phone = None
     conn = await get_db_conn()
     if conn:
@@ -531,11 +538,15 @@ async def _get_user_contact(uid: int) -> dict:
     if not email or not phone:
         try:
             users_r = json.loads(await odoo_query("res.users", [["id","=",uid]],
-                                                   ["login","email","partner_id"], limit=1))
+                                                   ["login","email","partner_id","mobile_phone"], limit=1))
             if isinstance(users_r, list) and users_r:
                 u = users_r[0]
                 if not email:
                     email = u.get("email") or u.get("login")
+                # First check res.users.mobile_phone (Work Mobile field)
+                if not phone:
+                    phone = u.get("mobile_phone") or None
+                # Then fallback to res.partner.mobile / .phone
                 if not phone and u.get("partner_id"):
                     pid = u["partner_id"][0]
                     partners_r = json.loads(await odoo_query("res.partner", [["id","=",pid]],
@@ -545,6 +556,17 @@ async def _get_user_contact(uid: int) -> dict:
                         phone = p.get("mobile") or p.get("phone") or None
         except Exception as e:
             print(f"get_user_contact Odoo error: {e}")
+    
+    # Normalize phone: strip common formatting that breaks Twilio
+    if phone:
+        phone = phone.strip().replace(" ", "").replace("-", "").replace("(", "").replace(")", "")
+        # If user wrote 10-digit US format without +1, prepend it
+        if phone.isdigit() and len(phone) == 10:
+            phone = "+1" + phone
+        # If user wrote 11-digit starting with 1, prepend +
+        elif phone.isdigit() and len(phone) == 11 and phone.startswith("1"):
+            phone = "+" + phone
+    
     return {"email": email, "phone": phone}
 
 async def _send_email(to_email: str, subject: str, body_text: str) -> tuple:
@@ -7051,8 +7073,13 @@ def convert_tools_to_openai(tools: list) -> list:
         })
     return oai_tools
 
-async def chat_openai(messages: list, system: str, model: str, tools: list, context: dict = None) -> str:
-    """Call OpenAI Chat Completions API with full tool use support."""
+async def chat_openai(messages: list, system: str, model: str, tools: list, context: dict = None, force_tool_first: bool = False) -> str:
+    """Call OpenAI Chat Completions API with full tool use support.
+    
+    force_tool_first: if True, the FIRST API call uses tool_choice="required"
+    to force the model to invoke a tool (defends against pattern-completion
+    hallucination on release/reminder intents).
+    """
     openai_key = os.getenv("OPENAI_API_KEY", "")
     if not openai_key:
         return "OpenAI API key not configured. Please add OPENAI_API_KEY to Railway environment variables."
@@ -7062,7 +7089,7 @@ async def chat_openai(messages: list, system: str, model: str, tools: list, cont
 
         async with httpx.AsyncClient(timeout=300) as c:
             current_messages = list(oai_messages)
-            for _ in range(8):
+            for iteration in range(8):
                 payload = {
                     "model": model,
                     "messages": current_messages,
@@ -7074,7 +7101,11 @@ async def chat_openai(messages: list, system: str, model: str, tools: list, cont
                     payload["max_tokens"] = 4096
                 if oai_tools:
                     payload["tools"] = oai_tools
-                    payload["tool_choice"] = "auto"
+                    # v18: force tool on first iteration if write intent detected
+                    if force_tool_first and iteration == 0:
+                        payload["tool_choice"] = "required"
+                    else:
+                        payload["tool_choice"] = "auto"
 
                 r = await c.post(
                     "https://api.openai.com/v1/chat/completions",
@@ -7717,19 +7748,42 @@ async def chat(req: ChatRequest, background_tasks: BackgroundTasks):
             oai_messages = req.history + [{"role": "user", "content": openai_image_content}]
         else:
             oai_messages = messages
-        reply = await chat_openai(oai_messages, system_prompt, selected_model, allowed_tools, context=tool_context)
+        # v18: Force tool_choice if release/reminder intent detected
+        force_tool_oai = (
+            _is_release_intent(req.message or "") or
+            _is_reminder_intent(req.message or "")
+        )
+        if force_tool_oai:
+            print(f"[FORCE_TOOL] /chat openai: detected write intent, forcing tool_choice=required")
+        reply = await chat_openai(oai_messages, system_prompt, selected_model, allowed_tools,
+                                   context=tool_context, force_tool_first=force_tool_oai)
     else:
         # Anthropic path
+        # v18: Force tool_choice if release/reminder intent detected
+        # — defends against pattern-completion hallucination where the model
+        # generates fake "✅ done" text without actually calling the tool.
+        force_tool = (
+            _is_release_intent(req.message or "") or
+            _is_reminder_intent(req.message or "")
+        )
+        if force_tool:
+            print(f"[FORCE_TOOL] /chat anthropic: detected write intent, forcing tool_choice=any")
+        
         async with httpx.AsyncClient(timeout=300) as c:
             current_messages = list(messages)
-            for _ in range(8):
-                r = await c.post("https://api.anthropic.com/v1/messages", headers=headers, json={
+            for iteration in range(8):
+                payload = {
                     "model": selected_model,
                     "max_tokens": 4096,
                     "system": system_prompt,
                     "tools": allowed_tools,
                     "messages": current_messages
-                })
+                }
+                # Only force on the FIRST iteration; once tool results come back,
+                # let the model summarize naturally
+                if force_tool and iteration == 0:
+                    payload["tool_choice"] = {"type": "any"}
+                r = await c.post("https://api.anthropic.com/v1/messages", headers=headers, json=payload)
                 d = r.json()
                 if "error" in d:
                     return {"reply": f"API error: {d['error'].get('message', str(d['error']))}"}
@@ -7920,6 +7974,14 @@ async def chat_stream(req: ChatRequest, background_tasks: BackgroundTasks):
             oai_tools = convert_tools_to_openai(allowed_tools)
             current_messages = [{"role": "system", "content": system_prompt}] + oai_messages_input
             full_reply_text = ""
+            
+            # v18: Force tool_choice if release/reminder intent detected
+            force_tool_oai_stream = (
+                _is_release_intent(req.message or "") or
+                _is_reminder_intent(req.message or "")
+            )
+            if force_tool_oai_stream:
+                print(f"[FORCE_TOOL] /chat/stream openai: detected write intent, forcing tool_choice=required")
 
             try:
                 for iteration in range(8):
@@ -7935,7 +7997,11 @@ async def chat_stream(req: ChatRequest, background_tasks: BackgroundTasks):
                         payload["max_tokens"] = 4096
                     if oai_tools:
                         payload["tools"] = oai_tools
-                        payload["tool_choice"] = "auto"
+                        # v18: force on first iteration
+                        if force_tool_oai_stream and iteration == 0:
+                            payload["tool_choice"] = "required"
+                        else:
+                            payload["tool_choice"] = "auto"
 
                     # Accumulate the assistant message as we stream
                     assistant_content = ""
@@ -8082,6 +8148,14 @@ async def chat_stream(req: ChatRequest, background_tasks: BackgroundTasks):
         "anthropic-version": "2023-06-01",
         "content-type": "application/json"
     }
+    
+    # v18: Force tool_choice if release/reminder intent detected
+    force_tool_stream = (
+        _is_release_intent(req.message or "") or
+        _is_reminder_intent(req.message or "")
+    )
+    if force_tool_stream:
+        print(f"[FORCE_TOOL] /chat/stream anthropic: detected write intent, forcing tool_choice=any")
 
     async def claude_stream():
         current_messages = list(messages)
@@ -8096,6 +8170,9 @@ async def chat_stream(req: ChatRequest, background_tasks: BackgroundTasks):
                     "messages": current_messages,
                     "stream": True,
                 }
+                # Only force on first iteration
+                if force_tool_stream and iteration == 0:
+                    payload["tool_choice"] = {"type": "any"}
                 async with httpx.AsyncClient(timeout=300) as c:
                     async with c.stream("POST", "https://api.anthropic.com/v1/messages",
                                         headers=headers, json=payload) as r:
@@ -8771,6 +8848,58 @@ def _is_query_intent(text: str) -> bool:
         r"\bany\b.*\b(orders?|invoices?|sales?|releases?)\b",
     ]
     for pat in en_query_patterns:
+        if re.search(pat, t):
+            return True
+    
+    return False
+
+
+def _is_reminder_intent(text: str) -> bool:
+    """检测用户是否要创建/更新 reminder（不是查询/取消）。
+    
+    用于强制 tool_choice，防止 AI 看到对话历史里前几次 reminder 成功的模板，
+    第 N 次直接生成"已设置"文本而不调工具（模式补全幻觉）。
+    
+    返回 True 仅当: 检测到 reminder 关键词 AND NOT 查询意图 AND NOT 取消意图。
+    """
+    if not text:
+        return False
+    t = text.lower().strip()
+    
+    # 排除取消意图: "取消提醒"/"删除提醒"/"cancel reminder"
+    cancel_patterns = [
+        r"取消", r"删除", r"删掉", r"去掉",
+        r"\bcancel\b", r"\bdelete\b", r"\bremove\b", r"\bclear\b",
+    ]
+    for pat in cancel_patterns:
+        if re.search(pat, t):
+            # 还要确认它跟 reminder 是同一句意——简单做法：取消 + 提醒同时出现就跳过 force
+            # （取消应该走 cancel_reminder 工具，不需要 force create_reminder）
+            if any(rk in t for rk in ["提醒", "remind", "reminder"]):
+                return False
+    
+    # 排除查询意图: "我有什么提醒"/"看下我的提醒"/"list my reminders"
+    if _is_query_intent(text):
+        return False
+    
+    # 中文 reminder 关键词
+    zh_keywords = [
+        "提醒我", "提醒一下", "提醒下", "记得",
+        "别忘", "不要忘", "千万别忘",
+        "到时", "到点",
+    ]
+    for kw in zh_keywords:
+        if kw in t:
+            return True
+    
+    # 英文 reminder 关键词
+    en_patterns = [
+        r"\bremind\s+me\b", r"\bset\s+(a\s+)?reminder\b",
+        r"\balert\s+me\b", r"\bnotify\s+me\b",
+        r"\bping\s+me\b", r"\btext\s+me\s+at\b", r"\bcall\s+me\s+at\b",
+        r"\bdon'?t\s+(let\s+me\s+)?forget\b",
+    ]
+    for pat in en_patterns:
         if re.search(pat, t):
             return True
     
@@ -9699,14 +9828,29 @@ This rule has NO exceptions. Even if the user insists, do not continue. Direct t
                 print(f"[ANTI-HALLUCINATION] write release intent → history stripped (1 msg)")
             else:
                 current_messages = list(conv)
-            for _ in range(8):  # max tool iterations
-                r = await c.post("https://api.anthropic.com/v1/messages", headers=headers, json={
+            
+            # v18: Force tool_choice if release/reminder intent (defends against
+            # pattern-completion hallucination — e.g. AI replies "✅ 已设置" without
+            # actually calling create_reminder when the conversation history shows
+            # several previous successful reminders)
+            force_tool_bot = (
+                _is_release_intent(msg) or _is_reminder_intent(msg)
+            ) and not _is_query_intent(msg)
+            if force_tool_bot:
+                print(f"[FORCE_TOOL] /odoo-bot: detected write intent, forcing tool_choice=any")
+            
+            for iteration in range(8):  # max tool iterations
+                payload = {
                     "model": bot_model,
                     "max_tokens": 2048,
                     "system": system_prompt,
                     "tools": allowed_tools,
                     "messages": current_messages
-                })
+                }
+                # Only force on first iteration
+                if force_tool_bot and iteration == 0:
+                    payload["tool_choice"] = {"type": "any"}
+                r = await c.post("https://api.anthropic.com/v1/messages", headers=headers, json=payload)
                 d = r.json()
                 if "error" in d:
                     print(f"[ODOO-BOT] API error: {d['error']}")
