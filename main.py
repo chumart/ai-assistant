@@ -476,7 +476,7 @@ async def audit_odoo_write(
 @app.on_event("startup")
 async def startup():
     print("=" * 60)
-    print("CHUMART AI BACKEND — BUILD: partner-fix-v13 (2026-04-28)")
+    print("CHUMART AI BACKEND — BUILD: release-fastpath-v15 (2026-04-28)")
     print("=" * 60)
     await init_db()
     # Start reminder scanner (checks every 60 seconds for due reminders)
@@ -8729,6 +8729,350 @@ def _is_release_intent(text: str) -> bool:
     return False
 
 
+# ─────────────────────────────────────────────
+# Marketplace release fast-path (v15)
+# ─────────────────────────────────────────────
+# 目的: 把 "AMZxxx release" / "#CMTxxx 开票" 这类完全确定性的请求，
+# 从 AI 路径剥离出来走纯代码 4 步流程，从架构上杜绝幻觉。
+# 设计原则: 严格保守 — 宁可漏吞 (走 AI 也无害)，绝不误吞复杂请求。
+
+# AMZ 标准格式: AMZ113-2288586-1962661  (3位前缀 + 7位 + 7位)
+# Lookbehind 排除数字/横线 (前缀); negative lookahead 排除后续数字 (后缀)
+# 这样 'releaseAMZxxx' 和 'AMZxxxrelease' 两种黏连都能识别
+_AMZ_SO_RE = re.compile(r"(?<![0-9\-])AMZ\d{3}-\d{7}-\d{7}(?!\d)", re.IGNORECASE)
+# Shopify 格式: #CMT1761 或 CMT1761
+_CMT_SO_RE = re.compile(r"(?<![0-9\-])#?CMT\d+(?!\d)", re.IGNORECASE)
+
+# 复杂修饰词 — 出现任一 → 不是单纯一句 release，让 AI 处理
+_COMPLEX_MARKERS = [
+    # 中文连接 / 条件 / 多任务
+    "如果", "先", "然后", "另外", "顺便", "还有", "再", "并且", "且", "以及",
+    "查", "看一下", "看下", "看看", "确认", "对账", "修改", "改", "取消", "退",
+    "为什么", "怎么", "提成", "佣金",
+    # 英文连接 / 条件 / 多任务
+    " and ", " then ", " also ", " but ", " if ", " also,", " then,",
+    "check", "verify", "look", "show", "tell", "why", "how", "first",
+    "cancel", "refund", "modify", "update", "and also", "before", "after",
+    "instead", "commission",
+    # 标点 — 多个分句
+    ";", "?", "？",
+]
+
+def _is_simple_marketplace_release(text: str, has_attachments: bool) -> tuple[bool, str | None, str | None]:
+    """判断消息是不是 "纯粹一句 marketplace release"。
+    
+    返回 (is_simple, so_name, marketplace_type) 三元组。
+    marketplace_type ∈ {"AMZ", "CMT"} or None。
+    
+    必须全部满足:
+    1. 无附件
+    2. 包含且仅包含一个 marketplace SO 单号 (AMZ 或 CMT，不能两个都有)
+    3. 包含 release 意图关键词
+    4. 不含复杂修饰词 (and/then/如果/顺便/查/?... 等)
+    5. 去掉单号和关键词后剩余字符 ≤ 8 个非空白
+    """
+    if has_attachments:
+        return (False, None, None)
+    if not text or not text.strip():
+        return (False, None, None)
+
+    raw = text.strip()
+
+    # 规则 1: 必须有 release 意图关键词
+    if not _is_release_intent(raw):
+        return (False, None, None)
+
+    # 规则 2: 复杂修饰词 → 让 AI 处理
+    lower = raw.lower()
+    for marker in _COMPLEX_MARKERS:
+        if marker in lower:
+            return (False, None, None)
+
+    # 规则 3: 必须正好一个 marketplace 单号
+    amz_matches = _AMZ_SO_RE.findall(raw)
+    cmt_matches = _CMT_SO_RE.findall(raw)
+    total = len(amz_matches) + len(cmt_matches)
+    if total != 1:
+        return (False, None, None)
+
+    if amz_matches:
+        so_name = amz_matches[0].upper()
+        mtype = "AMZ"
+    else:
+        # CMT: 保留原始大小写但去掉 # 前缀，统一用大写
+        so_name = cmt_matches[0].lstrip("#").upper()
+        mtype = "CMT"
+
+    # 规则 4: 剩余非单号、非关键词字符 ≤ 8 个 (容忍 "release" / "开票" / 标点)
+    remainder = raw
+    remainder = _AMZ_SO_RE.sub("", remainder)
+    remainder = _CMT_SO_RE.sub("", remainder)
+    # 去掉常见关键词
+    for kw in ("release", "开票", "出发票", "确认开票", "process", "create invoice"):
+        remainder = re.sub(re.escape(kw), "", remainder, flags=re.IGNORECASE)
+    # 去掉所有空白和常见标点
+    remainder_compact = re.sub(r"[\s,.\-_:;@#]", "", remainder)
+    if len(remainder_compact) > 8:
+        return (False, None, None)
+
+    return (True, so_name, mtype)
+
+
+def _format_release_report(steps: list, so_name: str, partner: str, lang: str) -> str:
+    """把 fast-path 4 步执行结果格式化成 Discuss 友好的回复。
+    steps: [{"name": "create_invoice", "ok": True, "data": {...}, "error": None}, ...]
+    """
+    is_zh = (lang == "zh")
+    
+    # 找出哪些步骤成功、失败
+    inv_step = next((s for s in steps if s["name"] == "create_invoice"), None)
+    pay_step = next((s for s in steps if s["name"] == "register_payment"), None)
+    pdf_step = next((s for s in steps if s["name"] == "export_pdf"), None)
+    print_step = next((s for s in steps if s["name"] == "print"), None)
+    
+    invoice_name = (inv_step or {}).get("data", {}).get("invoice_name", "") if inv_step and inv_step["ok"] else ""
+    invoice_id = (inv_step or {}).get("data", {}).get("invoice_id") if inv_step and inv_step["ok"] else None
+    amount = (inv_step or {}).get("data", {}).get("amount_total") if inv_step and inv_step["ok"] else None
+    journal = (pay_step or {}).get("data", {}).get("journal", "") if pay_step and pay_step["ok"] else ""
+    job_id = (print_step or {}).get("data", {}).get("job_id") if print_step and print_step["ok"] else None
+    download_url = (pdf_step or {}).get("data", {}).get("download_url", "") if pdf_step and pdf_step["ok"] else ""
+
+    all_ok = all(s["ok"] for s in steps) and len(steps) == 4
+    failed_step = next((s for s in steps if not s["ok"]), None)
+
+    if all_ok:
+        # 完整成功
+        if is_zh:
+            lines = [
+                f"✅ **{so_name} Release 完成**",
+                "",
+                f"**发票:** {invoice_name}",
+                f"**客户:** {partner}",
+                f"**金额:** ${amount:,.2f}" if amount else "",
+                f"**收款:** {journal}",
+                f"**打印:** PrintNode 任务 #{job_id}" if job_id else "",
+            ]
+        else:
+            lines = [
+                f"✅ **{so_name} Release Complete**",
+                "",
+                f"**Invoice:** {invoice_name}",
+                f"**Customer:** {partner}",
+                f"**Amount:** ${amount:,.2f}" if amount else "",
+                f"**Payment:** {journal}",
+                f"**Print:** PrintNode job #{job_id}" if job_id else "",
+            ]
+        return "\n".join(l for l in lines if l)
+
+    # 部分失败 — 报告已完成的部分 + 失败的步骤
+    if is_zh:
+        lines = [f"⚠️ **{so_name} Release 部分完成**", ""]
+        step_labels = {
+            "create_invoice": "创建发票",
+            "register_payment": "登记收款",
+            "export_pdf": "导出 PDF",
+            "print": "打印",
+        }
+    else:
+        lines = [f"⚠️ **{so_name} Release Partially Complete**", ""]
+        step_labels = {
+            "create_invoice": "Create invoice",
+            "register_payment": "Register payment",
+            "export_pdf": "Export PDF",
+            "print": "Print",
+        }
+    
+    for s in steps:
+        label = step_labels.get(s["name"], s["name"])
+        if s["ok"]:
+            lines.append(f"✅ {label}")
+        else:
+            lines.append(f"❌ {label} — {s.get('error', 'unknown error')}")
+    
+    if invoice_name:
+        lines.append("")
+        lines.append(f"**Invoice:** {invoice_name}" + (f" (${amount:,.2f})" if amount else ""))
+    
+    if is_zh:
+        lines.append("")
+        lines.append("⚠️ 请到 Odoo 手动检查，必要时联系 Admin。")
+    else:
+        lines.append("")
+        lines.append("⚠️ Please check in Odoo manually; contact Admin if needed.")
+    
+    return "\n".join(lines)
+
+
+async def _marketplace_release_fastpath(
+    so_name: str, mtype: str, channel_id: int, lang: str, ctx: dict
+) -> tuple[str, list]:
+    """纯代码执行 4 步 marketplace release 流程，零 AI 介入。
+    
+    Args:
+        so_name: e.g. "AMZ113-2288586-1962661" or "CMT1761"
+        mtype: "AMZ" or "CMT"
+        channel_id: Discuss channel for progress updates
+        lang: "zh" or "en"
+        ctx: tool context (uid, username, role)
+    
+    Returns: (reply_text, steps_log)
+        steps_log: [{"name": str, "ok": bool, "data": dict, "error": str|None}]
+    """
+    is_zh = (lang == "zh")
+    
+    # 根据 marketplace 决定 payment_method label 和 journal
+    if mtype == "AMZ":
+        payment_method = "Amazon Payment"
+        journal_name = "Amazon PLAT BUS CHECKING"
+    else:  # CMT
+        payment_method = "Shopify Payment"
+        journal_name = "Revenue and COGS"
+    
+    steps = []
+    partner_name = ""
+    invoice_id = None
+    
+    # ── Step 1: create invoice ──
+    progress_msg = "📄 正在创建发票..." if is_zh else "📄 Creating invoice..."
+    await _odoo_bot_post_progress(channel_id, progress_msg)
+    
+    try:
+        result_str = await run_tool(
+            "odoo_create_invoice_from_so",
+            {"so_name": so_name, "payment_method": payment_method},
+            context=ctx,
+        )
+        result = json.loads(result_str) if isinstance(result_str, str) else result_str
+        
+        if result.get("error"):
+            steps.append({"name": "create_invoice", "ok": False, "data": {}, "error": result["error"]})
+            return (_format_release_report(steps, so_name, "", lang), steps)
+        
+        # 注意: already_invoiced 也算一种"成功"（已存在了，继续走付款 + 打印）
+        if result.get("already_invoiced"):
+            invoice_id = result["invoice_id"]
+            invoice_name = result.get("invoice_name", "")
+            partner_name = ""  # already_invoiced 路径不返回 partner，后面查
+            payment_state = result.get("payment_state", "not_paid")
+            steps.append({
+                "name": "create_invoice",
+                "ok": True,
+                "data": {
+                    "invoice_id": invoice_id,
+                    "invoice_name": invoice_name,
+                    "amount_total": result.get("amount_total"),
+                    "already_invoiced": True,
+                },
+                "error": None,
+            })
+            print(f"[FASTPATH] {so_name} already invoiced → {invoice_name}, payment_state={payment_state}")
+            # 如果已经付清，跳过 register_payment
+            if payment_state in ("paid", "in_payment"):
+                steps.append({
+                    "name": "register_payment",
+                    "ok": True,
+                    "data": {"journal": journal_name, "skipped": True},
+                    "error": None,
+                })
+        else:
+            invoice_id = result["invoice_id"]
+            partner_name = result.get("partner", "")
+            steps.append({
+                "name": "create_invoice",
+                "ok": True,
+                "data": result,
+                "error": None,
+            })
+    except Exception as e:
+        steps.append({"name": "create_invoice", "ok": False, "data": {}, "error": str(e)[:200]})
+        return (_format_release_report(steps, so_name, partner_name, lang), steps)
+    
+    # ── Step 2: register payment (skip 如果已经标记为 skipped) ──
+    pay_already_done = any(
+        s["name"] == "register_payment" and s.get("data", {}).get("skipped")
+        for s in steps
+    )
+    if not pay_already_done:
+        progress_msg = "💰 正在登记收款..." if is_zh else "💰 Registering payment..."
+        await _odoo_bot_post_progress(channel_id, progress_msg)
+        
+        try:
+            result_str = await run_tool(
+                "odoo_register_payment",
+                {"invoice_id": invoice_id, "journal_name": journal_name},
+                context=ctx,
+            )
+            result = json.loads(result_str) if isinstance(result_str, str) else result_str
+            
+            if result.get("error"):
+                steps.append({"name": "register_payment", "ok": False, "data": {}, "error": result["error"]})
+                return (_format_release_report(steps, so_name, partner_name, lang), steps)
+            
+            # already_paid 也算成功
+            steps.append({
+                "name": "register_payment",
+                "ok": True,
+                "data": result,
+                "error": None,
+            })
+        except Exception as e:
+            steps.append({"name": "register_payment", "ok": False, "data": {}, "error": str(e)[:200]})
+            return (_format_release_report(steps, so_name, partner_name, lang), steps)
+    
+    # ── Step 3: export PDF ──
+    progress_msg = "📥 正在导出 PDF..." if is_zh else "📥 Exporting PDF..."
+    await _odoo_bot_post_progress(channel_id, progress_msg)
+    
+    try:
+        result_str = await run_tool(
+            "odoo_export_invoice_pdf",
+            {"invoice_id": invoice_id},
+            context=ctx,
+        )
+        result = json.loads(result_str) if isinstance(result_str, str) else result_str
+        
+        if result.get("error"):
+            steps.append({"name": "export_pdf", "ok": False, "data": {}, "error": result["error"]})
+            return (_format_release_report(steps, so_name, partner_name, lang), steps)
+        
+        steps.append({"name": "export_pdf", "ok": True, "data": result, "error": None})
+    except Exception as e:
+        steps.append({"name": "export_pdf", "ok": False, "data": {}, "error": str(e)[:200]})
+        return (_format_release_report(steps, so_name, partner_name, lang), steps)
+    
+    # ── Step 4: print ──
+    progress_msg = "🖨 正在打印发票..." if is_zh else "🖨 Printing invoice..."
+    await _odoo_bot_post_progress(channel_id, progress_msg)
+    
+    try:
+        # 拼一个跟 AI 路径一样的 title
+        invoice_name = steps[0]["data"].get("invoice_name", "")
+        if mtype == "AMZ":
+            title = f"Amazon Order {so_name}"
+        else:
+            title = f"Shopify Order {so_name}"
+        if partner_name:
+            title += f" - {partner_name}"
+        
+        result_str = await run_tool(
+            "print_invoice",
+            {"invoice_id": invoice_id, "title": title},
+            context=ctx,
+        )
+        result = json.loads(result_str) if isinstance(result_str, str) else result_str
+        
+        if result.get("error"):
+            steps.append({"name": "print", "ok": False, "data": {}, "error": result["error"]})
+            return (_format_release_report(steps, so_name, partner_name, lang), steps)
+        
+        steps.append({"name": "print", "ok": True, "data": result, "error": None})
+    except Exception as e:
+        steps.append({"name": "print", "ok": False, "data": {}, "error": str(e)[:200]})
+        return (_format_release_report(steps, so_name, partner_name, lang), steps)
+    
+    return (_format_release_report(steps, so_name, partner_name, lang), steps)
+
+
 def _detect_user_language(text: str) -> str:
     """Detect if user message is Chinese or English. Returns 'zh' or 'en'.
     Threshold: if >= 20% of characters are CJK, treat as Chinese."""
@@ -9068,6 +9412,47 @@ async def odoo_bot_chat(req: OdooBotRequest):
             denial_msg = "❌ Sorry, your role cannot release orders or create invoices. Please contact your Sales Manager, Finance, or Admin to process."
         return {"reply": denial_msg}
 
+    # ── v15 Fast-path: pure-code marketplace release (zero AI involvement) ──
+    # Only triggers for "AMZxxx release" / "#CMTxxx 开票" — single SO, no extras.
+    # 防止 AI 被对话历史污染产生幻觉 (上次成功的 INV 号被模式补全)。
+    has_attachments = bool(req.attachments)
+    is_simple, fp_so_name, fp_mtype = _is_simple_marketplace_release(
+        req.message or "", has_attachments
+    )
+    if is_simple and perms.get("can_release_so"):
+        print(f"[FASTPATH] {fp_mtype} release: so={fp_so_name} uid={uid} role={role}")
+        # 确保 conv 存在 (后面要 append 历史)
+        if uid not in ODOO_BOT_HISTORY:
+            ODOO_BOT_HISTORY[uid] = []
+        conv = ODOO_BOT_HISTORY[uid]
+        # 把 user message 也存进去 (Q1: 要记录历史)
+        conv.append({"role": "user", "content": req.message or ""})
+        
+        tool_context = {"uid": uid, "username": author, "role": role}
+        try:
+            reply, steps = await _marketplace_release_fastpath(
+                fp_so_name, fp_mtype, req.channel_id, user_lang, tool_context
+            )
+        except Exception as e:
+            print(f"[FASTPATH] unexpected error: {e}")
+            import traceback; traceback.print_exc()
+            err_prefix = "Fast-path 异常" if user_lang == "zh" else "Fast-path error"
+            reply = f"⚠️ {err_prefix}: {str(e)[:200]}"
+            steps = []
+        
+        # 记录到对话历史 (Q1)
+        conv.append({"role": "assistant", "content": reply})
+        if len(conv) > ODOO_BOT_MAX_HISTORY:
+            ODOO_BOT_HISTORY[uid] = conv[-ODOO_BOT_MAX_HISTORY:]
+        
+        # 日志: 哪些步骤成功 / 失败
+        step_summary = ", ".join(
+            f"{s['name']}={'OK' if s['ok'] else 'FAIL'}" for s in steps
+        )
+        print(f"[FASTPATH] {fp_so_name} done: {step_summary}")
+        print(f"[ODOO-BOT] reply to uid={uid}: {reply[:100]}...")
+        return {"reply": reply}
+
     # Filter tools by permission (same logic as /chat)
     allowed_tools = []
     finance_tools = {"get_monthly_tax", "get_quarterly_tax", "get_monthly_sales", "get_missing_tax", "odoo_match_payment_to_customer"}
@@ -9133,7 +9518,15 @@ ODOO DISCUSS BOT RULES (you are responding inside Odoo Discuss chat, NOT the web
 
     try:
         async with httpx.AsyncClient(timeout=300) as c:
-            current_messages = list(conv)
+            # ── v15 Plan A: anti-hallucination history strip ──
+            # 如果是 release 意图但因为复杂度没走 fast-path (比如混合了查询、
+            # 或者 S04 普通订单)，仍然走 AI，但清掉历史。否则 Claude 会模式补全
+            # 上次成功的 "Release Complete + INV/2026/xxxx" 模板，编造一个 INV 号。
+            if _is_release_intent(req.message or ""):
+                current_messages = [conv[-1]]
+                print(f"[ANTI-HALLUCINATION] release intent in mixed/complex msg → history stripped (1 msg)")
+            else:
+                current_messages = list(conv)
             for _ in range(8):  # max tool iterations
                 r = await c.post("https://api.anthropic.com/v1/messages", headers=headers, json={
                     "model": bot_model,
