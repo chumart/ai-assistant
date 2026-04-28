@@ -476,7 +476,7 @@ async def audit_odoo_write(
 @app.on_event("startup")
 async def startup():
     print("=" * 60)
-    print("CHUMART AI BACKEND — BUILD: payment-hint-v11 (2026-04-28)")
+    print("CHUMART AI BACKEND — BUILD: outbound-fix-v12 (2026-04-28)")
     print("=" * 60)
     await init_db()
     # Start reminder scanner (checks every 60 seconds for due reminders)
@@ -2264,6 +2264,22 @@ finance 需要在 Banking 模块的 reconciliation 界面把它**匹配**到一�
 ⚠️ 必须使用完全等额匹配 (NO tolerance) — 因为我们退款做 credit note 时金额一定一致,
 付供应商时也是按发票金额付。任何金额误差都说明不是这笔。
 
+🚫 CRITICAL — DO NOT search these models for outbound matching:
+  ❌ account.bank.statement.line — that's the bank flow line user is ALREADY looking at;
+     searching it just returns the same line back ("循环引用",答非所问)
+  ❌ account.bank.statement — same reason
+  Users typically ask this question while staring at a BNK/PBNK line in their bank
+  reconciliation screen. They want to know which credit_note/bill/payment THIS LINE
+  corresponds to. Returning the line itself is useless.
+
+🚫 DO NOT add date filter to outbound queries:
+  Users see a $120 line dated 2026-04-07 and want to find the matching credit note,
+  BUT the credit note may have been created on a DIFFERENT date (e.g. 2026-04-24).
+  When user pays Zelle on day X, the credit note can be backdated/postdated by days.
+  ⛔ NEVER add ["invoice_date", ">=", X-N] / ["invoice_date", "<=", X+N] for outbound queries.
+  ⛔ NEVER add ["date", ">=", X] / ["date", "<=", X+N] for outbound account.payment queries.
+  Just match by amount precisely; date is for ranking/display only, not filtering.
+
 ⚠️ Payment method 字段填写情况 (重要 — 影响匹配策略):
   • Customer Invoice (out_invoice) 的 x_payment_method —— **强制填写**,可信度高
   • Credit Note (out_refund) 的 x_payment_method —— **强制填写**,可信度高
@@ -2279,6 +2295,7 @@ STEP 1: 先查 credit note (退款单) 是否有金额完全相等的:
     ["company_id", "=", 1],
   ], fields=["name", "partner_id", "invoice_date", "amount_total", "x_payment_method"])
   ✅ 这里 x_payment_method 强制填写,可作为强加分项 (匹配 +15 / 不符 -3)
+  ⛔ NO date filter — credit note can be created any day relative to the payment.
 
 STEP 2: 查 vendor bill (供应商账单) 是否有金额完全相等的或 amount_residual 等于该金额:
   odoo_search(model="account.move", domain=[
@@ -2291,6 +2308,7 @@ STEP 2: 查 vendor bill (供应商账单) 是否有金额完全相等的或 amou
   ], fields=["name", "partner_id", "invoice_date", "amount_total", "amount_residual", "x_payment_method"])
   ⚠ 这里 x_payment_method 经常为空 — 即使用户说了 Zelle, 空字段的 vendor bill **依然要保留**为候选,
     不能因为字段空白就排除它。回复时显示"付款方式: 未填写" 让用户判断,不要标 ⚠ 不符。
+  ⛔ NO date filter.
 
 STEP 3: 查 account.payment 已登记的 outbound 但未对账:
   odoo_search(model="account.payment", domain=[
@@ -2302,11 +2320,14 @@ STEP 3: 查 account.payment 已登记的 outbound 但未对账:
   ], fields=["name", "partner_id", "amount", "date", "journal_id", "ref", "payment_method"])
   # account.payment uses 'payment_method' field (NOT x_payment_method).
   # 通常有值, 偶尔空白时同样不能排除。
+  ⛔ NO date filter on `date`.
 
 STEP 4: 都没找到 → 告诉用户"在 credit note / vendor bill / unreconciled payment 中均未找到 $X 的精确匹配"。
+  ⛔ DO NOT fall back to searching account.bank.statement.line — that returns the line user is staring at.
 
 ⛔ DO NOT use amount range (e.g. >=X-1 AND <=X+1) for outbound queries.
 ⛔ DO NOT use odoo_match_payment_to_customer for outbound — that tool is for inbound only.
+⛔ DO NOT search account.bank.statement.line / account.bank.statement at all.
 
 If user provided payment method (e.g. "Zelle 给 PAUL 的 $120"):
   - 按 model 分别处理:
@@ -3414,6 +3435,17 @@ async def run_tool(name, inp, context=None):
     if name == "odoo_search":
         model = inp["model"]
         domain = inp.get("domain", [])
+        # ── Block bank.statement.line searches — almost always wrong intent ──
+        # Users ask "this $X line corresponds to which invoice/credit note", not
+        # "find the bank line itself". Searching the line returns the same line back.
+        if model in ("account.bank.statement.line", "account.bank.statement"):
+            print(f"[BLOCKED] odoo_search on {model} — bank statement lines should not be searched (use account.move/account.payment instead)")
+            return json.dumps({
+                "error": f"Searching {model} is blocked. The user is typically already looking at a bank line; "
+                         f"to find what it corresponds to, search account.move (out_refund/in_invoice) or "
+                         f"account.payment by amount instead.",
+                "results": []
+            })
         models_with_company = ["account.move","sale.order","purchase.order","account.payment","res.partner","crm.lead","repair.order","stock.picking"]
         if model in models_with_company:
             domain = domain + [["company_id","=",1]]
