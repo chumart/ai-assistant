@@ -7843,6 +7843,13 @@ ALLOWED_MODELS = {
 # Models non-admin users can choose from
 NON_ADMIN_MODELS = {"claude-sonnet-4-5", "claude-haiku-4-5-20251001"}
 
+# Auto-fallback: if primary model is overloaded (529), retry with fallback
+MODEL_FALLBACK = {
+    "claude-sonnet-4-5": "claude-haiku-4-5-20251001",
+    "claude-opus-4-5": "claude-sonnet-4-5",
+    # Haiku has no fallback (it's the cheapest/fastest)
+}
+
 OPENAI_MODELS = {"gpt-5.4", "gpt-5.4-mini", "gpt-5.4-nano", "gpt-4o", "gpt-4o-mini"}
 
 
@@ -8216,6 +8223,10 @@ async def chat(req: ChatRequest, background_tasks: BackgroundTasks):
                     payload["tool_choice"] = {"type": "any"}
                 r = await c.post("https://api.anthropic.com/v1/messages", headers=headers, json=payload)
                 d = r.json()
+                # 529 = overloaded
+                if r.status_code == 529:
+                    fallback = MODEL_FALLBACK.get(selected_model, "claude-haiku-4-5-20251001")
+                    return {"reply": f"⚠️ Model {selected_model} is currently overloaded. Please try again or switch to a faster model.", "overloaded": True, "fallback": fallback}
                 if "error" in d:
                     return {"reply": f"API error: {d['error'].get('message', str(d['error']))}"}
                 if d.get("stop_reason") == "tool_use":
@@ -8604,87 +8615,99 @@ async def chat_stream(req: ChatRequest, background_tasks: BackgroundTasks):
                 # Only force on first iteration
                 if force_tool_stream and iteration == 0:
                     payload["tool_choice"] = {"type": "any"}
+                
+                # Try API call
                 async with httpx.AsyncClient(timeout=300) as c:
-                    async with c.stream("POST", "https://api.anthropic.com/v1/messages",
-                                        headers=headers, json=payload) as r:
-                        if r.status_code != 200:
-                            body = await r.aread()
-                            err_txt = body.decode("utf-8", errors="ignore")[:500]
-                            yield f"data: {json.dumps({'type': 'error', 'message': f'API {r.status_code}: {err_txt}'})}\n\n"
+                    resp = await c.send(c.build_request("POST", "https://api.anthropic.com/v1/messages",
+                                        headers=headers, json=payload), stream=True)
+                    
+                    # 529 = overloaded → tell frontend, let user decide
+                    if resp.status_code == 529:
+                        await resp.aclose()
+                        fallback = MODEL_FALLBACK.get(selected_model, "claude-haiku-4-5-20251001")
+                        print(f"[OVERLOADED] {selected_model} overloaded, suggesting {fallback}")
+                        yield f"data: {json.dumps({'type': 'overloaded', 'model': selected_model, 'fallback': fallback})}\n\n"
+                        return
+                    
+                    if resp.status_code != 200:
+                        body = await resp.aread()
+                        err_txt = body.decode("utf-8", errors="ignore")[:500]
+                        yield f"data: {json.dumps({'type': 'error', 'message': f'API {resp.status_code}: {err_txt}'})}\n\n"
+                        await resp.aclose()
+                        return
+
+                    # Accumulate the assistant's content blocks so we can replay on tool_use loop
+                    content_blocks = []  # list of {type, ...}
+                    current_block = None
+                    current_tool_input_buf = ""
+                    stop_reason = None
+
+                    async for line in resp.aiter_lines():
+                        if not line or not line.startswith("data: "):
+                            continue
+                        try:
+                            event = json.loads(line[6:])
+                        except Exception:
+                            continue
+
+                        et = event.get("type", "")
+
+                        if et == "content_block_start":
+                            block = event.get("content_block", {})
+                            idx = event.get("index", 0)
+                            if block.get("type") == "text":
+                                current_block = {"type": "text", "text": "", "_idx": idx}
+                            elif block.get("type") == "tool_use":
+                                current_block = {
+                                    "type": "tool_use",
+                                    "id": block.get("id"),
+                                    "name": block.get("name"),
+                                    "input": {},
+                                    "_idx": idx
+                                }
+                                current_tool_input_buf = ""
+                                # Tell frontend a tool is being invoked
+                                yield f"data: {json.dumps({'type': 'tool_use', 'name': block.get('name')})}\n\n"
+
+                        elif et == "content_block_delta":
+                            delta = event.get("delta", {})
+                            dt = delta.get("type", "")
+                            if dt == "text_delta" and current_block and current_block.get("type") == "text":
+                                text_chunk = delta.get("text", "")
+                                current_block["text"] += text_chunk
+                                full_reply_text += text_chunk
+                                yield f"data: {json.dumps({'type': 'text', 'delta': text_chunk})}\n\n"
+                            elif dt == "input_json_delta" and current_block and current_block.get("type") == "tool_use":
+                                current_tool_input_buf += delta.get("partial_json", "")
+
+                        elif et == "content_block_stop":
+                            if current_block:
+                                if current_block.get("type") == "tool_use":
+                                    # Finalize tool input
+                                    try:
+                                        current_block["input"] = json.loads(current_tool_input_buf) if current_tool_input_buf else {}
+                                    except Exception as e:
+                                        print(f"Tool input JSON parse error: {e}, buf={current_tool_input_buf[:200]}")
+                                        current_block["input"] = {}
+                                # Strip internal index field
+                                cb = {k: v for k, v in current_block.items() if not k.startswith("_")}
+                                content_blocks.append(cb)
+                                current_block = None
+                                current_tool_input_buf = ""
+
+                        elif et == "message_delta":
+                            delta = event.get("delta", {})
+                            if "stop_reason" in delta:
+                                stop_reason = delta["stop_reason"]
+
+                        elif et == "message_stop":
+                            pass
+
+                        elif et == "error":
+                            err = event.get("error", {})
+                            msg = err.get("message", str(err))
+                            yield f"data: {json.dumps({'type': 'error', 'message': msg})}\n\n"
                             return
-
-                        # Accumulate the assistant's content blocks so we can replay on tool_use loop
-                        content_blocks = []  # list of {type, ...}
-                        current_block = None
-                        current_tool_input_buf = ""
-                        stop_reason = None
-
-                        async for line in r.aiter_lines():
-                            if not line or not line.startswith("data: "):
-                                continue
-                            try:
-                                event = json.loads(line[6:])
-                            except Exception:
-                                continue
-
-                            et = event.get("type", "")
-
-                            if et == "content_block_start":
-                                block = event.get("content_block", {})
-                                idx = event.get("index", 0)
-                                if block.get("type") == "text":
-                                    current_block = {"type": "text", "text": "", "_idx": idx}
-                                elif block.get("type") == "tool_use":
-                                    current_block = {
-                                        "type": "tool_use",
-                                        "id": block.get("id"),
-                                        "name": block.get("name"),
-                                        "input": {},
-                                        "_idx": idx
-                                    }
-                                    current_tool_input_buf = ""
-                                    # Tell frontend a tool is being invoked
-                                    yield f"data: {json.dumps({'type': 'tool_use', 'name': block.get('name')})}\n\n"
-
-                            elif et == "content_block_delta":
-                                delta = event.get("delta", {})
-                                dt = delta.get("type", "")
-                                if dt == "text_delta" and current_block and current_block.get("type") == "text":
-                                    text_chunk = delta.get("text", "")
-                                    current_block["text"] += text_chunk
-                                    full_reply_text += text_chunk
-                                    yield f"data: {json.dumps({'type': 'text', 'delta': text_chunk})}\n\n"
-                                elif dt == "input_json_delta" and current_block and current_block.get("type") == "tool_use":
-                                    current_tool_input_buf += delta.get("partial_json", "")
-
-                            elif et == "content_block_stop":
-                                if current_block:
-                                    if current_block.get("type") == "tool_use":
-                                        # Finalize tool input
-                                        try:
-                                            current_block["input"] = json.loads(current_tool_input_buf) if current_tool_input_buf else {}
-                                        except Exception as e:
-                                            print(f"Tool input JSON parse error: {e}, buf={current_tool_input_buf[:200]}")
-                                            current_block["input"] = {}
-                                    # Strip internal index field
-                                    cb = {k: v for k, v in current_block.items() if not k.startswith("_")}
-                                    content_blocks.append(cb)
-                                    current_block = None
-                                    current_tool_input_buf = ""
-
-                            elif et == "message_delta":
-                                delta = event.get("delta", {})
-                                if "stop_reason" in delta:
-                                    stop_reason = delta["stop_reason"]
-
-                            elif et == "message_stop":
-                                pass
-
-                            elif et == "error":
-                                err = event.get("error", {})
-                                msg = err.get("message", str(err))
-                                yield f"data: {json.dumps({'type': 'error', 'message': msg})}\n\n"
-                                return
 
                 # After stream for this iteration ends, decide next step
                 if stop_reason == "tool_use":
