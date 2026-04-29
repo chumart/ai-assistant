@@ -9068,6 +9068,33 @@ async def admin_delete_reminder(reminder_id: int, admin_key: str = ""):
     finally:
         await conn.close()
 
+
+@app.get("/api/reminder-users")
+async def get_reminder_users(session_token: str = ""):
+    """Return Odoo internal users for admin reminder 'Remind who?' dropdown."""
+    if not session_token or session_token not in SESSION_STORE:
+        return {"error": "not authenticated"}
+    sess = SESSION_STORE[session_token]
+    if sess.get("role") != "admin":
+        return {"error": "admin only"}
+    try:
+        raw = await odoo_query(
+            "res.users",
+            [["active", "=", True], ["share", "=", False]],
+            ["id", "name"],
+            limit=50
+        )
+        users = json.loads(raw) if isinstance(raw, str) else raw
+        # Sort by name, exclude OdooBot (uid=1)
+        user_list = sorted(
+            [{"uid": u["id"], "name": u["name"]} for u in users if u["id"] != 1],
+            key=lambda u: u["name"]
+        )
+        return {"users": user_list}
+    except Exception as e:
+        return {"error": str(e)}
+
+
 # ─────────────────────────────────────────────
 # Signed URL for secure document downloads
 # ─────────────────────────────────────────────
