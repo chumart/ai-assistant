@@ -476,7 +476,7 @@ async def audit_odoo_write(
 @app.on_event("startup")
 async def startup():
     print("=" * 60)
-    print("CHUMART AI BACKEND — BUILD: force-tool-v18 (2026-04-28)")
+    print("CHUMART AI BACKEND — BUILD: reminder-flow-v18.2 (2026-04-28)")
     print("=" * 60)
     await init_db()
     # Start reminder scanner (checks every 60 seconds for due reminders)
@@ -2114,13 +2114,38 @@ TOOLS = [
     },
     {
         "name": "create_reminder",
-        "description": "Schedule a reminder that notifies the user via email/SMS/voice call at a specified time. Use when user says '提醒我...', 'remind me...', '下个月X号提醒我'. fire_at must be ISO datetime (naive = LA time). Default channel is email. Add 'sms' for text, 'call' for phone call. CRITICAL: Always compute the date from the 'today' value in your system prompt — do NOT guess. '明天/tomorrow' = today's date + 1 day (use the explicit 'tomorrow' value in your system prompt). When user mentions a weekday like '下周一', count forward from today's weekday. Always confirm the resolved date in your reply (e.g. '已设置 4月28日(周一) 09:00 的提醒')",
+        "description": (
+            "Schedule a reminder that notifies the user via email/SMS/voice call at a specified time. "
+            "Use when user says '提醒我...', 'remind me...', '下个月X号提醒我'. "
+            "fire_at must be ISO datetime (naive = LA time). "
+            "channels: email/sms/call (default ['email','call']). "
+            "\n"
+            "🚨 CRITICAL — INFO COMPLETENESS CHECK (v18.2):\n"
+            "Before calling this tool, verify the user has provided ALL THREE pieces:\n"
+            "  1. Content (what to remind) — required, no default\n"
+            "  2. Time (when to fire) — required, no default\n"
+            "  3. Channels (how to notify) — has a default of ['email','call']\n"
+            "\n"
+            "Decision tree:\n"
+            "- If content + time + channels all explicit → call this tool DIRECTLY\n"
+            "- If content + time present, channels NOT specified → DO NOT call this tool yet. "
+            "  Instead, REPLY in chat with: '准备建 reminder: 内容【X】时间【Y】方式默认【📧邮件+📞电话】, 是否调整方式? "
+            "  (邮件/电话/短信 任意组合, 或 OK 确认)' Wait for user's reply. If they say OK → call this tool with channels=['email','call']. "
+            "  If they pick channels → use their choice.\n"
+            "- If content present but time missing → ASK 'What time should I remind you?' DO NOT GUESS time.\n"
+            "- If user says only '提醒我' / 'remind me' alone → ASK for both time and content.\n"
+            "\n"
+            "CRITICAL: Always compute date from the 'today' value in your system prompt. "
+            "'明天/tomorrow' = today + 1 day (explicit 'tomorrow' value in system prompt). "
+            "When user mentions a weekday like '下周一', count forward from today's weekday. "
+            "Always confirm the resolved date in reply (e.g. '已设置 4月28日(周一) 09:00 的提醒')."
+        ),
         "input_schema": {
             "type": "object",
             "properties": {
                 "content": {"type": "string", "description": "What to remind about"},
                 "fire_at": {"type": "string", "description": "When to fire, ISO format like '2026-05-24T09:00:00'. Naive = LA time. If user only gives date, default time to 09:00."},
-                "channels": {"type": "array", "items": {"type": "string", "enum": ["email", "sms", "call"]}, "description": "Notification channels. Default ['email']. Add 'sms' if user says '短信', 'call' if user says '打电话'/'重要'."}
+                "channels": {"type": "array", "items": {"type": "string", "enum": ["email", "sms", "call"]}, "description": "Notification channels. Default ['email','call'] when user didn't specify but confirmed via reply. Single channel only when user explicitly chose."}
             },
             "required": ["content", "fire_at"]
         }
@@ -7749,10 +7774,8 @@ async def chat(req: ChatRequest, background_tasks: BackgroundTasks):
         else:
             oai_messages = messages
         # v18: Force tool_choice if release/reminder intent detected
-        force_tool_oai = (
-            _is_release_intent(req.message or "") or
-            _is_reminder_intent(req.message or "")
-        )
+        # v18.1: 也支持 reminder 上下文里的短追加指令 (e.g. "改成电话")
+        force_tool_oai = _should_force_write_tool(req.message or "", oai_messages)
         if force_tool_oai:
             print(f"[FORCE_TOOL] /chat openai: detected write intent, forcing tool_choice=required")
         reply = await chat_openai(oai_messages, system_prompt, selected_model, allowed_tools,
@@ -7762,10 +7785,8 @@ async def chat(req: ChatRequest, background_tasks: BackgroundTasks):
         # v18: Force tool_choice if release/reminder intent detected
         # — defends against pattern-completion hallucination where the model
         # generates fake "✅ done" text without actually calling the tool.
-        force_tool = (
-            _is_release_intent(req.message or "") or
-            _is_reminder_intent(req.message or "")
-        )
+        # v18.1: 也支持 reminder 上下文里的短追加指令
+        force_tool = _should_force_write_tool(req.message or "", messages)
         if force_tool:
             print(f"[FORCE_TOOL] /chat anthropic: detected write intent, forcing tool_choice=any")
         
@@ -7976,10 +7997,8 @@ async def chat_stream(req: ChatRequest, background_tasks: BackgroundTasks):
             full_reply_text = ""
             
             # v18: Force tool_choice if release/reminder intent detected
-            force_tool_oai_stream = (
-                _is_release_intent(req.message or "") or
-                _is_reminder_intent(req.message or "")
-            )
+            # v18.1: 也支持 reminder 上下文里的短追加指令
+            force_tool_oai_stream = _should_force_write_tool(req.message or "", oai_messages_input)
             if force_tool_oai_stream:
                 print(f"[FORCE_TOOL] /chat/stream openai: detected write intent, forcing tool_choice=required")
 
@@ -8150,10 +8169,8 @@ async def chat_stream(req: ChatRequest, background_tasks: BackgroundTasks):
     }
     
     # v18: Force tool_choice if release/reminder intent detected
-    force_tool_stream = (
-        _is_release_intent(req.message or "") or
-        _is_reminder_intent(req.message or "")
-    )
+    # v18.1: 也支持 reminder 上下文里的短追加指令
+    force_tool_stream = _should_force_write_tool(req.message or "", messages)
     if force_tool_stream:
         print(f"[FORCE_TOOL] /chat/stream anthropic: detected write intent, forcing tool_choice=any")
 
@@ -8882,11 +8899,20 @@ def _is_reminder_intent(text: str) -> bool:
     if _is_query_intent(text):
         return False
     
-    # 中文 reminder 关键词
+    # 中文 reminder 关键词（创建 + 修改）
     zh_keywords = [
+        # 创建意图
         "提醒我", "提醒一下", "提醒下", "记得",
         "别忘", "不要忘", "千万别忘",
         "到时", "到点",
+        # 修改/重建意图（v18.1 新加）
+        "改成电话", "改成短信", "改成邮件", "改成email",
+        "改为电话", "改为短信", "改为邮件",
+        "换成电话", "换成短信",
+        "改成call", "改成sms", "改成call",
+        "重新设置提醒", "重新建提醒", "重新创建提醒",
+        "重新设置reminder", "重建提醒",
+        "更新提醒", "修改提醒",
     ]
     for kw in zh_keywords:
         if kw in t:
@@ -8898,11 +8924,184 @@ def _is_reminder_intent(text: str) -> bool:
         r"\balert\s+me\b", r"\bnotify\s+me\b",
         r"\bping\s+me\b", r"\btext\s+me\s+at\b", r"\bcall\s+me\s+at\b",
         r"\bdon'?t\s+(let\s+me\s+)?forget\b",
+        # 修改/重建（v18.1）
+        r"\bchange\s+(to|reminder)\b", r"\bswitch\s+to\b",
+        r"\bupdate\s+(my\s+|the\s+)?reminder\b",
+        r"\bmodify\s+(my\s+|the\s+)?reminder\b",
+        r"\brecreate\s+(my\s+|the\s+)?reminder\b",
     ]
     for pat in en_patterns:
         if re.search(pat, t):
             return True
     
+    return False
+
+
+def _is_reminder_context_followup(text: str, recent_messages: list) -> bool:
+    """检测是否是 reminder 上下文里的简短追加/修改指令。
+    
+    用于:
+    1. 用户先说"提醒我...买西瓜"(已建 reminder)
+    2. 紧接着说"打电话"/"改成电话"/"取消" — 短指令，没明确 reminder 关键词
+    
+    检测逻辑:
+    - 当前消息长度 < 25 字 (短指令)
+    - 包含通道/动作词 (打电话/电话/短信/邮件/取消/再发一遍/改时间)
+    - 最近 5 条 messages 里有过 create_reminder/update_reminder/cancel_reminder 工具调用痕迹
+    
+    返回 True 时建议触发 force_tool（避免 AI 模式补全"好的已改"但其实没调工具）。
+    """
+    if not text or len(text) > 25:
+        return False
+    t = text.lower().strip()
+    
+    # 短动作/通道词
+    action_words = [
+        "打电话", "电话", "短信", "邮件", "email", "sms",
+        "取消", "删除", "改时间", "提前", "推迟", "延后",
+        "再发", "再来", "重新发",
+        "call", "text", "cancel", "delete",
+    ]
+    has_action = any(w in t for w in action_words)
+    if not has_action:
+        return False
+    
+    # 检查最近消息里有没有 reminder 痕迹
+    if not recent_messages:
+        return False
+    # 取最近 5 条 (含 user + assistant)
+    recent = recent_messages[-10:] if len(recent_messages) > 10 else recent_messages
+    for msg in recent:
+        # assistant 消息可能含 tool_use blocks
+        content = msg.get("content", "")
+        if isinstance(content, list):
+            for block in content:
+                if isinstance(block, dict) and block.get("type") == "tool_use":
+                    tool_name = block.get("name", "")
+                    if "reminder" in tool_name:
+                        return True
+        elif isinstance(content, str):
+            # 文本内容里出现"提醒"等词
+            if any(kw in content.lower() for kw in ["提醒", "reminder", "已设置", "fire_at"]):
+                return True
+    
+    return False
+
+
+def _has_time_in_text(text: str) -> bool:
+    """检测文本里是否有时间信息（用于 reminder 完整性判断）。
+    
+    匹配的时间表达:
+    中文: X分钟后/X小时后/明天/今天/下午/上午/晚上/几点/X月X日/下周X
+    英文: X minutes / hours / tomorrow / today / at X am/pm / next monday
+    """
+    if not text:
+        return False
+    t = text.lower().strip()
+    
+    zh_time_patterns = [
+        r"\d+\s*(分钟|小时|小时后|分钟后|秒|秒后|天后|周后|月后)",
+        r"(明天|今天|后天|大后天|昨天)",
+        r"(早上|上午|中午|下午|傍晚|晚上|凌晨|夜里|深夜)",
+        r"\d+\s*[点时]",
+        r"(下周|本周|这周|下个月|本月)",
+        r"(周一|周二|周三|周四|周五|周六|周日|星期)",
+        r"\d+\s*月\s*\d+\s*[日号]",
+        r"\d{4}-\d{1,2}-\d{1,2}",
+        r"\d{1,2}:\d{2}",
+        r"(一会儿|马上|立刻|稍后|过会儿)",
+    ]
+    for pat in zh_time_patterns:
+        if re.search(pat, t):
+            return True
+    
+    en_time_patterns = [
+        r"\d+\s*(minute|min|hour|hr|second|sec|day|week|month)s?\s*(later|after|from\s+now)?",
+        r"\b(tomorrow|today|tonight|tomorrow\s+(morning|afternoon|evening|night))\b",
+        r"\b(morning|afternoon|evening|night|noon|midnight)\b",
+        r"\bat\s+\d+\s*(am|pm|:)",
+        r"\b(next|this)\s+(week|month|monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b",
+        r"\d{1,2}:\d{2}\s*(am|pm)?",
+        r"\bin\s+\d+\s*(min|hour|sec)",
+    ]
+    for pat in en_time_patterns:
+        if re.search(pat, t):
+            return True
+    
+    return False
+
+
+def _has_channel_in_text(text: str) -> bool:
+    """检测文本里是否明确指定了 reminder 的通知方式。"""
+    if not text:
+        return False
+    t = text.lower().strip()
+    
+    channel_keywords = [
+        # 中文
+        "邮件", "邮箱", "email",
+        "电话", "打电话", "call",
+        "短信", "sms", "信息",
+        # 组合
+        "邮件和电话", "电话和邮件", "邮箱和电话", "电话和邮箱",
+        "邮件加电话", "电话加邮件",
+        "都通知", "都发", "都要",
+    ]
+    for kw in channel_keywords:
+        if kw in t:
+            return True
+    return False
+
+
+def _has_full_reminder_info(text: str) -> bool:
+    """判断 reminder 命令是否信息齐全 (内容 + 时间 + 方式)。
+    
+    完整 → force_tool 安全，AI 可以直接调工具
+    不完整 → 让 AI 走反问流程，不能 force_tool
+    """
+    if not text:
+        return False
+    # 必须同时有时间和方式
+    if not _has_time_in_text(text):
+        return False
+    if not _has_channel_in_text(text):
+        return False
+    # 内容判断: 文本去掉时间词和方式词后，剩余有意义内容
+    # 简化处理: 只要文本足够长(≥6字)就当有内容
+    return len(text.strip()) >= 6
+
+
+def _should_force_write_tool(text: str, recent_messages: list = None) -> bool:
+    """统一判断是否应该 force tool_choice (写意图防幻觉)。
+    
+    触发条件:
+    1. _is_release_intent(text) — release 相关命令 (release 流程独立，一直 force)
+    2. _is_reminder_intent(text) AND _has_full_reminder_info(text) — 信息齐全的 reminder 命令
+    3. _is_reminder_context_followup(text, recent_messages) — reminder 上下文里的修改/追加指令
+       (这种情况上一轮已建过 reminder, AI 修改时也必须真调工具)
+    
+    排除条件:
+    - _is_query_intent(text) — 查询意图，不写
+    - reminder 命令但信息不全 + 没 reminder 上下文 — AI 应反问，不要强制调工具
+    """
+    if not text:
+        return False
+    if _is_query_intent(text):
+        return False
+    if _is_release_intent(text):
+        return True
+    
+    # v18.2: reminder 信息齐全 → force
+    if _is_reminder_intent(text) and _has_full_reminder_info(text):
+        return True
+    
+    # v18.1: reminder 上下文里的修改/追加指令 → force
+    # 注意: 即使 _is_reminder_intent 命中但信息不全 (e.g. "改成电话" 关键词命中
+    # 但只是修改指令)，只要有 reminder 上下文也应该 force
+    if recent_messages and _is_reminder_context_followup(text, recent_messages):
+        return True
+    
+    # reminder 命令但信息不全 + 没上下文 → 不 force, AI 走反问流程
     return False
 
 
@@ -9833,9 +10032,8 @@ This rule has NO exceptions. Even if the user insists, do not continue. Direct t
             # pattern-completion hallucination — e.g. AI replies "✅ 已设置" without
             # actually calling create_reminder when the conversation history shows
             # several previous successful reminders)
-            force_tool_bot = (
-                _is_release_intent(msg) or _is_reminder_intent(msg)
-            ) and not _is_query_intent(msg)
+            # v18.1: 也支持 reminder 上下文里的短追加指令 (e.g. "改成电话")
+            force_tool_bot = _should_force_write_tool(msg, conv)
             if force_tool_bot:
                 print(f"[FORCE_TOOL] /odoo-bot: detected write intent, forcing tool_choice=any")
             
