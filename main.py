@@ -9215,6 +9215,99 @@ async def api_my_reminders(session_token: str = "", include_fired: bool = False)
         await conn.close()
 
 
+class ReminderCreate(BaseModel):
+    content: str
+    fire_at: str       # ISO datetime, naive = LA time
+    channels: list = ["email", "call"]
+    target_name: str = ""  # admin only
+
+
+@app.post("/api/my-reminders")
+async def api_create_reminder(body: ReminderCreate, session_token: str = ""):
+    """Create a reminder directly (no AI). Used by mobile Set Reminder sheet."""
+    uid, role = await _resolve_uid_from_token(session_token)
+    if not uid:
+        return {"error": "not authenticated"}
+    
+    content = body.content.strip()
+    if not content:
+        return {"error": "content is required"}
+    if not body.fire_at.strip():
+        return {"error": "fire_at is required"}
+    
+    # Parse time (naive = LA time)
+    try:
+        fire_at_utc = _parse_iso_to_utc(body.fire_at.strip())
+    except Exception as e:
+        return {"error": f"invalid time: {e}"}
+    
+    now_utc = datetime.datetime.now(UTC_TZ)
+    if fire_at_utc <= now_utc:
+        return {"error": f"time is in the past: {_fmt_la(fire_at_utc)}"}
+    
+    # Validate channels
+    channels = [c for c in body.channels if c in ("email", "call")]
+    if not channels:
+        channels = ["email", "call"]
+    
+    # Target user (admin can remind others)
+    reminder_uid = uid
+    reminder_username = SESSION_STORE.get(session_token, {}).get("name", f"uid={uid}")
+    target_name = body.target_name.strip()
+    
+    if target_name and role == "admin":
+        try:
+            target_users = json.loads(await odoo_query(
+                "res.users", [["name", "ilike", target_name]],
+                ["id", "name"], limit=5
+            ))
+            if not target_users:
+                return {"error": f"Employee '{target_name}' not found"}
+            if len(target_users) > 1:
+                names = [u["name"] for u in target_users]
+                return {"error": f"Multiple matches: {', '.join(names)}"}
+            reminder_uid = target_users[0]["id"]
+            reminder_username = target_users[0]["name"]
+        except Exception as e:
+            return {"error": f"Lookup failed: {e}"}
+    elif target_name and role != "admin":
+        return {"error": "Only admin can remind others"}
+    
+    # Get contact info
+    contact = await _get_user_contact(reminder_uid)
+    missing = []
+    if "email" in channels and not contact["email"]:
+        missing.append("email")
+    if "call" in channels and not contact["phone"]:
+        missing.append("phone")
+    if missing:
+        return {"error": f"Missing contact for {reminder_username}: {', '.join(missing)}"}
+    
+    # Create in DB
+    conn = await get_db_conn()
+    if not conn:
+        return {"error": "DB unavailable"}
+    try:
+        row = await conn.fetchrow("""
+            INSERT INTO reminders (uid, user_name, content, fire_at, channels, target_email, target_phone)
+            VALUES ($1, $2, $3, $4, $5::TEXT[], $6, $7) RETURNING id, fire_at
+        """, reminder_uid, reminder_username, content, fire_at_utc, channels, contact["email"], contact["phone"])
+        
+        result = {
+            "ok": True, "id": row["id"],
+            "content": content,
+            "fire_at_la": _fmt_la(row["fire_at"]),
+            "channels": channels,
+            "target_email": contact["email"],
+            "target_phone": contact["phone"] if "call" in channels else None,
+        }
+        if target_name:
+            result["target_user"] = reminder_username
+        return result
+    finally:
+        await conn.close()
+
+
 class ReminderUpdate(BaseModel):
     content: str = ""
     fire_at: str = ""  # ISO datetime, naive = LA time
