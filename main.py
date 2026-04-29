@@ -698,7 +698,7 @@ async def _check_due_reminders():
                 if not ok: errors.append(f"email:{err}")
             if "call" in channels:
                 has_cjk = any('\u4e00' <= ch <= '\u9fff' for ch in content)
-                msg = f"你好,这是 Chumart AI 的提醒。{content}" if has_cjk else f"Hello, Chumart AI reminder. {content}"
+                msg = f"你好，这是楚马特 AI 的提醒。{content}。重复一遍，{content}" if has_cjk else f"Hello, this is a Chumart AI reminder. {content}. Again, {content}"
                 ok, err = await _send_voice_call(phone, msg)
                 print(f"[REMINDER-DEBUG] id={r['id']} call_send: to_phone={phone!r} ok={ok} err={err!r}")
                 if not ok: errors.append(f"call:{err}")
@@ -9080,14 +9080,16 @@ async def get_reminder_users(session_token: str = ""):
     try:
         raw = await odoo_query(
             "res.users",
-            [["active", "=", True], ["share", "=", False]],
-            ["id", "name"],
+            [["active", "=", True]],
+            ["id", "name", "login"],
             limit=50
         )
         users = json.loads(raw) if isinstance(raw, str) else raw
-        # Sort by name, exclude OdooBot (uid=1)
+        print(f"[REMINDER-USERS] raw count={len(users)}, names={[u.get('name') for u in users[:10]]}")
+        # Exclude OdooBot (uid=1) and portal/public users (login containing @-less or __system__)
         user_list = sorted(
-            [{"uid": u["id"], "name": u["name"]} for u in users if u["id"] != 1],
+            [{"uid": u["id"], "name": u["name"]} for u in users 
+             if u["id"] not in (1, 3, 4, 5) and "__" not in (u.get("login") or "")],
             key=lambda u: u["name"]
         )
         return {"users": user_list}
@@ -9398,10 +9400,10 @@ def _is_reminder_intent(text: str) -> bool:
     # 中文 reminder 关键词（创建 + 修改）
     zh_keywords = [
         # 创建意图
-        "提醒我", "提醒一下", "提醒下", "记得",
+        "设置提醒", "提醒我", "提醒一下", "提醒下", "记得",
         "别忘", "不要忘", "千万别忘",
         "到时", "到点",
-        # 修改/重建意图（v18.1 新加）
+        # 修改/重建意图
         "改成电话", "改成邮件", "改成email",
         "改为电话", "改为邮件",
         "换成电话",
