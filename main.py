@@ -682,7 +682,7 @@ async def _check_due_reminders():
             print(f"[REMINDER-DEBUG] id={r['id']} db_target_email={email!r} db_target_phone={phone!r}")
             
             if (not email and "email" in channels) or \
-               (not phone and ("sms" in channels or "call" in channels)):
+               (not phone and "call" in channels):
                 contact = await _get_user_contact(r["uid"])
                 print(f"[REMINDER-DEBUG] id={r['id']} fallback _get_user_contact returned: email={contact['email']!r} phone={contact['phone']!r}")
                 email = email or contact["email"]
@@ -696,10 +696,6 @@ async def _check_due_reminders():
                     f"Chumart AI Reminder\n\n📌 {content}\n\nScheduled: {_fmt_la(r['fire_at'])}")
                 print(f"[REMINDER-DEBUG] id={r['id']} email_send: ok={ok} err={err!r}")
                 if not ok: errors.append(f"email:{err}")
-            if "sms" in channels:
-                ok, err = await _send_sms(phone, f"⏰ Chumart AI: {content}")
-                print(f"[REMINDER-DEBUG] id={r['id']} sms_send: to_phone={phone!r} ok={ok} err={err!r}")
-                if not ok: errors.append(f"sms:{err}")
             if "call" in channels:
                 has_cjk = any('\u4e00' <= ch <= '\u9fff' for ch in content)
                 msg = f"你好,这是 Chumart AI 的提醒。{content}" if has_cjk else f"Hello, Chumart AI reminder. {content}"
@@ -2151,37 +2147,46 @@ TOOLS = [
     {
         "name": "create_reminder",
         "description": (
-            "Schedule a reminder that notifies the user via email/SMS/voice call at a specified time. "
+            "Schedule a reminder that notifies a user via email and/or voice call at a specified time. "
             "Use when user says '提醒我...', 'remind me...', '下个月X号提醒我'. "
             "fire_at must be ISO datetime (naive = LA time). "
-            "channels: email/sms/call (default ['email','call']). "
+            "channels: email/call only (default ['email','call']). SMS is NOT supported. "
             "\n"
-            "🚨 CRITICAL — INFO COMPLETENESS CHECK (v18.2):\n"
-            "Before calling this tool, verify the user has provided ALL THREE pieces:\n"
+            "🚨 CRITICAL — INFO COMPLETENESS CHECK:\n"
+            "Before calling this tool, verify the user has provided ALL pieces:\n"
             "  1. Content (what to remind) — required, no default\n"
             "  2. Time (when to fire) — required, no default\n"
-            "  3. Channels (how to notify) — has a default of ['email','call']\n"
+            "  3. Channels (how to notify) — default ['email','call']\n"
             "\n"
             "Decision tree:\n"
             "- If content + time + channels all explicit → call this tool DIRECTLY\n"
-            "- If content + time present, channels NOT specified → DO NOT call this tool yet. "
-            "  Instead, REPLY in chat with: '准备建 reminder: 内容【X】时间【Y】方式默认【📧邮件+📞电话】, 是否调整方式? "
-            "  (邮件/电话/短信 任意组合, 或 OK 确认)' Wait for user's reply. If they say OK → call this tool with channels=['email','call']. "
-            "  If they pick channels → use their choice.\n"
-            "- If content present but time missing → ASK 'What time should I remind you?' DO NOT GUESS time.\n"
-            "- If user says only '提醒我' / 'remind me' alone → ASK for both time and content.\n"
+            "- If content + time present, channels NOT specified → DO NOT call yet. "
+            "  REPLY: '准备设置提醒：内容【X】时间【Y】方式默认【📧邮件 + 📞电话】，确认或调整方式？' "
+            "  Wait for user reply. If OK → call with channels=['email','call']. "
+            "  If they pick → use their choice.\n"
+            "- If time missing → ASK for time. DO NOT GUESS.\n"
             "\n"
-            "CRITICAL: Always compute date from the 'today' value in your system prompt. "
-            "'明天/tomorrow' = today + 1 day (explicit 'tomorrow' value in system prompt). "
-            "When user mentions a weekday like '下周一', count forward from today's weekday. "
-            "Always confirm the resolved date in reply (e.g. '已设置 4月28日(周一) 09:00 的提醒')."
+            "ADMIN ONLY — REMIND OTHERS:\n"
+            "If an admin says 'remind Ashley to ...' / '提醒Ashley...' / '提醒Alex...', "
+            "pass target_name='Ashley' (or 'Alex', 'Crystal', etc). The backend will look up "
+            "that employee's Odoo contact and send the reminder to THEM instead of the admin.\n"
+            "Non-admin users can only remind themselves (target_name is ignored).\n"
+            "\n"
+            "AFTER CREATION:\n"
+            "The tool returns target_email and target_phone. ALWAYS show these in your reply:\n"
+            "'✅ 已设置！将发送到：📧 xxx@chumartusa.com 📞 +1xxx'\n"
+            "This lets the user verify the correct contact info.\n"
+            "\n"
+            "CRITICAL: Always compute date from 'today' in system prompt. "
+            "'明天/tomorrow' = today + 1 day. Always confirm date in reply."
         ),
         "input_schema": {
             "type": "object",
             "properties": {
                 "content": {"type": "string", "description": "What to remind about"},
                 "fire_at": {"type": "string", "description": "When to fire, ISO format like '2026-05-24T09:00:00'. Naive = LA time. If user only gives date, default time to 09:00."},
-                "channels": {"type": "array", "items": {"type": "string", "enum": ["email", "sms", "call"]}, "description": "Notification channels. Default ['email','call'] when user didn't specify but confirmed via reply. Single channel only when user explicitly chose."}
+                "channels": {"type": "array", "items": {"type": "string", "enum": ["email", "call"]}, "description": "Notification channels. Default ['email','call']. Only email and call supported."},
+                "target_name": {"type": "string", "description": "ADMIN ONLY: employee name to remind (e.g. 'Ashley', 'Alex'). Omit to remind yourself."}
             },
             "required": ["content", "fire_at"]
         }
@@ -2189,18 +2194,23 @@ TOOLS = [
     {
         "name": "list_reminders",
         "description": (
-            "List the user's scheduled reminders. Use when user asks 'what reminders do I have' / "
-            "'我有什么提醒' / '查看reminder'. Each reminder includes: content, fire_at_la (LA time), "
-            "channels (email/sms/call), id, fired (bool).\n"
-            "For reminders with call/sms channels, target_phone is included — this is the user's OWN "
-            "notification phone number (safe to display, it's their own data). "
-            "For email reminders, target_email is included.\n"
-            "If the user asks 'who will the call go to' / '电话打给谁', show the target_phone from the results."
+            "List scheduled reminders. Default: shows current user's reminders only.\n"
+            "Use when user asks 'what reminders do I have' / '我有什么提醒' / '查看reminder'.\n"
+            "\n"
+            "ADMIN ONLY — view others:\n"
+            "- '查看所有人的reminder' / 'show all reminders' → pass all_users=true\n"
+            "- '查看Ashley的reminder' / 'show Ashley reminders' → pass target_name='Ashley'\n"
+            "Non-admin users: all_users and target_name are ignored (only see their own).\n"
+            "\n"
+            "Each reminder includes: id, user_name, content, fire_at_la, channels, "
+            "target_email, target_phone (when applicable), fired status."
         ),
         "input_schema": {
             "type": "object",
             "properties": {
-                "include_fired": {"type": "boolean", "default": False, "description": "If true, include past fired reminders too."}
+                "include_fired": {"type": "boolean", "default": False, "description": "If true, include past fired reminders too."},
+                "all_users": {"type": "boolean", "default": False, "description": "ADMIN ONLY: if true, list ALL users' reminders."},
+                "target_name": {"type": "string", "description": "ADMIN ONLY: employee name to filter (e.g. 'Ashley', 'Alex'). Omit to see your own."}
             },
             "required": []
         }
@@ -6896,12 +6906,14 @@ async def run_tool(name, inp, context=None):
     if name == "create_reminder":
         content = (inp.get("content") or "").strip()
         fire_at_str = (inp.get("fire_at") or "").strip()
-        channels = inp.get("channels") or ["email"]
+        channels = inp.get("channels") or ["email", "call"]
+        target_name = (inp.get("target_name") or "").strip()
         if isinstance(channels, str):
             channels = [channels]
-        channels = [c for c in channels if c in ("email", "sms", "call")]
+        # v18.3.1: only email + call, no sms
+        channels = [c for c in channels if c in ("email", "call")]
         if not channels:
-            channels = ["email"]
+            channels = ["email", "call"]
         if not content:
             return json.dumps({"error": "content is required"})
         if not fire_at_str:
@@ -6913,17 +6925,46 @@ async def run_tool(name, inp, context=None):
         now_utc = datetime.datetime.now(UTC_TZ)
         if fire_at_utc <= now_utc:
             return json.dumps({"error": f"fire_at ({_fmt_la(fire_at_utc)}) is in the past"})
-        uid = ctx.get("uid", 0)
-        if not uid:
+        
+        caller_uid = ctx.get("uid", 0)
+        caller_role = ctx.get("role", "guest")
+        if not caller_uid:
             return json.dumps({"error": "user not authenticated"})
-        contact = await _get_user_contact(uid)
+        
+        # Determine target user (self or another employee if admin)
+        reminder_uid = caller_uid
+        reminder_username = ctx.get("username", "")
+        
+        if target_name:
+            # Only admin can remind others
+            if caller_role != "admin":
+                return json.dumps({"error": "Only admin can create reminders for other employees."})
+            # Look up target user by name in Odoo
+            try:
+                target_users = json.loads(await odoo_query(
+                    "res.users", [["name", "ilike", target_name]],
+                    ["id", "name", "login"], limit=5
+                ))
+                if not target_users:
+                    return json.dumps({"error": f"Employee '{target_name}' not found in Odoo."})
+                if len(target_users) > 1:
+                    names = [f"{u['name']} (uid={u['id']})" for u in target_users]
+                    return json.dumps({"error": f"Multiple matches for '{target_name}': {', '.join(names)}. Be more specific."})
+                target_user = target_users[0]
+                reminder_uid = target_user["id"]
+                reminder_username = target_user["name"]
+                print(f"[REMINDER] admin {ctx.get('username')}({caller_uid}) creating reminder for {reminder_username}({reminder_uid})")
+            except Exception as e:
+                return json.dumps({"error": f"Failed to look up employee: {e}"})
+        
+        contact = await _get_user_contact(reminder_uid)
         missing = []
         if "email" in channels and not contact["email"]:
             missing.append("email")
-        if ("sms" in channels or "call" in channels) and not contact["phone"]:
+        if "call" in channels and not contact["phone"]:
             missing.append("phone (set in Odoo: Settings → Users → Work Mobile)")
         if missing:
-            return json.dumps({"error": f"missing contact info: {', '.join(missing)}"})
+            return json.dumps({"error": f"missing contact info for {reminder_username}: {', '.join(missing)}"})
         conn = await get_db_conn()
         if not conn:
             return json.dumps({"error": "database unavailable"})
@@ -6931,35 +6972,80 @@ async def run_tool(name, inp, context=None):
             row = await conn.fetchrow("""
                 INSERT INTO reminders (uid, user_name, content, fire_at, channels, target_email, target_phone)
                 VALUES ($1, $2, $3, $4, $5::TEXT[], $6, $7) RETURNING id, fire_at
-            """, uid, ctx.get("username", ""), content, fire_at_utc, channels, contact["email"], contact["phone"])
-            return json.dumps({"ok": True, "id": row["id"], "content": content,
+            """, reminder_uid, reminder_username, content, fire_at_utc, channels, contact["email"], contact["phone"])
+            # v18.3.1: 返回目标联系方式让 AI 展示给用户
+            result = {
+                "ok": True, "id": row["id"], "content": content,
                 "fire_at_la": _fmt_la(row["fire_at"]), "channels": channels,
-                "message": f"Reminder set for {_fmt_la(row['fire_at'])}: {content}"}, ensure_ascii=False)
+                "target_email": contact["email"],
+                "message": f"Reminder set for {_fmt_la(row['fire_at'])}: {content}",
+            }
+            if "call" in channels and contact["phone"]:
+                result["target_phone"] = contact["phone"]
+            if target_name:
+                result["target_user"] = reminder_username
+            return json.dumps(result, ensure_ascii=False)
         finally:
             await conn.close()
 
     if name == "list_reminders":
         uid = ctx.get("uid", 0)
+        caller_role = ctx.get("role", "guest")
         if not uid:
             return json.dumps({"error": "user not authenticated"})
         include_fired = bool(inp.get("include_fired", False))
+        all_users = bool(inp.get("all_users", False))
+        target_name = (inp.get("target_name") or "").strip()
+        
+        # Determine query scope
+        query_uid = uid  # default: only current user
+        query_label = "your"
+        
+        if all_users and caller_role == "admin":
+            query_uid = None  # no uid filter
+            query_label = "all users'"
+        elif target_name and caller_role == "admin":
+            # Look up target user by name
+            try:
+                target_users = json.loads(await odoo_query(
+                    "res.users", [["name", "ilike", target_name]],
+                    ["id", "name"], limit=5
+                ))
+                if not target_users:
+                    return json.dumps({"error": f"Employee '{target_name}' not found."})
+                if len(target_users) > 1:
+                    names = [f"{u['name']} (uid={u['id']})" for u in target_users]
+                    return json.dumps({"error": f"Multiple matches: {', '.join(names)}. Be more specific."})
+                query_uid = target_users[0]["id"]
+                query_label = f"{target_users[0]['name']}'s"
+            except Exception as e:
+                return json.dumps({"error": f"Failed to look up employee: {e}"})
+        elif (all_users or target_name) and caller_role != "admin":
+            return json.dumps({"error": "Only admin can view other users' reminders."})
+        
         conn = await get_db_conn()
         if not conn:
             return json.dumps({"error": "database unavailable"})
         try:
-            # v18.3.1: 返回 target_phone/email — 这些是该用户自己的通知号码
-            # (list_reminders 已经 WHERE uid=$1 限制，只能看自己的 reminder)
-            base_fields = "id, content, fire_at, channels, fired, fired_at, error, target_email, target_phone"
-            if include_fired:
-                rows = await conn.fetch(f"SELECT {base_fields} FROM reminders WHERE uid=$1 ORDER BY fire_at DESC LIMIT 50", uid)
+            base_fields = "id, uid, user_name, content, fire_at, channels, fired, fired_at, error, target_email, target_phone"
+            if query_uid is None:
+                # All users
+                if include_fired:
+                    rows = await conn.fetch(f"SELECT {base_fields} FROM reminders ORDER BY fire_at DESC LIMIT 100")
+                else:
+                    rows = await conn.fetch(f"SELECT {base_fields} FROM reminders WHERE fired=FALSE ORDER BY fire_at ASC LIMIT 100")
             else:
-                rows = await conn.fetch(f"SELECT {base_fields} FROM reminders WHERE uid=$1 AND fired=FALSE ORDER BY fire_at ASC", uid)
+                if include_fired:
+                    rows = await conn.fetch(f"SELECT {base_fields} FROM reminders WHERE uid=$1 ORDER BY fire_at DESC LIMIT 50", query_uid)
+                else:
+                    rows = await conn.fetch(f"SELECT {base_fields} FROM reminders WHERE uid=$1 AND fired=FALSE ORDER BY fire_at ASC", query_uid)
             
             out = []
             for r in rows:
                 channels = list(r["channels"] or [])
                 entry = {
                     "id": r["id"],
+                    "user_name": r["user_name"] or f"uid={r['uid']}",
                     "content": r["content"],
                     "fire_at_la": _fmt_la(r["fire_at"]),
                     "channels": channels,
@@ -6967,18 +7053,18 @@ async def run_tool(name, inp, context=None):
                     "fired_at_la": _fmt_la(r["fired_at"]) if r["fired_at"] else None,
                     "error": r["error"],
                 }
-                # 只在有电话/短信通道时展示 target_phone
-                if ("call" in channels or "sms" in channels) and r["target_phone"]:
+                if "call" in channels and r["target_phone"]:
                     entry["target_phone"] = r["target_phone"]
                 if "email" in channels and r["target_email"]:
                     entry["target_email"] = r["target_email"]
                 out.append(entry)
-            return json.dumps({"count": len(out), "reminders": out}, ensure_ascii=False)
+            return json.dumps({"count": len(out), "scope": query_label, "reminders": out}, ensure_ascii=False)
         finally:
             await conn.close()
 
     if name == "cancel_reminder":
         uid = ctx.get("uid", 0)
+        caller_role = ctx.get("role", "guest")
         rid = inp.get("id")
         if not uid:
             return json.dumps({"error": "user not authenticated"})
@@ -6988,7 +7074,11 @@ async def run_tool(name, inp, context=None):
         if not conn:
             return json.dumps({"error": "database unavailable"})
         try:
-            result = await conn.execute("DELETE FROM reminders WHERE id=$1 AND uid=$2 AND fired=FALSE", rid, uid)
+            # Admin can cancel anyone's reminder; others only their own
+            if caller_role == "admin":
+                result = await conn.execute("DELETE FROM reminders WHERE id=$1 AND fired=FALSE", rid)
+            else:
+                result = await conn.execute("DELETE FROM reminders WHERE id=$1 AND uid=$2 AND fired=FALSE", rid, uid)
             if result.endswith(" 1"):
                 return json.dumps({"ok": True, "deleted_id": rid})
             return json.dumps({"error": f"reminder {rid} not found or already fired"})
@@ -6997,6 +7087,7 @@ async def run_tool(name, inp, context=None):
 
     if name == "update_reminder":
         uid = ctx.get("uid", 0)
+        caller_role = ctx.get("role", "guest")
         rid = inp.get("id")
         if not uid:
             return json.dumps({"error": "user not authenticated"})
@@ -7020,11 +7111,13 @@ async def run_tool(name, inp, context=None):
         if not conn:
             return json.dumps({"error": "database unavailable"})
         try:
-            # Verify reminder exists and belongs to user
-            existing = await conn.fetchrow(
-                "SELECT id, content, fire_at, fired FROM reminders WHERE id=$1 AND uid=$2",
-                rid, uid
-            )
+            # Admin can update anyone's reminder; others only their own
+            if caller_role == "admin":
+                existing = await conn.fetchrow(
+                    "SELECT id, content, fire_at, fired FROM reminders WHERE id=$1", rid)
+            else:
+                existing = await conn.fetchrow(
+                    "SELECT id, content, fire_at, fired FROM reminders WHERE id=$1 AND uid=$2", rid, uid)
             if not existing:
                 return json.dumps({"error": f"reminder {rid} not found or not yours"})
             if existing["fired"]:
@@ -7042,8 +7135,12 @@ async def run_tool(name, inp, context=None):
                 sets.append(f"content = ${idx}")
                 params.append(new_content)
                 idx += 1
-            params.extend([rid, uid])
-            sql = f"UPDATE reminders SET {', '.join(sets)} WHERE id = ${idx} AND uid = ${idx+1}"
+            params.append(rid)
+            if caller_role == "admin":
+                sql = f"UPDATE reminders SET {', '.join(sets)} WHERE id = ${idx}"
+            else:
+                params.append(uid)
+                sql = f"UPDATE reminders SET {', '.join(sets)} WHERE id = ${idx} AND uid = ${idx+1}"
             await conn.execute(sql, *params)
 
             # Return the updated reminder for confirmation
@@ -9121,10 +9218,10 @@ def _is_reminder_intent(text: str) -> bool:
         "别忘", "不要忘", "千万别忘",
         "到时", "到点",
         # 修改/重建意图（v18.1 新加）
-        "改成电话", "改成短信", "改成邮件", "改成email",
-        "改为电话", "改为短信", "改为邮件",
-        "换成电话", "换成短信",
-        "改成call", "改成sms", "改成call",
+        "改成电话", "改成邮件", "改成email",
+        "改为电话", "改为邮件",
+        "换成电话",
+        "改成call",
         "重新设置提醒", "重新建提醒", "重新创建提醒",
         "重新设置reminder", "重建提醒",
         "更新提醒", "修改提醒",
@@ -9172,10 +9269,10 @@ def _is_reminder_context_followup(text: str, recent_messages: list) -> bool:
     
     # 短动作/通道词
     action_words = [
-        "打电话", "电话", "短信", "邮件", "email", "sms",
+        "打电话", "电话", "邮件", "email",
         "取消", "删除", "改时间", "提前", "推迟", "延后",
         "再发", "再来", "重新发",
-        "call", "text", "cancel", "delete",
+        "call", "cancel", "delete",
     ]
     has_action = any(w in t for w in action_words)
     if not has_action:
@@ -9256,7 +9353,6 @@ def _has_channel_in_text(text: str) -> bool:
         # 中文
         "邮件", "邮箱", "email",
         "电话", "打电话", "call",
-        "短信", "sms", "信息",
         # 组合
         "邮件和电话", "电话和邮件", "邮箱和电话", "电话和邮箱",
         "邮件加电话", "电话加邮件",
