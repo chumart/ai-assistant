@@ -6278,7 +6278,9 @@ async def run_tool(name, inp, context=None):
                     limit=5, cookies=cookies))
                 if isinstance(so_r, list) and so_r:
                     print(f"[INVOICE-DEBUG] exact match failed for '{so_name}', ilike found: {[s.get('name') for s in so_r]}")
-                    so_r = [so_r[0]]  # take first match
+                    # Prefer the one whose name matches exactly (case-insensitive)
+                    exact_ci = [s for s in so_r if (s.get("name") or "").upper() == so_name.upper()]
+                    so_r = [exact_ci[0]] if exact_ci else [so_r[0]]
                 else:
                     # Last resort: search without company filter
                     so_r2 = json.loads(await odoo_query("sale.order",
@@ -6749,7 +6751,16 @@ async def run_tool(name, inp, context=None):
                 ["id", "name", "state", "partner_id", "amount_total", "invoice_status", "invoice_ids"],
                 limit=1, cookies=cookies))
             if not isinstance(so_r, list) or not so_r:
-                return json.dumps({"error": f"SO '{so_name}' not found"})
+                # Fallback: ilike search
+                so_r = json.loads(await odoo_query("sale.order",
+                    [["name", "ilike", so_name], ["company_id", "=", 1]],
+                    ["id", "name", "state", "partner_id", "amount_total", "invoice_status", "invoice_ids"],
+                    limit=5, cookies=cookies))
+                if isinstance(so_r, list) and so_r:
+                    exact_ci = [s for s in so_r if (s.get("name") or "").upper() == so_name.upper()]
+                    so_r = [exact_ci[0]] if exact_ci else [so_r[0]]
+                else:
+                    return json.dumps({"error": f"SO '{so_name}' not found"})
             so = so_r[0]
             so_state = so.get("state", "")
             so_amount = float(so.get("amount_total") or 0)
