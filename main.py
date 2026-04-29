@@ -476,7 +476,7 @@ async def audit_odoo_write(
 @app.on_event("startup")
 async def startup():
     print("=" * 60)
-    print("CHUMART AI BACKEND — BUILD: privacy-fix-v18.3 (2026-04-29)")
+    print("CHUMART AI BACKEND — BUILD: privacy-fix-v18.3.1 (2026-04-29)")
     print("=" * 60)
     await init_db()
     # Start reminder scanner (checks every 60 seconds for due reminders)
@@ -2203,10 +2203,11 @@ TOOLS = [
         "description": (
             "List the user's scheduled reminders. Use when user asks 'what reminders do I have' / "
             "'我有什么提醒' / '查看reminder'. Each reminder includes: content, fire_at_la (LA time), "
-            "channels (email/sms/call), id, fired (bool). "
-            "Privacy note: do NOT speculate or display target phone numbers or email addresses to the user. "
-            "If the user asks 'what's my phone number' or '我的电话是多少', respond that you don't have access "
-            "to that info — they should check their Odoo profile (Settings → Users)."
+            "channels (email/sms/call), id, fired (bool).\n"
+            "For reminders with call/sms channels, target_phone is included — this is the user's OWN "
+            "notification phone number (safe to display, it's their own data). "
+            "For email reminders, target_email is included.\n"
+            "If the user asks 'who will the call go to' / '电话打给谁', show the target_phone from the results."
         ),
         "input_schema": {
             "type": "object",
@@ -2333,14 +2334,29 @@ TOOLS = [
             "  - INSERT / UPDATE / DELETE / DROP / ALTER / TRUNCATE — read only\n"
             "  - Multiple statements (no semicolons except trailing)\n"
             "\n"
-            "Always include LIMIT (default 50, max 200). Use parameterized values via the params array.\n"
-            "Example: query='SELECT id, uid, target_phone FROM reminders WHERE uid=$1 LIMIT 20', params=[7]"
+            "PARAMETERS:\n"
+            "  - For integer columns (e.g. uid, id): pass plain integers in params, NOT strings.\n"
+            "    Correct: params=[7]   Wrong: params=[\"7\"]\n"
+            "  - For text columns (content, partner_id name): pass strings.\n"
+            "  - You can also embed integer literals directly: WHERE uid=7  (no $1/params needed)\n"
+            "\n"
+            "🚨 IF QUERY FAILS — DO NOT FABRICATE DATA:\n"
+            "If the tool returns {\"error\": \"...\"}, tell the user the exact error and ASK how to proceed.\n"
+            "NEVER make up reminder content, phone numbers, emails, or any row data. NEVER use\n"
+            "placeholder values like 'user7@example.com', '+1 310-555-0123', 'Test reminder'.\n"
+            "If you don't have real query results, say 'query failed' — do not invent rows.\n"
+            "\n"
+            "Always include LIMIT (default 50, max 200)."
         ),
         "input_schema": {
             "type": "object",
             "properties": {
                 "query": {"type": "string", "description": "SELECT statement. Must reference whitelisted tables only."},
-                "params": {"type": "array", "items": {"type": "string"}, "description": "Optional parameter values for $1, $2, etc."}
+                "params": {
+                    "type": "array",
+                    "items": {"type": ["string", "integer", "number", "boolean"]},
+                    "description": "Optional parameter values for $1, $2, etc. Match column types: integer for uid/id, string for text. Or skip params and embed literals in query."
+                }
             },
             "required": ["query"]
         }
@@ -6976,10 +6992,9 @@ async def run_tool(name, inp, context=None):
         if not conn:
             return json.dumps({"error": "database unavailable"})
         try:
-            # v18.3: 只查 reminder 元数据，不返回具体的 phone/email 字符串给 AI
-            # (避免 AI 把这些数据展示给用户造成隐私泄漏，特别是当 _get_user_contact
-            # fallback 链异常导致拿到他人号码时)
-            base_fields = "id, content, fire_at, channels, fired, fired_at, error"
+            # v18.3.1: 返回 target_phone/email — 这些是该用户自己的通知号码
+            # (list_reminders 已经 WHERE uid=$1 限制，只能看自己的 reminder)
+            base_fields = "id, content, fire_at, channels, fired, fired_at, error, target_email, target_phone"
             if include_fired:
                 rows = await conn.fetch(f"SELECT {base_fields} FROM reminders WHERE uid=$1 ORDER BY fire_at DESC LIMIT 50", uid)
             else:
@@ -6987,15 +7002,22 @@ async def run_tool(name, inp, context=None):
             
             out = []
             for r in rows:
-                out.append({
+                channels = list(r["channels"] or [])
+                entry = {
                     "id": r["id"],
                     "content": r["content"],
                     "fire_at_la": _fmt_la(r["fire_at"]),
-                    "channels": list(r["channels"] or []),
+                    "channels": channels,
                     "fired": r["fired"],
                     "fired_at_la": _fmt_la(r["fired_at"]) if r["fired_at"] else None,
                     "error": r["error"],
-                })
+                }
+                # 只在有电话/短信通道时展示 target_phone
+                if ("call" in channels or "sms" in channels) and r["target_phone"]:
+                    entry["target_phone"] = r["target_phone"]
+                if "email" in channels and r["target_email"]:
+                    entry["target_email"] = r["target_email"]
+                out.append(entry)
             return json.dumps({"count": len(out), "reminders": out}, ensure_ascii=False)
         finally:
             await conn.close()
@@ -7255,12 +7277,39 @@ async def run_tool(name, inp, context=None):
             # Audit log this query
             who_uid = ctx.get("uid", 0)
             who_name = ctx.get("username", "")
-            print(f"[DB-QUERY] who={who_name}({who_uid}) query={query[:200]} params={params}")
+            
+            # v18.3.1: 自动把 "数字字符串" 转成 int（AI 经常传 ["7"] 而不是 [7]，
+            # 但 PostgreSQL 整数字段不接受字符串输入）
+            normalized_params = []
+            for p in params:
+                if isinstance(p, str) and p.lstrip("-").isdigit():
+                    try:
+                        normalized_params.append(int(p))
+                    except ValueError:
+                        normalized_params.append(p)
+                elif isinstance(p, str) and p.replace(".", "", 1).lstrip("-").isdigit():
+                    try:
+                        normalized_params.append(float(p))
+                    except ValueError:
+                        normalized_params.append(p)
+                else:
+                    normalized_params.append(p)
+            
+            print(f"[DB-QUERY] who={who_name}({who_uid}) query={query[:200]} params_in={params} params_normalized={normalized_params}")
             
             try:
-                rows = await conn.fetch(query, *params)
+                rows = await conn.fetch(query, *normalized_params)
             except Exception as e:
-                return json.dumps({"error": f"query execution failed: {str(e)[:300]}"})
+                # v18.3.1: 错误消息加严，禁止 AI 编造数据
+                err_str = str(e)[:300]
+                return json.dumps({
+                    "error": f"QUERY EXECUTION FAILED: {err_str}",
+                    "instruction_to_ai": (
+                        "DO NOT FABRICATE DATA. Tell the user the query failed with this error. "
+                        "If it's a type error, suggest they specify integer params as integers, e.g. params=[7] not [\"7\"]. "
+                        "Or embed integer literals in the query: WHERE uid=7"
+                    )
+                })
             
             # Convert rows to list of dicts (handle datetime / JSONB / etc)
             result = []
