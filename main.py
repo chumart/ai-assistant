@@ -610,8 +610,10 @@ async def _send_sms(to_phone: str, body: str) -> tuple:
 async def _send_voice_call(to_phone: str, message: str) -> tuple:
     """Place Twilio voice call that reads message aloud, repeats once."""
     if not (TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN and TWILIO_FROM_NUMBER):
+        print(f"[VOICE-DEBUG] Twilio config missing: SID={bool(TWILIO_ACCOUNT_SID)} TOKEN={bool(TWILIO_AUTH_TOKEN)} FROM={TWILIO_FROM_NUMBER!r}")
         return False, "Twilio not configured"
     if not to_phone:
+        print(f"[VOICE-DEBUG] no recipient phone (got {to_phone!r})")
         return False, "no recipient phone"
     safe = (message.replace("&","&amp;").replace("<","&lt;").replace(">","&gt;")
             .replace('"',"&quot;").replace("'","&apos;"))
@@ -622,14 +624,38 @@ async def _send_voice_call(to_phone: str, message: str) -> tuple:
              f'<Say voice="{voice}" language="{lang}">{safe}</Say>'
              f'<Pause length="1"/>'
              f'<Say voice="{voice}" language="{lang}">{safe}</Say></Response>')
+    
+    # v18.2 DEBUG: 详细记录请求和响应
+    print(f"[VOICE-DEBUG] sending: From={TWILIO_FROM_NUMBER!r} To={to_phone!r} voice={voice} lang={lang}")
+    
     try:
         async with httpx.AsyncClient(timeout=15,
             auth=(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)) as c:
             r = await c.post(
                 f"https://api.twilio.com/2010-04-01/Accounts/{TWILIO_ACCOUNT_SID}/Calls.json",
                 data={"From": TWILIO_FROM_NUMBER, "To": to_phone, "Twiml": twiml})
+        
+        # v18.2 DEBUG: 完整记录 Twilio 返回
+        try:
+            resp_json = r.json()
+            # 关键字段: sid (call id), status, error_code, error_message, price
+            log_fields = {
+                "http_status": r.status_code,
+                "call_sid": resp_json.get("sid"),
+                "call_status": resp_json.get("status"),
+                "error_code": resp_json.get("error_code"),
+                "error_message": resp_json.get("error_message"),
+                "to": resp_json.get("to"),
+                "from": resp_json.get("from"),
+                "direction": resp_json.get("direction"),
+            }
+            print(f"[VOICE-DEBUG] Twilio response: {log_fields}")
+        except Exception:
+            print(f"[VOICE-DEBUG] Twilio raw response (HTTP {r.status_code}): {r.text[:500]}")
+        
         return (True, None) if r.status_code in (200, 201) else (False, f"Twilio Call {r.status_code}: {r.text[:200]}")
     except Exception as e:
+        print(f"[VOICE-DEBUG] exception: {e}")
         return False, f"Twilio Call exception: {e}"
 
 async def _check_due_reminders():
@@ -652,23 +678,35 @@ async def _check_due_reminders():
             content = r["content"]
             channels = list(r["channels"] or ["email"])
             email, phone = r["target_email"], r["target_phone"]
+            
+            # v18.2 DEBUG: 清楚记录拿到的目标号码
+            print(f"[REMINDER-DEBUG] id={r['id']} uid={r['uid']} channels={channels}")
+            print(f"[REMINDER-DEBUG] id={r['id']} db_target_email={email!r} db_target_phone={phone!r}")
+            
             if (not email and "email" in channels) or \
                (not phone and ("sms" in channels or "call" in channels)):
                 contact = await _get_user_contact(r["uid"])
+                print(f"[REMINDER-DEBUG] id={r['id']} fallback _get_user_contact returned: email={contact['email']!r} phone={contact['phone']!r}")
                 email = email or contact["email"]
                 phone = phone or contact["phone"]
+            
+            print(f"[REMINDER-DEBUG] id={r['id']} FINAL email={email!r} phone={phone!r}")
+            
             errors = []
             if "email" in channels:
                 ok, err = await _send_email(email, "⏰ 提醒 / Reminder",
                     f"Chumart AI Reminder\n\n📌 {content}\n\nScheduled: {_fmt_la(r['fire_at'])}")
+                print(f"[REMINDER-DEBUG] id={r['id']} email_send: ok={ok} err={err!r}")
                 if not ok: errors.append(f"email:{err}")
             if "sms" in channels:
                 ok, err = await _send_sms(phone, f"⏰ Chumart AI: {content}")
+                print(f"[REMINDER-DEBUG] id={r['id']} sms_send: to_phone={phone!r} ok={ok} err={err!r}")
                 if not ok: errors.append(f"sms:{err}")
             if "call" in channels:
                 has_cjk = any('\u4e00' <= ch <= '\u9fff' for ch in content)
                 msg = f"你好,这是 Chumart AI 的提醒。{content}" if has_cjk else f"Hello, Chumart AI reminder. {content}"
                 ok, err = await _send_voice_call(phone, msg)
+                print(f"[REMINDER-DEBUG] id={r['id']} call_send: to_phone={phone!r} ok={ok} err={err!r}")
                 if not ok: errors.append(f"call:{err}")
             print(f"[REMINDER] id={r['id']} fired, errors={errors or 'none'}")
             await conn.execute("UPDATE reminders SET fired=TRUE, fired_at=NOW(), error=$1 WHERE id=$2",
@@ -2152,7 +2190,15 @@ TOOLS = [
     },
     {
         "name": "list_reminders",
-        "description": "List the user's scheduled reminders. Use when user asks 'what reminders do I have' / '我有什么提醒'.",
+        "description": (
+            "List the user's scheduled reminders. Use when user asks 'what reminders do I have' / "
+            "'我有什么提醒' / '查看reminder'. Each reminder includes:\n"
+            "- content (what), fire_at_la (when in LA time), channels (how — email/sms/call)\n"
+            "- targets: dict with 'email' and/or 'phone' keys showing MASKED target addresses\n"
+            "  (e.g. 'phone': '+13***-***-8999', 'email': 'a***@example.com'). Display these in your reply\n"
+            "  so the user can see WHERE the reminder will be sent (helps spot wrong number).\n"
+            "- id, fired (bool)"
+        ),
         "input_schema": {
             "type": "object",
             "properties": {
@@ -6863,14 +6909,51 @@ async def run_tool(name, inp, context=None):
         if not conn:
             return json.dumps({"error": "database unavailable"})
         try:
+            # v18.2: 也返回 target_phone / target_email，让用户能看到真正会发到哪里
+            base_fields = "id, content, fire_at, channels, fired, fired_at, error, target_email, target_phone"
             if include_fired:
-                rows = await conn.fetch("SELECT id, content, fire_at, channels, fired, fired_at, error FROM reminders WHERE uid=$1 ORDER BY fire_at DESC LIMIT 50", uid)
+                rows = await conn.fetch(f"SELECT {base_fields} FROM reminders WHERE uid=$1 ORDER BY fire_at DESC LIMIT 50", uid)
             else:
-                rows = await conn.fetch("SELECT id, content, fire_at, channels, fired, fired_at, error FROM reminders WHERE uid=$1 AND fired=FALSE ORDER BY fire_at ASC", uid)
-            out = [{"id": r["id"], "content": r["content"], "fire_at_la": _fmt_la(r["fire_at"]),
-                    "channels": list(r["channels"] or []), "fired": r["fired"],
+                rows = await conn.fetch(f"SELECT {base_fields} FROM reminders WHERE uid=$1 AND fired=FALSE ORDER BY fire_at ASC", uid)
+            
+            def _mask_phone(phone):
+                """Mask phone for display: +13239198999 → +1***-***-8999"""
+                if not phone:
+                    return None
+                p = phone.strip()
+                if len(p) >= 4:
+                    return p[:3] + "***" + p[-4:]
+                return p
+            
+            def _mask_email(email):
+                """Mask email: john@example.com → j***@example.com"""
+                if not email or "@" not in email:
+                    return email
+                local, domain = email.split("@", 1)
+                if len(local) <= 1:
+                    return f"{local}***@{domain}"
+                return f"{local[0]}***@{domain}"
+            
+            out = []
+            for r in rows:
+                channels = list(r["channels"] or [])
+                # 把目标信息按 channel 组装清晰
+                targets = {}
+                if "email" in channels and r["target_email"]:
+                    targets["email"] = _mask_email(r["target_email"])
+                if ("sms" in channels or "call" in channels) and r["target_phone"]:
+                    targets["phone"] = _mask_phone(r["target_phone"])
+                
+                out.append({
+                    "id": r["id"],
+                    "content": r["content"],
+                    "fire_at_la": _fmt_la(r["fire_at"]),
+                    "channels": channels,
+                    "targets": targets,  # v18.2: 显示发送目标 (脱敏)
+                    "fired": r["fired"],
                     "fired_at_la": _fmt_la(r["fired_at"]) if r["fired_at"] else None,
-                    "error": r["error"]} for r in rows]
+                    "error": r["error"],
+                })
             return json.dumps({"count": len(out), "reminders": out}, ensure_ascii=False)
         finally:
             await conn.close()
