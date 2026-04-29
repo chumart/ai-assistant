@@ -8911,6 +8911,63 @@ async def delete_document(doc_id: str, admin_key: str = ""):
     finally:
         await conn.close()
 
+
+# ─────────────────────────────────────────────
+# Admin Reminders API (v18.3.1)
+# ─────────────────────────────────────────────
+
+@app.get("/admin/reminders")
+async def admin_list_reminders(admin_key: str = "", include_fired: bool = False):
+    """List all reminders across all users — admin dashboard endpoint."""
+    if admin_key != os.getenv("ADMIN_KEY", "chumart2024"):
+        return {"error": "Invalid admin key"}
+    conn = await get_db_conn()
+    if not conn:
+        return {"error": "DB not connected"}
+    try:
+        fields = "id, uid, user_name, content, fire_at, channels, target_email, target_phone, fired, fired_at, error, created_at"
+        if include_fired:
+            rows = await conn.fetch(f"SELECT {fields} FROM reminders ORDER BY fire_at DESC LIMIT 200")
+        else:
+            rows = await conn.fetch(f"SELECT {fields} FROM reminders WHERE fired=FALSE ORDER BY fire_at ASC LIMIT 200")
+        reminders = []
+        for r in rows:
+            reminders.append({
+                "id": r["id"],
+                "uid": r["uid"],
+                "user_name": r["user_name"] or f"uid={r['uid']}",
+                "content": r["content"],
+                "fire_at": r["fire_at"].isoformat() if r["fire_at"] else None,
+                "fire_at_la": _fmt_la(r["fire_at"]),
+                "channels": list(r["channels"] or []),
+                "target_email": r["target_email"],
+                "target_phone": r["target_phone"],
+                "fired": r["fired"],
+                "fired_at": r["fired_at"].isoformat() if r["fired_at"] else None,
+                "error": r["error"],
+                "created_at": r["created_at"].isoformat() if r["created_at"] else None,
+            })
+        return {"count": len(reminders), "reminders": reminders}
+    finally:
+        await conn.close()
+
+
+@app.delete("/admin/reminders/{reminder_id}")
+async def admin_delete_reminder(reminder_id: int, admin_key: str = ""):
+    """Delete a specific reminder by ID — admin dashboard endpoint."""
+    if admin_key != os.getenv("ADMIN_KEY", "chumart2024"):
+        return {"error": "Invalid admin key"}
+    conn = await get_db_conn()
+    if not conn:
+        return {"error": "DB not connected"}
+    try:
+        result = await conn.execute("DELETE FROM reminders WHERE id=$1", reminder_id)
+        if result.endswith(" 1"):
+            return {"status": "deleted", "id": reminder_id}
+        return {"error": f"Reminder {reminder_id} not found"}
+    finally:
+        await conn.close()
+
 # ─────────────────────────────────────────────
 # Signed URL for secure document downloads
 # ─────────────────────────────────────────────
