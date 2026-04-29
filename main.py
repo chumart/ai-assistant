@@ -9149,6 +9149,151 @@ async def get_reminder_users(session_token: str = ""):
 
 
 # ─────────────────────────────────────────────
+# My Reminders API (for Check Reminder sheet)
+# ─────────────────────────────────────────────
+
+async def _resolve_uid_from_token(session_token: str) -> tuple:
+    """Resolve (uid, role) from session_token. Returns (0, 'guest') if invalid."""
+    if not session_token:
+        return 0, "guest"
+    if session_token in SESSION_STORE:
+        s = SESSION_STORE[session_token]
+        return s.get("uid", 0), s.get("role", "guest")
+    # Try DB
+    try:
+        conn = await get_db_conn()
+        if conn:
+            try:
+                row = await conn.fetchrow(
+                    "SELECT uid, role, name, username, client_type, created_at FROM user_sessions WHERE token=$1 AND expires_at > NOW()",
+                    session_token)
+                if row:
+                    ttl = 24 * 30 if row["client_type"] == "mobile" else SESSION_TTL_HOURS
+                    SESSION_STORE[session_token] = {
+                        "uid": row["uid"], "username": row["username"],
+                        "name": row["name"], "role": row["role"],
+                        "created_at": row["created_at"].replace(tzinfo=None) if row["created_at"] else datetime.datetime.now(),
+                        "ttl_hours": ttl,
+                    }
+                    return row["uid"], row["role"]
+            finally:
+                await conn.close()
+    except Exception:
+        pass
+    return 0, "guest"
+
+
+@app.get("/api/my-reminders")
+async def api_my_reminders(session_token: str = "", include_fired: bool = False):
+    """List current user's reminders for the Check Reminder sheet."""
+    uid, role = await _resolve_uid_from_token(session_token)
+    if not uid:
+        return {"error": "not authenticated"}
+    conn = await get_db_conn()
+    if not conn:
+        return {"error": "DB unavailable"}
+    try:
+        fields = "id, uid, user_name, content, fire_at, channels, target_email, target_phone, fired, fired_at, error"
+        if include_fired:
+            rows = await conn.fetch(f"SELECT {fields} FROM reminders WHERE uid=$1 ORDER BY fire_at DESC LIMIT 50", uid)
+        else:
+            rows = await conn.fetch(f"SELECT {fields} FROM reminders WHERE uid=$1 AND fired=FALSE ORDER BY fire_at ASC", uid)
+        reminders = []
+        for r in rows:
+            channels = list(r["channels"] or [])
+            entry = {
+                "id": r["id"], "content": r["content"],
+                "fire_at_la": _fmt_la(r["fire_at"]),
+                "fire_at_iso": r["fire_at"].isoformat() if r["fire_at"] else None,
+                "channels": channels, "fired": r["fired"],
+                "target_email": r["target_email"] if "email" in channels else None,
+                "target_phone": r["target_phone"] if "call" in channels else None,
+            }
+            reminders.append(entry)
+        return {"count": len(reminders), "reminders": reminders}
+    finally:
+        await conn.close()
+
+
+class ReminderUpdate(BaseModel):
+    content: str = ""
+    fire_at: str = ""  # ISO datetime, naive = LA time
+    channels: list = []
+
+
+@app.put("/api/my-reminders/{reminder_id}")
+async def api_update_reminder(reminder_id: int, body: ReminderUpdate, session_token: str = ""):
+    """Update a reminder's content, time, or channels."""
+    uid, role = await _resolve_uid_from_token(session_token)
+    if not uid:
+        return {"error": "not authenticated"}
+    conn = await get_db_conn()
+    if not conn:
+        return {"error": "DB unavailable"}
+    try:
+        # Verify ownership (admin can edit anyone's)
+        if role == "admin":
+            existing = await conn.fetchrow("SELECT id, fired FROM reminders WHERE id=$1", reminder_id)
+        else:
+            existing = await conn.fetchrow("SELECT id, fired FROM reminders WHERE id=$1 AND uid=$2", reminder_id, uid)
+        if not existing:
+            return {"error": "Reminder not found"}
+        if existing["fired"]:
+            return {"error": "Already fired, cannot edit"}
+        
+        sets, params, idx = [], [], 1
+        if body.content.strip():
+            sets.append(f"content=${idx}"); params.append(body.content.strip()); idx += 1
+        if body.fire_at.strip():
+            try:
+                new_time = _parse_iso_to_utc(body.fire_at.strip())
+                sets.append(f"fire_at=${idx}"); params.append(new_time); idx += 1
+            except Exception as e:
+                return {"error": f"Invalid time: {e}"}
+        if body.channels:
+            valid = [c for c in body.channels if c in ("email", "call")]
+            if valid:
+                sets.append(f"channels=${idx}::TEXT[]"); params.append(valid); idx += 1
+                # Update contact info if channels changed
+                contact = await _get_user_contact(uid)
+                if "email" in valid and contact["email"]:
+                    sets.append(f"target_email=${idx}"); params.append(contact["email"]); idx += 1
+                if "call" in valid and contact["phone"]:
+                    sets.append(f"target_phone=${idx}"); params.append(contact["phone"]); idx += 1
+        
+        if not sets:
+            return {"error": "Nothing to update"}
+        
+        params.append(reminder_id)
+        sql = f"UPDATE reminders SET {', '.join(sets)} WHERE id=${idx}"
+        await conn.execute(sql, *params)
+        return {"ok": True, "id": reminder_id}
+    finally:
+        await conn.close()
+
+
+@app.delete("/api/my-reminders/{reminder_id}")
+async def api_delete_reminder(reminder_id: int, session_token: str = ""):
+    """Delete (cancel) a reminder."""
+    uid, role = await _resolve_uid_from_token(session_token)
+    if not uid:
+        return {"error": "not authenticated"}
+    conn = await get_db_conn()
+    if not conn:
+        return {"error": "DB unavailable"}
+    try:
+        if role == "admin":
+            result = await conn.execute("DELETE FROM reminders WHERE id=$1 AND fired=FALSE", reminder_id)
+        else:
+            result = await conn.execute("DELETE FROM reminders WHERE id=$1 AND uid=$2 AND fired=FALSE", reminder_id, uid)
+        if result.endswith(" 1"):
+            return {"ok": True, "deleted_id": reminder_id}
+        return {"error": "Not found or already fired"}
+    finally:
+        await conn.close()
+
+
+# ─────────────────────────────────────────────
 # Signed URL for secure document downloads
 # ─────────────────────────────────────────────
 
