@@ -476,7 +476,7 @@ async def audit_odoo_write(
 @app.on_event("startup")
 async def startup():
     print("=" * 60)
-    print("CHUMART AI BACKEND — BUILD: reminder-flow-v18.2 (2026-04-28)")
+    print("CHUMART AI BACKEND — BUILD: privacy-fix-v18.3 (2026-04-29)")
     print("=" * 60)
     await init_db()
     # Start reminder scanner (checks every 60 seconds for due reminders)
@@ -524,6 +524,7 @@ async def _get_user_contact(uid: int) -> dict:
     but should ideally be stored in E.164 format (+13105551234) for Twilio.
     """
     email = phone = None
+    source = "none"   # v18.2 DEBUG: which lookup step provided phone
     conn = await get_db_conn()
     if conn:
         try:
@@ -531,6 +532,8 @@ async def _get_user_contact(uid: int) -> dict:
             if row:
                 email = row["email"] or None
                 phone = row["phone"] or None
+                if phone:
+                    source = "user_contacts_table"
         except Exception as e:
             print(f"get_user_contact DB error: {e}")
         finally:
@@ -546,6 +549,8 @@ async def _get_user_contact(uid: int) -> dict:
                 # First check res.users.mobile_phone (Work Mobile field)
                 if not phone:
                     phone = u.get("mobile_phone") or None
+                    if phone:
+                        source = "res.users.mobile_phone"
                 # Then fallback to res.partner.mobile / .phone
                 if not phone and u.get("partner_id"):
                     pid = u["partner_id"][0]
@@ -554,6 +559,8 @@ async def _get_user_contact(uid: int) -> dict:
                     if isinstance(partners_r, list) and partners_r:
                         p = partners_r[0]
                         phone = p.get("mobile") or p.get("phone") or None
+                        if phone:
+                            source = f"res.partner.{('mobile' if p.get('mobile') else 'phone')}(pid={pid})"
         except Exception as e:
             print(f"get_user_contact Odoo error: {e}")
     
@@ -566,6 +573,9 @@ async def _get_user_contact(uid: int) -> dict:
         # If user wrote 11-digit starting with 1, prepend +
         elif phone.isdigit() and len(phone) == 11 and phone.startswith("1"):
             phone = "+" + phone
+    
+    # v18.2 DEBUG: 关键日志 — 谁问的、拿到什么、来源
+    print(f"[CONTACT-DEBUG] _get_user_contact(uid={uid}) → email={email!r} phone={phone!r} source={source}")
     
     return {"email": email, "phone": phone}
 
@@ -2192,12 +2202,11 @@ TOOLS = [
         "name": "list_reminders",
         "description": (
             "List the user's scheduled reminders. Use when user asks 'what reminders do I have' / "
-            "'我有什么提醒' / '查看reminder'. Each reminder includes:\n"
-            "- content (what), fire_at_la (when in LA time), channels (how — email/sms/call)\n"
-            "- targets: dict with 'email' and/or 'phone' keys showing MASKED target addresses\n"
-            "  (e.g. 'phone': '+13***-***-8999', 'email': 'a***@example.com'). Display these in your reply\n"
-            "  so the user can see WHERE the reminder will be sent (helps spot wrong number).\n"
-            "- id, fired (bool)"
+            "'我有什么提醒' / '查看reminder'. Each reminder includes: content, fire_at_la (LA time), "
+            "channels (email/sms/call), id, fired (bool). "
+            "Privacy note: do NOT speculate or display target phone numbers or email addresses to the user. "
+            "If the user asks 'what's my phone number' or '我的电话是多少', respond that you don't have access "
+            "to that info — they should check their Odoo profile (Settings → Users)."
         ),
         "input_schema": {
             "type": "object",
@@ -2273,14 +2282,67 @@ TOOLS = [
     },
     {
         "name": "set_my_contact",
-        "description": "Save user's preferred email or phone for receiving reminders. Phone must be E.164 format (e.g. +13105551234). Falls back to Odoo login email and partner mobile if not set.",
+        "description": (
+            "Save the CURRENTLY-LOGGED-IN user's OWN email or phone for receiving notifications. "
+            "Phone must be E.164 format (e.g. +13105551234). Falls back to Odoo login email and "
+            "partner mobile if not set.\n"
+            "\n"
+            "🚨 WHEN TO CALL THIS TOOL — STRICT RULES:\n"
+            "✅ DO call when user EXPLICITLY says one of:\n"
+            "   - '我的电话/手机/邮箱是 X'\n"
+            "   - 'My phone/email is X'\n"
+            "   - '把我的电话改成 X' / 'change my phone to X'\n"
+            "   - 'set my phone to X'\n"
+            "\n"
+            "❌ DO NOT call when user says:\n"
+            "   - '打给 +1XXX' / 'call +1XXX' — that's a CALL TARGET, not the user's own number\n"
+            "   - '提醒 Ashley 在 +1XXX' — that's a third party's number\n"
+            "   - '把通知发给 +1XXX' — same, not the user themselves\n"
+            "   - Any phone number that appears to be someone else's (Ashley/Alex/customer/vendor)\n"
+            "\n"
+            "If unsure whether the number is the user's own, ASK first: '这是你自己的电话吗?'\n"
+            "Reminders ALWAYS go to the logged-in user's own contact info — they can't be sent\n"
+            "to arbitrary numbers. To send to someone else, that person must log in and set their own contact."
+        ),
         "input_schema": {
             "type": "object",
             "properties": {
                 "email": {"type": "string"},
-                "phone": {"type": "string", "description": "E.164 format, e.g. +13105551234"}
+                "phone": {"type": "string", "description": "E.164 format, e.g. +13105551234. MUST be the user's OWN phone, not a target/third-party number."}
             },
             "required": []
+        }
+    },
+    {
+        "name": "db_query_admin",
+        "description": (
+            "🔐 ADMIN ONLY — Run a read-only SELECT query against Chumart's PostgreSQL DB. "
+            "Use for diagnosing data issues (e.g. checking why a reminder has wrong target_phone, "
+            "finding stale contact records, auditing odoo_write_audit history).\n"
+            "\n"
+            "WHITELISTED TABLES (only these can be queried):\n"
+            "  - reminders                  (scheduled reminders + target_phone/email)\n"
+            "  - user_contacts              (per-user phone/email overrides)\n"
+            "  - odoo_write_audit           (every AI-initiated Odoo write)\n"
+            "  - pending_payments           (Stripe/Square/Zelle queued payments awaiting release)\n"
+            "  - knowledge_documents        (uploaded KB docs metadata)\n"
+            "  - knowledge_chunks           (KB chunk metadata, no embeddings)\n"
+            "\n"
+            "BLOCKED:\n"
+            "  - sessions / auth tokens / API keys / secrets — never queryable\n"
+            "  - INSERT / UPDATE / DELETE / DROP / ALTER / TRUNCATE — read only\n"
+            "  - Multiple statements (no semicolons except trailing)\n"
+            "\n"
+            "Always include LIMIT (default 50, max 200). Use parameterized values via the params array.\n"
+            "Example: query='SELECT id, uid, target_phone FROM reminders WHERE uid=$1 LIMIT 20', params=[7]"
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "SELECT statement. Must reference whitelisted tables only."},
+                "params": {"type": "array", "items": {"type": "string"}, "description": "Optional parameter values for $1, $2, etc."}
+            },
+            "required": ["query"]
         }
     }
 ]
@@ -3552,6 +3614,8 @@ async def run_tool(name, inp, context=None):
     _write_tools = {"odoo_create_record", "odoo_add_order_line", "odoo_confirm_order", "odoo_update_record", "odoo_update_vendor_price"}
     _cost_tools = {"odoo_find_recent_purchases_by_skus", "odoo_get_product_vendors", "odoo_create_bulk_po", "get_po_with_so_links", "odoo_restock_analysis"}
     _finance_tools = {"get_monthly_tax", "get_quarterly_tax", "get_monthly_sales", "get_missing_tax", "odoo_match_payment_to_customer"}
+    # v18.3: admin-only tools (raw DB query / sensitive ops)
+    _admin_only_tools = {"db_query_admin"}
     if name in _release_tools and not role_perms.get("can_release_so"):
         print(f"[PERM-DENY] tool={name} role={role} reason=no_release_permission")
         return json.dumps({"error": f"Permission denied: role '{role}' cannot use {name}. Need finance/admin/sales_manager."})
@@ -3564,6 +3628,9 @@ async def run_tool(name, inp, context=None):
     if name in _finance_tools and not role_perms.get("can_see_finance"):
         print(f"[PERM-DENY] tool={name} role={role} reason=no_finance_permission")
         return json.dumps({"error": f"Permission denied: role '{role}' cannot use {name}. Need finance/admin."})
+    if name in _admin_only_tools and role != "admin":
+        print(f"[PERM-DENY] tool={name} role={role} reason=admin_only")
+        return json.dumps({"error": f"Permission denied: role '{role}' cannot use {name}. Admin only."})
     try:
         print(f"[TOOL] {name} input={json.dumps(inp, ensure_ascii=False, default=str)[:500]}")
     except Exception:
@@ -6909,47 +6976,22 @@ async def run_tool(name, inp, context=None):
         if not conn:
             return json.dumps({"error": "database unavailable"})
         try:
-            # v18.2: 也返回 target_phone / target_email，让用户能看到真正会发到哪里
-            base_fields = "id, content, fire_at, channels, fired, fired_at, error, target_email, target_phone"
+            # v18.3: 只查 reminder 元数据，不返回具体的 phone/email 字符串给 AI
+            # (避免 AI 把这些数据展示给用户造成隐私泄漏，特别是当 _get_user_contact
+            # fallback 链异常导致拿到他人号码时)
+            base_fields = "id, content, fire_at, channels, fired, fired_at, error"
             if include_fired:
                 rows = await conn.fetch(f"SELECT {base_fields} FROM reminders WHERE uid=$1 ORDER BY fire_at DESC LIMIT 50", uid)
             else:
                 rows = await conn.fetch(f"SELECT {base_fields} FROM reminders WHERE uid=$1 AND fired=FALSE ORDER BY fire_at ASC", uid)
             
-            def _mask_phone(phone):
-                """Mask phone for display: +13239198999 → +1***-***-8999"""
-                if not phone:
-                    return None
-                p = phone.strip()
-                if len(p) >= 4:
-                    return p[:3] + "***" + p[-4:]
-                return p
-            
-            def _mask_email(email):
-                """Mask email: john@example.com → j***@example.com"""
-                if not email or "@" not in email:
-                    return email
-                local, domain = email.split("@", 1)
-                if len(local) <= 1:
-                    return f"{local}***@{domain}"
-                return f"{local[0]}***@{domain}"
-            
             out = []
             for r in rows:
-                channels = list(r["channels"] or [])
-                # 把目标信息按 channel 组装清晰
-                targets = {}
-                if "email" in channels and r["target_email"]:
-                    targets["email"] = _mask_email(r["target_email"])
-                if ("sms" in channels or "call" in channels) and r["target_phone"]:
-                    targets["phone"] = _mask_phone(r["target_phone"])
-                
                 out.append({
                     "id": r["id"],
                     "content": r["content"],
                     "fire_at_la": _fmt_la(r["fire_at"]),
-                    "channels": channels,
-                    "targets": targets,  # v18.2: 显示发送目标 (脱敏)
+                    "channels": list(r["channels"] or []),
                     "fired": r["fired"],
                     "fired_at_la": _fmt_la(r["fired_at"]) if r["fired_at"] else None,
                     "error": r["error"],
@@ -7138,6 +7180,106 @@ async def run_tool(name, inp, context=None):
                     phone = COALESCE(EXCLUDED.phone, user_contacts.phone), updated_at = NOW()
             """, uid, email, phone)
             return json.dumps({"ok": True, "email": email, "phone": phone, "message": "Contact preferences saved."})
+        finally:
+            await conn.close()
+
+    if name == "db_query_admin":
+        # v18.3: admin-only read-only DB query for diagnostics.
+        # Permission already checked above (admin_only_tools).
+        query = (inp.get("query") or "").strip()
+        params = inp.get("params") or []
+        if not query:
+            return json.dumps({"error": "query is required"})
+        
+        # ── SQL Safety Gate ──
+        q_lower = query.lower()
+        # 1) Must be SELECT only
+        # Strip leading whitespace and comments
+        q_stripped = re.sub(r"^\s*(--[^\n]*\n)*\s*", "", q_lower)
+        if not q_stripped.startswith("select"):
+            return json.dumps({"error": "Only SELECT queries are allowed."})
+        
+        # 2) Block dangerous keywords (use word boundaries to avoid false positives like "selected")
+        forbidden = [
+            r"\binsert\b", r"\bupdate\b", r"\bdelete\b", r"\bdrop\b",
+            r"\balter\b", r"\btruncate\b", r"\bcreate\b", r"\bgrant\b",
+            r"\brevoke\b", r"\bcopy\b", r"\bvacuum\b", r"\breindex\b",
+            r"\bnotify\b", r"\blisten\b",
+            # Block accessing pg system tables / functions
+            r"\bpg_\w+", r"\binformation_schema\b", r"\bpg_catalog\b",
+            # Block functions that could be abused
+            r"\bpg_read_file\b", r"\bpg_ls_dir\b", r"\bdblink\b",
+            r"\blo_import\b", r"\blo_export\b",
+        ]
+        for pat in forbidden:
+            if re.search(pat, q_lower):
+                return json.dumps({"error": f"Forbidden SQL keyword/pattern detected: {pat}"})
+        
+        # 3) Block multiple statements (semicolon mid-query)
+        # Allow trailing semicolon
+        q_no_trailing = query.rstrip().rstrip(";")
+        if ";" in q_no_trailing:
+            return json.dumps({"error": "Multiple statements not allowed (only one SELECT)."})
+        
+        # 4) Whitelist table check — query MUST reference only allowed tables
+        WHITELIST_TABLES = {
+            "reminders", "user_contacts", "odoo_write_audit",
+            "pending_payments", "knowledge_documents", "knowledge_chunks",
+        }
+        # Find table references after FROM / JOIN
+        table_refs = re.findall(r"\b(?:from|join)\s+([a-z_][a-z0-9_]*)", q_lower)
+        if not table_refs:
+            return json.dumps({"error": "Query must reference at least one table via FROM/JOIN."})
+        for tbl in table_refs:
+            if tbl not in WHITELIST_TABLES:
+                return json.dumps({
+                    "error": f"Table '{tbl}' is not whitelisted. Allowed: {sorted(WHITELIST_TABLES)}"
+                })
+        
+        # 5) Enforce a hard LIMIT cap
+        # If query already has LIMIT N, check N <= 200; else append LIMIT 50
+        limit_match = re.search(r"\blimit\s+(\d+)", q_lower)
+        if limit_match:
+            limit_val = int(limit_match.group(1))
+            if limit_val > 200:
+                return json.dumps({"error": f"LIMIT {limit_val} exceeds max 200."})
+        else:
+            # Append default LIMIT 50
+            query = query.rstrip().rstrip(";") + " LIMIT 50"
+        
+        # ── Execute ──
+        conn = await get_db_conn()
+        if not conn:
+            return json.dumps({"error": "database unavailable"})
+        try:
+            # Audit log this query
+            who_uid = ctx.get("uid", 0)
+            who_name = ctx.get("username", "")
+            print(f"[DB-QUERY] who={who_name}({who_uid}) query={query[:200]} params={params}")
+            
+            try:
+                rows = await conn.fetch(query, *params)
+            except Exception as e:
+                return json.dumps({"error": f"query execution failed: {str(e)[:300]}"})
+            
+            # Convert rows to list of dicts (handle datetime / JSONB / etc)
+            result = []
+            for r in rows:
+                row_dict = {}
+                for k, v in r.items():
+                    if isinstance(v, (datetime.datetime, datetime.date)):
+                        row_dict[k] = v.isoformat()
+                    elif isinstance(v, (list, tuple)):
+                        row_dict[k] = list(v)
+                    else:
+                        row_dict[k] = v
+                result.append(row_dict)
+            
+            return json.dumps({
+                "ok": True,
+                "row_count": len(result),
+                "rows": result,
+            }, ensure_ascii=False, default=str)
         finally:
             await conn.close()
 
@@ -7792,6 +7934,8 @@ async def chat(req: ChatRequest, background_tasks: BackgroundTasks):
     write_tools = {"odoo_create_record", "odoo_add_order_line", "odoo_confirm_order", "odoo_update_record", "odoo_update_vendor_price"}
     # Tools that expose vendor names, prices, PO costs — only admin / finance / purchase should see these
     cost_tools = {"odoo_find_recent_purchases_by_skus", "odoo_get_product_vendors", "odoo_create_bulk_po", "get_po_with_so_links", "odoo_restock_analysis"}
+    # v18.3: admin-only tools (raw DB query for diagnostics)
+    admin_only_tools = {"db_query_admin"}
     for tool in TOOLS:
         tname = tool["name"]
         if tname in finance_tools and not perms.get("can_see_finance"):
@@ -7801,6 +7945,8 @@ async def chat(req: ChatRequest, background_tasks: BackgroundTasks):
         if tname in write_tools and not perms.get("can_write_odoo"):
             continue
         if tname in cost_tools and not perms.get("can_see_cost"):
+            continue
+        if tname in admin_only_tools and verified_role != "admin":
             continue
         allowed_tools.append(tool)
 
@@ -8005,6 +8151,8 @@ async def chat_stream(req: ChatRequest, background_tasks: BackgroundTasks):
     write_tools = {"odoo_create_record", "odoo_add_order_line", "odoo_confirm_order", "odoo_update_record", "odoo_update_vendor_price"}
     # Tools that expose vendor names, prices, PO costs — only admin / finance / purchase should see these
     cost_tools = {"odoo_find_recent_purchases_by_skus", "odoo_get_product_vendors", "odoo_create_bulk_po", "get_po_with_so_links", "odoo_restock_analysis"}
+    # v18.3: admin-only tools (raw DB query for diagnostics)
+    admin_only_tools = {"db_query_admin"}
     for tool in TOOLS:
         tname = tool["name"]
         if tname in finance_tools and not perms.get("can_see_finance"):
@@ -8014,6 +8162,8 @@ async def chat_stream(req: ChatRequest, background_tasks: BackgroundTasks):
         if tname in write_tools and not perms.get("can_write_odoo"):
             continue
         if tname in cost_tools and not perms.get("can_see_cost"):
+            continue
+        if tname in admin_only_tools and verified_role != "admin":
             continue
         allowed_tools.append(tool)
 
@@ -9959,6 +10109,8 @@ async def odoo_bot_chat(req: OdooBotRequest):
     # Other write tools (PO, product/price edits) — admin/finance only (NOT sales_manager)
     write_tools = {"odoo_create_record", "odoo_add_order_line", "odoo_confirm_order", "odoo_update_record", "odoo_update_vendor_price"}
     cost_tools = {"odoo_find_recent_purchases_by_skus", "odoo_get_product_vendors", "odoo_create_bulk_po", "get_po_with_so_links", "odoo_restock_analysis"}
+    # v18.3: admin-only tools
+    admin_only_tools = {"db_query_admin"}
     for tool in TOOLS:
         tname = tool["name"]
         if tname in finance_tools and not perms.get("can_see_finance"):
@@ -9968,6 +10120,8 @@ async def odoo_bot_chat(req: OdooBotRequest):
         if tname in write_tools and not perms.get("can_write_odoo"):
             continue
         if tname in cost_tools and not perms.get("can_see_cost"):
+            continue
+        if tname in admin_only_tools and role != "admin":
             continue
         allowed_tools.append(tool)
 
