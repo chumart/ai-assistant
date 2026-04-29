@@ -9072,24 +9072,52 @@ async def admin_delete_reminder(reminder_id: int, admin_key: str = ""):
 @app.get("/api/reminder-users")
 async def get_reminder_users(session_token: str = ""):
     """Return Odoo internal users for admin reminder 'Remind who?' dropdown."""
-    if not session_token or session_token not in SESSION_STORE:
+    if not session_token:
         return {"error": "not authenticated"}
-    sess = SESSION_STORE[session_token]
-    if sess.get("role") != "admin":
+    
+    # Check in-memory first, then DB (handles post-restart race condition)
+    role = None
+    if session_token in SESSION_STORE:
+        role = SESSION_STORE[session_token].get("role")
+    else:
+        # Try restoring from DB
+        try:
+            conn = await get_db_conn()
+            if conn:
+                try:
+                    row = await conn.fetchrow("""
+                        SELECT uid, username, name, role, client_type, created_at
+                        FROM user_sessions WHERE token = $1 AND expires_at > NOW()
+                    """, session_token)
+                    if row:
+                        ttl_hours = 24 * 30 if row["client_type"] == "mobile" else SESSION_TTL_HOURS
+                        SESSION_STORE[session_token] = {
+                            "uid": row["uid"], "username": row["username"],
+                            "name": row["name"], "role": row["role"],
+                            "created_at": row["created_at"].replace(tzinfo=None) if row["created_at"] else datetime.datetime.now(),
+                            "ttl_hours": ttl_hours,
+                        }
+                        role = row["role"]
+                        print(f"SESSION: restored from DB for uid={row['uid']} (via reminder-users)")
+                finally:
+                    await conn.close()
+        except Exception as e:
+            print(f"[REMINDER-USERS] session restore error: {e}")
+    
+    if role != "admin":
         return {"error": "admin only"}
+    
     try:
         raw = await odoo_query(
             "res.users",
-            [["active", "=", True]],
-            ["id", "name", "login"],
+            [["active", "=", True], ["share", "=", False]],
+            ["id", "name"],
             limit=50
         )
         users = json.loads(raw) if isinstance(raw, str) else raw
         print(f"[REMINDER-USERS] raw count={len(users)}, names={[u.get('name') for u in users[:10]]}")
-        # Exclude OdooBot (uid=1) and portal/public users (login containing @-less or __system__)
         user_list = sorted(
-            [{"uid": u["id"], "name": u["name"]} for u in users 
-             if u["id"] not in (1, 3, 4, 5) and "__" not in (u.get("login") or "")],
+            [{"uid": u["id"], "name": u["name"]} for u in users if u["id"] not in (1,)],
             key=lambda u: u["name"]
         )
         return {"users": user_list}
