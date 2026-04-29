@@ -2342,6 +2342,25 @@ def get_system_prompt(role: str = "guest", user_name: str = "", user_id: int = 0
     tomorrow_str = tomorrow_la.strftime("%Y年%m月%d日")
     tomorrow_dow_cn = weekday_cn[tomorrow_la.weekday()]
     tomorrow_dow_en = weekday_names[tomorrow_la.weekday()]
+    
+    # v18.3.1: Pre-compute full week calendar so AI never miscounts weekdays
+    # This solves the persistent "周五 = 5月2日" off-by-one errors
+    week_lines = []
+    # Start from this Monday (or today if Monday)
+    days_since_monday = now_dt.weekday()  # 0=Mon, 1=Tue, ...
+    this_monday = today_la - datetime.timedelta(days=days_since_monday)
+    for i in range(14):  # This week + next week
+        d = this_monday + datetime.timedelta(days=i)
+        dcn = weekday_cn[d.weekday()]
+        den = weekday_names[d.weekday()]
+        label = ""
+        if d == today_la:
+            label = " ← 今天/TODAY"
+        elif d == tomorrow_la:
+            label = " ← 明天/TOMORROW"
+        prefix = "本周" if i < 7 else "下周"
+        week_lines.append(f"  {prefix}{dcn}({den}) = {d.strftime('%Y-%m-%d')} ({d.month}月{d.day}日){label}")
+    weekday_calendar = "\n".join(week_lines)
     perms = ROLE_PERMISSIONS.get(role, ROLE_PERMISSIONS["guest"])
 
     # Build permission-specific rules
@@ -2650,6 +2669,10 @@ COST/MARGIN RULES (NO ACCESS):
     if role == "admin" and free_mode:
         return f"""今天是{today}（{dow_cn}/{dow_en}），当前时间(洛杉矶): {now_la}。
 明天是{tomorrow_str}（{tomorrow_dow_cn}/{tomorrow_dow_en}）。
+
+📅 日期速查表 (NEVER count manually — use this table):
+{weekday_calendar}
+
 你是 Chumart AI，Chumart 管理员的专属私人助手。
 你支持中英文，用用户的语言回复。{memory_block}
 
@@ -2682,6 +2705,10 @@ COST/MARGIN RULES (NO ACCESS):
 
     return f"""今天是{today}（{dow_cn}/{dow_en}），当前时间(洛杉矶): {now_la}。
 明天是{tomorrow_str}（{tomorrow_dow_cn}/{tomorrow_dow_en}）。
+
+📅 日期速查表 (NEVER count manually — ALWAYS look up dates from this table):
+{weekday_calendar}
+
 You are Chumart Assistant, an enterprise AI assistant.
 You support both English and Chinese - reply in the same language the user uses.
 
