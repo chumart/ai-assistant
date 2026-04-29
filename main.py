@@ -515,66 +515,54 @@ def _fmt_la(dt_val: datetime.datetime) -> str:
     return dt_val.astimezone(LA_TZ).strftime("%Y-%m-%d %H:%M %Z")
 
 async def _get_user_contact(uid: int) -> dict:
-    """Find user's email + phone. Lookup priority:
-    1. PostgreSQL user_contacts table (manual override)
-    2. Odoo res.users.mobile_phone (Work Mobile in user profile)
-    3. Odoo res.partner.mobile / .phone (linked contact)
+    """Find user's email + phone from Odoo (single source of truth).
     
-    Phone numbers are stripped of common formatting (spaces, dashes, parens)
-    but should ideally be stored in E.164 format (+13105551234) for Twilio.
+    v18.3.1: 不再从 user_contacts 表拿号码。之前 AI 通过 set_my_contact 工具
+    可以覆盖号码，导致反复出错（存了别人号码、被 AI 误调等）。
+    现在跟 email 一样：只从 Odoo 拿，数据源唯一，AI 碰不到。
+    
+    Lookup:
+    1. Email: Odoo res.users.email / login
+    2. Phone: Odoo res.users.mobile_phone (Work Mobile)
+           → Odoo res.partner.mobile
+           → Odoo res.partner.phone
+    
+    Phone numbers are normalized to E.164 format for Twilio.
     """
     email = phone = None
-    source = "none"   # v18.2 DEBUG: which lookup step provided phone
-    conn = await get_db_conn()
-    if conn:
-        try:
-            row = await conn.fetchrow("SELECT email, phone FROM user_contacts WHERE uid=$1", uid)
-            if row:
-                email = row["email"] or None
-                phone = row["phone"] or None
-                if phone:
-                    source = "user_contacts_table"
-        except Exception as e:
-            print(f"get_user_contact DB error: {e}")
-        finally:
-            await conn.close()
-    if not email or not phone:
-        try:
-            users_r = json.loads(await odoo_query("res.users", [["id","=",uid]],
-                                                   ["login","email","partner_id","mobile_phone"], limit=1))
-            if isinstance(users_r, list) and users_r:
-                u = users_r[0]
-                if not email:
-                    email = u.get("email") or u.get("login")
-                # First check res.users.mobile_phone (Work Mobile field)
-                if not phone:
-                    phone = u.get("mobile_phone") or None
+    source = "none"
+    try:
+        users_r = json.loads(await odoo_query("res.users", [["id","=",uid]],
+                                               ["login","email","partner_id","mobile_phone"], limit=1))
+        if isinstance(users_r, list) and users_r:
+            u = users_r[0]
+            # Email from Odoo
+            email = u.get("email") or u.get("login")
+            # Phone: res.users.mobile_phone first
+            phone = u.get("mobile_phone") or None
+            if phone:
+                source = "res.users.mobile_phone"
+            # Fallback: res.partner.mobile / .phone
+            if not phone and u.get("partner_id"):
+                pid = u["partner_id"][0]
+                partners_r = json.loads(await odoo_query("res.partner", [["id","=",pid]],
+                                                         ["phone","mobile"], limit=1))
+                if isinstance(partners_r, list) and partners_r:
+                    p = partners_r[0]
+                    phone = p.get("mobile") or p.get("phone") or None
                     if phone:
-                        source = "res.users.mobile_phone"
-                # Then fallback to res.partner.mobile / .phone
-                if not phone and u.get("partner_id"):
-                    pid = u["partner_id"][0]
-                    partners_r = json.loads(await odoo_query("res.partner", [["id","=",pid]],
-                                                             ["phone","mobile"], limit=1))
-                    if isinstance(partners_r, list) and partners_r:
-                        p = partners_r[0]
-                        phone = p.get("mobile") or p.get("phone") or None
-                        if phone:
-                            source = f"res.partner.{('mobile' if p.get('mobile') else 'phone')}(pid={pid})"
-        except Exception as e:
-            print(f"get_user_contact Odoo error: {e}")
+                        source = f"res.partner.{('mobile' if p.get('mobile') else 'phone')}(pid={pid})"
+    except Exception as e:
+        print(f"get_user_contact Odoo error: {e}")
     
     # Normalize phone: strip common formatting that breaks Twilio
     if phone:
         phone = phone.strip().replace(" ", "").replace("-", "").replace("(", "").replace(")", "")
-        # If user wrote 10-digit US format without +1, prepend it
         if phone.isdigit() and len(phone) == 10:
             phone = "+1" + phone
-        # If user wrote 11-digit starting with 1, prepend +
         elif phone.isdigit() and len(phone) == 11 and phone.startswith("1"):
             phone = "+" + phone
     
-    # v18.2 DEBUG: 关键日志 — 谁问的、拿到什么、来源
     print(f"[CONTACT-DEBUG] _get_user_contact(uid={uid}) → email={email!r} phone={phone!r} source={source}")
     
     return {"email": email, "phone": phone}
@@ -2279,39 +2267,6 @@ TOOLS = [
             "type": "object",
             "properties": {"id": {"type": "integer"}},
             "required": ["id"]
-        }
-    },
-    {
-        "name": "set_my_contact",
-        "description": (
-            "Save the CURRENTLY-LOGGED-IN user's OWN email or phone for receiving notifications. "
-            "Phone must be E.164 format (e.g. +13105551234). Falls back to Odoo login email and "
-            "partner mobile if not set.\n"
-            "\n"
-            "🚨 WHEN TO CALL THIS TOOL — STRICT RULES:\n"
-            "✅ DO call when user EXPLICITLY says one of:\n"
-            "   - '我的电话/手机/邮箱是 X'\n"
-            "   - 'My phone/email is X'\n"
-            "   - '把我的电话改成 X' / 'change my phone to X'\n"
-            "   - 'set my phone to X'\n"
-            "\n"
-            "❌ DO NOT call when user says:\n"
-            "   - '打给 +1XXX' / 'call +1XXX' — that's a CALL TARGET, not the user's own number\n"
-            "   - '提醒 Ashley 在 +1XXX' — that's a third party's number\n"
-            "   - '把通知发给 +1XXX' — same, not the user themselves\n"
-            "   - Any phone number that appears to be someone else's (Ashley/Alex/customer/vendor)\n"
-            "\n"
-            "If unsure whether the number is the user's own, ASK first: '这是你自己的电话吗?'\n"
-            "Reminders ALWAYS go to the logged-in user's own contact info — they can't be sent\n"
-            "to arbitrary numbers. To send to someone else, that person must log in and set their own contact."
-        ),
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "email": {"type": "string"},
-                "phone": {"type": "string", "description": "E.164 format, e.g. +13105551234. MUST be the user's OWN phone, not a target/third-party number."}
-            },
-            "required": []
         }
     },
     {
@@ -6966,7 +6921,7 @@ async def run_tool(name, inp, context=None):
         if "email" in channels and not contact["email"]:
             missing.append("email")
         if ("sms" in channels or "call" in channels) and not contact["phone"]:
-            missing.append("phone (set via set_my_contact or Odoo partner mobile)")
+            missing.append("phone (set in Odoo: Settings → Users → Work Mobile)")
         if missing:
             return json.dumps({"error": f"missing contact info: {', '.join(missing)}"})
         conn = await get_db_conn()
@@ -7181,29 +7136,9 @@ async def run_tool(name, inp, context=None):
         finally:
             await conn.close()
 
-    if name == "set_my_contact":
-        uid = ctx.get("uid", 0)
-        if not uid:
-            return json.dumps({"error": "user not authenticated"})
-        email = (inp.get("email") or "").strip() or None
-        phone = (inp.get("phone") or "").strip() or None
-        if not email and not phone:
-            return json.dumps({"error": "provide at least one of: email, phone"})
-        if phone and not phone.startswith("+"):
-            return json.dumps({"error": "phone must be E.164 format starting with +, e.g. +13105551234"})
-        conn = await get_db_conn()
-        if not conn:
-            return json.dumps({"error": "database unavailable"})
-        try:
-            await conn.execute("""
-                INSERT INTO user_contacts (uid, email, phone, updated_at) VALUES ($1, $2, $3, NOW())
-                ON CONFLICT (uid) DO UPDATE SET
-                    email = COALESCE(EXCLUDED.email, user_contacts.email),
-                    phone = COALESCE(EXCLUDED.phone, user_contacts.phone), updated_at = NOW()
-            """, uid, email, phone)
-            return json.dumps({"ok": True, "email": email, "phone": phone, "message": "Contact preferences saved."})
-        finally:
-            await conn.close()
+    # set_my_contact removed in v18.3.1 — phone/email now sourced exclusively from Odoo.
+    # User contacts table (user_contacts) is no longer used for phone lookup.
+    # To change phone: go to Odoo → Settings → Users → Work Mobile field.
 
     if name == "db_query_admin":
         # v18.3: admin-only read-only DB query for diagnostics.
@@ -8991,7 +8926,6 @@ TOOL_PROGRESS_LABELS_ZH = {
     "list_events":                 "📅 正在查询日程...",
     "create_event":                "📅 正在创建日程...",
     "delete_event":                "🗑 正在删除日程...",
-    "set_my_contact":              "📇 正在更新联系方式...",
     "odoo_query":                  "🔍 正在查询 Odoo 数据...",
     "odoo_query_count":            "🔢 正在统计...",
     "odoo_search":                 "🔍 正在搜索 Odoo 数据...",
@@ -9030,7 +8964,6 @@ TOOL_PROGRESS_LABELS_EN = {
     "list_events":                 "📅 Fetching events...",
     "create_event":                "📅 Creating event...",
     "delete_event":                "🗑 Deleting event...",
-    "set_my_contact":              "📇 Updating contact...",
     "odoo_query":                  "🔍 Querying Odoo...",
     "odoo_query_count":            "🔢 Counting records...",
     "odoo_search":                 "🔍 Searching Odoo...",
