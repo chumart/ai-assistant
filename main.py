@@ -2376,7 +2376,7 @@ TOOLS = [
     }
 ]
 
-def get_system_prompt(role: str = "guest", user_name: str = "", user_id: int = 0, free_mode: bool = False, memories: list = []):
+def get_system_prompt(role: str = "guest", user_name: str = "", user_id: int = 0, free_mode: bool = False, memories: list = [], user_timezone: str = ""):
     now_dt = datetime.datetime.now(LA_TZ)
     today_la = now_dt.date()
     today = today_la.strftime("%Y年%m月%d日")
@@ -2390,6 +2390,28 @@ def get_system_prompt(role: str = "guest", user_name: str = "", user_id: int = 0
     tomorrow_str = tomorrow_la.strftime("%Y年%m月%d日")
     tomorrow_dow_cn = weekday_cn[tomorrow_la.weekday()]
     tomorrow_dow_en = weekday_names[tomorrow_la.weekday()]
+    
+    # v18.3.1: Timezone awareness
+    # If user is in a different timezone, compute their local time and offset
+    tz_note = ""
+    if user_timezone and user_timezone != "America/Los_Angeles":
+        try:
+            import zoneinfo
+            user_tz = zoneinfo.ZoneInfo(user_timezone)
+            user_now = datetime.datetime.now(user_tz)
+            user_time_str = user_now.strftime("%H:%M")
+            la_time_str = now_dt.strftime("%H:%M")
+            offset_hours = (user_now.utcoffset().total_seconds() - now_dt.utcoffset().total_seconds()) / 3600
+            sign = "+" if offset_hours >= 0 else ""
+            tz_note = (
+                f"\n⚠️ TIMEZONE: User is in {user_timezone} (their local time: {user_time_str}, "
+                f"LA time: {la_time_str}, offset: {sign}{offset_hours:.0f}h). "
+                f"When user says a time like '3pm', they mean {user_timezone} time. "
+                f"CONVERT to LA time before passing to create_reminder fire_at. "
+                f"Example: if user says '3pm' and offset is +3h, fire_at should be 12:00 (noon LA)."
+            )
+        except Exception:
+            pass  # If timezone parsing fails, skip — default to LA
     
     # v18.3.1: Pre-compute full week calendar so AI never miscounts weekdays
     # This solves the persistent "周五 = 5月2日" off-by-one errors
@@ -2720,6 +2742,7 @@ COST/MARGIN RULES (NO ACCESS):
 
 📅 日期速查表 (NEVER count manually — use this table):
 {weekday_calendar}
+{tz_note}
 
 你是 Chumart AI，Chumart 管理员的专属私人助手。
 你支持中英文，用用户的语言回复。{memory_block}
@@ -2756,6 +2779,7 @@ COST/MARGIN RULES (NO ACCESS):
 
 📅 日期速查表 (NEVER count manually — ALWAYS look up dates from this table):
 {weekday_calendar}
+{tz_note}
 
 You are Chumart Assistant, an enterprise AI assistant.
 You support both English and Chinese - reply in the same language the user uses.
@@ -8000,6 +8024,7 @@ class ChatRequest(BaseModel):
     session_id: str = ""
     session_title: str = ""
     session_token: str = ""   # Server-side session token for role verification
+    user_timezone: str = ""   # e.g. "America/New_York" — from browser Intl API
 
 def resolve_session(req: ChatRequest) -> dict:
     """Resolve uid/role from server-side session token.
@@ -8148,7 +8173,7 @@ async def chat(req: ChatRequest, background_tasks: BackgroundTasks):
     else:
         selected_model = default_model
 
-    system_prompt = get_system_prompt(verified_role, verified_name, verified_uid, req.free_mode, memories)
+    system_prompt = get_system_prompt(verified_role, verified_name, verified_uid, req.free_mode, memories, getattr(req, "user_timezone", ""))
     tool_context = {"uid": verified_uid, "username": verified_name, "role": verified_role}
 
     # Route to OpenAI if selected
@@ -8364,7 +8389,7 @@ async def chat_stream(req: ChatRequest, background_tasks: BackgroundTasks):
     if selected_model in OPENAI_MODELS:
         # OpenAI streaming path with tool-call support
         openai_key = os.getenv("OPENAI_API_KEY", "")
-        system_prompt = get_system_prompt(verified_role, verified_name, verified_uid, req.free_mode, memories)
+        system_prompt = get_system_prompt(verified_role, verified_name, verified_uid, req.free_mode, memories, getattr(req, "user_timezone", ""))
 
         # Build OpenAI-format messages
         if has_file and cached_file:
@@ -8550,7 +8575,7 @@ async def chat_stream(req: ChatRequest, background_tasks: BackgroundTasks):
         })
 
     # Anthropic streaming path
-    system_prompt = get_system_prompt(verified_role, verified_name, verified_uid, req.free_mode, memories)
+    system_prompt = get_system_prompt(verified_role, verified_name, verified_uid, req.free_mode, memories, getattr(req, "user_timezone", ""))
     headers = {
         "x-api-key": ANTHROPIC_KEY,
         "anthropic-version": "2023-06-01",
