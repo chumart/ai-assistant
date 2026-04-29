@@ -6265,13 +6265,31 @@ async def run_tool(name, inp, context=None):
         try:
             cookies = await odoo_get_session()
 
-            # Step 1: Find the SO
+            # Step 1: Find the SO (exact match first, then fallback to ilike)
             so_r = json.loads(await odoo_query("sale.order",
                 [["name", "=", so_name], ["company_id", "=", 1]],
                 ["id", "name", "partner_id", "amount_total", "state", "invoice_status", "invoice_ids"],
                 limit=1, cookies=cookies))
             if not isinstance(so_r, list) or not so_r:
-                return json.dumps({"error": f"SO '{so_name}' not found"})
+                # Fallback: try ilike search (handles #CMT1765, cmt1765, etc.)
+                so_r = json.loads(await odoo_query("sale.order",
+                    [["name", "ilike", so_name], ["company_id", "=", 1]],
+                    ["id", "name", "partner_id", "amount_total", "state", "invoice_status", "invoice_ids"],
+                    limit=5, cookies=cookies))
+                if isinstance(so_r, list) and so_r:
+                    print(f"[INVOICE-DEBUG] exact match failed for '{so_name}', ilike found: {[s.get('name') for s in so_r]}")
+                    so_r = [so_r[0]]  # take first match
+                else:
+                    # Last resort: search without company filter
+                    so_r2 = json.loads(await odoo_query("sale.order",
+                        [["name", "ilike", so_name]],
+                        ["id", "name", "company_id"],
+                        limit=3, cookies=cookies))
+                    if isinstance(so_r2, list) and so_r2:
+                        print(f"[INVOICE-DEBUG] SO '{so_name}' found in different company: {[(s.get('name'), s.get('company_id')) for s in so_r2]}")
+                        return json.dumps({"error": f"SO '{so_name}' not found in company 1, but exists in company {so_r2[0].get('company_id')}"})
+                    print(f"[INVOICE-DEBUG] SO '{so_name}' not found anywhere")
+                    return json.dumps({"error": f"SO '{so_name}' not found"})
             so = so_r[0]
 
             # Check SO state
