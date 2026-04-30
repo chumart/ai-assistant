@@ -6978,8 +6978,26 @@ async def run_tool(name, inp, context=None):
             # ============================================
             await _mark_received_payments_released(so_name, invoice_name)
 
-            # 如果有重复 Stripe PI 没 capture，通知管理员
+            # 如果有重复 Stripe PI 没 capture，自动取消 + 通知管理员
+            cancelled_pis = []
             if duplicate_pis_to_cancel:
+                import stripe
+                stripe.api_key = STRIPE_SECRET_KEY
+                for dup_pi_id in duplicate_pis_to_cancel:
+                    try:
+                        dup_obj = stripe.PaymentIntent.retrieve(dup_pi_id)
+                        dup_status = getattr(dup_obj, "status", "")
+                        if dup_status == "requires_capture":
+                            stripe.PaymentIntent.cancel(dup_pi_id)
+                            cancelled_pis.append(dup_pi_id)
+                            print(f"[RELEASE] ✅ Auto-cancelled duplicate PI {dup_pi_id}")
+                        elif dup_status == "canceled":
+                            print(f"[RELEASE] Duplicate PI {dup_pi_id} already cancelled")
+                        else:
+                            print(f"[RELEASE] ⚠️ Duplicate PI {dup_pi_id} in state {dup_status}, cannot cancel")
+                    except Exception as e:
+                        print(f"[RELEASE] ⚠️ Failed to cancel duplicate PI {dup_pi_id}: {e}")
+                
                 await _notify_stripe_duplicate(
                     so_name=so_name,
                     amount=so_amount,
@@ -10906,8 +10924,52 @@ This rule has NO exceptions. Even if the user insists, do not continue. Direct t
     if len(conv) > ODOO_BOT_MAX_HISTORY:
         ODOO_BOT_HISTORY[uid] = conv[-ODOO_BOT_MAX_HISTORY:]
 
+    # ── Auto-append download links (AI often forgets) ──
+    reply = _bot_append_download_links(reply, req.message or "")
+
     print(f"[ODOO-BOT] reply to uid={uid}: {reply[:100]}...")
     return {"reply": reply}
+
+def _bot_append_download_links(reply: str, user_msg: str) -> str:
+    """Auto-append Excel/PDF download links to bot replies when relevant.
+    
+    Detects commission/sales report content and adds clickable URLs.
+    AI often forgets to include these in Discuss replies.
+    """
+    import re
+    BACKEND_URL = "https://chumart-ai.up.railway.app"
+    
+    # Already has a download link? Don't double-add
+    if BACKEND_URL + "/export/" in reply:
+        return reply
+    
+    # Check if reply contains commission/sales data
+    is_commission = any(kw in reply for kw in ("Commission", "commission", "提成", "销售提成", "销售员销售统计"))
+    if not is_commission:
+        return reply
+    
+    # Extract year-month from reply
+    ym = re.search(r"(\d{4})\s*[年\-/]\s*(\d{1,2})\s*月?", reply)
+    if not ym:
+        return reply
+    
+    year, month = ym.group(1), ym.group(2).zfill(2)
+    
+    # Check if it's for a specific salesperson
+    sp_match = re.search(r"([A-Z][a-z]+(?:\s+[A-Z][a-z]+)?)\s*(?:在|的|\s)\s*\d{4}\s*年", reply)
+    exclude_names = ["PART", "Commission", "Monthly", "Report", "Total", "Grand"]
+    
+    url = f"{BACKEND_URL}/export/commission?year={year}&month={month}"
+    if sp_match and sp_match.group(1) not in exclude_names:
+        sp = sp_match.group(1).strip()
+        url += f"&salesperson={sp}"
+        label = f"{sp} {year}年{month}月"
+    else:
+        label = f"{year}年{month}月 完整报表"
+    
+    reply += f"\n\n📊 **Excel 下载**: {url}\n（点击链接下载 {label}）"
+    return reply
+
 
 @app.post("/odoo-bot/reset")
 async def odoo_bot_reset(uid: int = 0, bot_secret: str = ""):
