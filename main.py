@@ -8149,11 +8149,11 @@ async def chat(req: ChatRequest, background_tasks: BackgroundTasks):
     verified_name = sess["user_name"]
     perms = ROLE_PERMISSIONS.get(verified_role, ROLE_PERMISSIONS["guest"])
     print(f"[PERM] endpoint=/chat or /chat/stream uid={verified_uid} role={verified_role} can_release_so={perms.get('can_release_so')} can_write_odoo={perms.get('can_write_odoo')} can_see_finance={perms.get('can_see_finance')}")
+    user_lang = _detect_user_language(req.message or "")
 
     # ── Short-circuit: deny release intent for roles without permission ──
     if not perms.get("can_release_so") and _is_release_intent(req.message or ""):
         print(f"[PERM-SHORTCIRCUIT] role={verified_role} blocked release intent: {req.message[:80]}")
-        user_lang = _detect_user_language(req.message or "")
         if user_lang == "zh":
             denial_msg = "❌ 抱歉,你的角色无权进行 release 或开票操作。请联系 Sales Manager、Finance 或 Admin 处理。"
         else:
@@ -8228,6 +8228,8 @@ async def chat(req: ChatRequest, background_tasks: BackgroundTasks):
         selected_model = default_model
 
     system_prompt = get_system_prompt(verified_role, verified_name, verified_uid, req.free_mode, memories, getattr(req, "user_timezone", ""))
+    if user_lang == "en":
+        system_prompt += "\n\n🗣️ LANGUAGE: The user is writing in English. Reply in English."
     tool_context = {"uid": verified_uid, "username": verified_name, "role": verified_role}
 
     # Route to OpenAI if selected
@@ -8367,10 +8369,11 @@ async def chat_stream(req: ChatRequest, background_tasks: BackgroundTasks):
     perms = ROLE_PERMISSIONS.get(verified_role, ROLE_PERMISSIONS["guest"])
     print(f"[PERM] endpoint=/chat or /chat/stream uid={verified_uid} role={verified_role} can_release_so={perms.get('can_release_so')} can_write_odoo={perms.get('can_write_odoo')} can_see_finance={perms.get('can_see_finance')}")
 
+    user_lang = _detect_user_language(req.message or "")
+
     # ── Short-circuit: deny release intent for roles without permission ──
     if not perms.get("can_release_so") and _is_release_intent(req.message or ""):
         print(f"[PERM-SHORTCIRCUIT] role={verified_role} blocked release intent: {req.message[:80]}")
-        user_lang = _detect_user_language(req.message or "")
         if user_lang == "zh":
             denial_msg = "❌ 抱歉,你的角色无权进行 release 或开票操作。请联系 Sales Manager、Finance 或 Admin 处理。"
         else:
@@ -8448,6 +8451,8 @@ async def chat_stream(req: ChatRequest, background_tasks: BackgroundTasks):
         # OpenAI streaming path with tool-call support
         openai_key = os.getenv("OPENAI_API_KEY", "")
         system_prompt = get_system_prompt(verified_role, verified_name, verified_uid, req.free_mode, memories, getattr(req, "user_timezone", ""))
+        if user_lang == "en":
+            system_prompt += "\n\n🗣️ LANGUAGE: The user is writing in English. Reply in English."
 
         # Build OpenAI-format messages
         if has_file and cached_file:
@@ -8634,6 +8639,8 @@ async def chat_stream(req: ChatRequest, background_tasks: BackgroundTasks):
 
     # Anthropic streaming path
     system_prompt = get_system_prompt(verified_role, verified_name, verified_uid, req.free_mode, memories, getattr(req, "user_timezone", ""))
+    if user_lang == "en":
+        system_prompt += "\n\n🗣️ LANGUAGE: The user is writing in English. Reply in English."
     headers = {
         "x-api-key": ANTHROPIC_KEY,
         "anthropic-version": "2023-06-01",
@@ -10841,6 +10848,8 @@ Instead, reply in this format (adjust language to match user):
 
 This rule has NO exceptions. Even if the user insists, do not continue. Direct them to Admin.
 """
+    if user_lang == "en":
+        system_prompt += "\n\n🗣️ LANGUAGE: The user is writing in English. Reply in English."
 
     # Call Claude — Sonnet for admin/finance (better reasoning for reminders/invoicing),
     # Haiku for others (faster, cheaper).
