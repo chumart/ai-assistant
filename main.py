@@ -8241,9 +8241,10 @@ async def chat(req: ChatRequest, background_tasks: BackgroundTasks):
             oai_messages = messages
         # v18: Force tool_choice if release/reminder intent detected
         # v18.1: 也支持 reminder 上下文里的短追加指令 (e.g. "改成电话")
-        force_tool_oai = _should_force_write_tool(req.message or "", oai_messages)
+        # v19.1: 也支持实时数据查询 (e.g. printer status)
+        force_tool_oai = _should_force_write_tool(req.message or "", oai_messages) or _is_live_data_query(req.message or "")
         if force_tool_oai:
-            print(f"[FORCE_TOOL] /chat openai: detected write intent, forcing tool_choice=required")
+            print(f"[FORCE_TOOL] /chat openai: detected write/live intent, forcing tool_choice=required")
         reply = await chat_openai(oai_messages, system_prompt, selected_model, allowed_tools,
                                    context=tool_context, force_tool_first=force_tool_oai)
     else:
@@ -8252,9 +8253,10 @@ async def chat(req: ChatRequest, background_tasks: BackgroundTasks):
         # — defends against pattern-completion hallucination where the model
         # generates fake "✅ done" text without actually calling the tool.
         # v18.1: 也支持 reminder 上下文里的短追加指令
-        force_tool = _should_force_write_tool(req.message or "", messages)
+        # v19.1: 也支持实时数据查询 (printer status 等)
+        force_tool = _should_force_write_tool(req.message or "", messages) or _is_live_data_query(req.message or "")
         if force_tool:
-            print(f"[FORCE_TOOL] /chat anthropic: detected write intent, forcing tool_choice=any")
+            print(f"[FORCE_TOOL] /chat anthropic: detected write/live intent, forcing tool_choice=any")
         
         async with httpx.AsyncClient(timeout=300) as c:
             current_messages = list(messages)
@@ -8475,9 +8477,10 @@ async def chat_stream(req: ChatRequest, background_tasks: BackgroundTasks):
             
             # v18: Force tool_choice if release/reminder intent detected
             # v18.1: 也支持 reminder 上下文里的短追加指令
-            force_tool_oai_stream = _should_force_write_tool(req.message or "", oai_messages_input)
+            # v19.1: 也支持实时数据查询
+            force_tool_oai_stream = _should_force_write_tool(req.message or "", oai_messages_input) or _is_live_data_query(req.message or "")
             if force_tool_oai_stream:
-                print(f"[FORCE_TOOL] /chat/stream openai: detected write intent, forcing tool_choice=required")
+                print(f"[FORCE_TOOL] /chat/stream openai: detected write/live intent, forcing tool_choice=required")
 
             try:
                 for iteration in range(8):
@@ -8649,9 +8652,10 @@ async def chat_stream(req: ChatRequest, background_tasks: BackgroundTasks):
     
     # v18: Force tool_choice if release/reminder intent detected
     # v18.1: 也支持 reminder 上下文里的短追加指令
-    force_tool_stream = _should_force_write_tool(req.message or "", messages)
+    # v19.1: 也支持实时数据查询
+    force_tool_stream = _should_force_write_tool(req.message or "", messages) or _is_live_data_query(req.message or "")
     if force_tool_stream:
-        print(f"[FORCE_TOOL] /chat/stream anthropic: detected write intent, forcing tool_choice=any")
+        print(f"[FORCE_TOOL] /chat/stream anthropic: detected write/live intent, forcing tool_choice=any")
 
     async def claude_stream():
         current_messages = list(messages)
@@ -9911,6 +9915,33 @@ def _has_full_reminder_info(text: str) -> bool:
     return len(text.strip()) >= 6
 
 
+def _is_live_data_query(text: str) -> bool:
+    """检测是否为必须调用工具获取实时数据的查询（不能从历史模式补全）。
+    
+    例如: "查看我的printer", "list printers", "打印机状态"
+    这些查询的结果是动态的（打印机可能上线/下线），AI 不能从历史中复制旧结果。
+    
+    返回 True → 必须 force tool_choice=any，确保 AI 真正调用工具。
+    """
+    if not text:
+        return False
+    t = text.lower().strip()
+    
+    # Printer listing queries — status changes dynamically
+    # Note: "print invoice" / "打印发票" is a release action, NOT a printer query.
+    # We only match when the user is asking ABOUT printers (not asking to print something).
+    printer_query_patterns = [
+        "printer",         # "查看我的printer", "list printers", "my printer"
+        "printers",        # "what printers", "show printers"
+        "打印机",          # "打印机状态", "哪些打印机", "查看打印机"
+        "list_printers",   # direct tool name
+    ]
+    if any(kw in t for kw in printer_query_patterns):
+        return True
+    
+    return False
+
+
 def _should_force_write_tool(text: str, recent_messages: list = None) -> bool:
     """统一判断是否应该 force tool_choice (写意图防幻觉)。
     
@@ -10879,9 +10910,12 @@ This rule has NO exceptions. Even if the user insists, do not continue. Direct t
             # actually calling create_reminder when the conversation history shows
             # several previous successful reminders)
             # v18.1: 也支持 reminder 上下文里的短追加指令 (e.g. "改成电话")
-            force_tool_bot = _should_force_write_tool(msg, conv)
+            # v19.1: 也支持实时数据查询 (e.g. "查看我的printer" — 打印机状态是动态的,
+            #        AI 不能从历史模式补全旧数据)
+            force_tool_bot = _should_force_write_tool(msg, conv) or _is_live_data_query(msg)
             if force_tool_bot:
-                print(f"[FORCE_TOOL] /odoo-bot: detected write intent, forcing tool_choice=any")
+                reason = "live data query" if _is_live_data_query(msg) else "write intent"
+                print(f"[FORCE_TOOL] /odoo-bot: detected {reason}, forcing tool_choice=any")
             
             for iteration in range(8):  # max tool iterations
                 payload = {
