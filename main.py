@@ -1757,6 +1757,241 @@ async def missing_tax(year: int, month: int):
                 "tax":r.get("amount_tax",0),"total":r.get("amount_total",0),
                 "payment_state":r.get("payment_state","")} for r in records]}
 
+
+@app.get("/report/incoming-products")
+async def incoming_products(days: int = 30, brand: str = ""):
+    """30天内即将到货的产品（基于已确认 PO 的 date_planned）。
+    
+    逻辑：
+    1. 查所有 state=purchase (已确认) 的 PO，排除 cancel/done/draft
+    2. 查这些 PO 的 lines，筛选 date_planned 在今天 ~ 今天+N天
+    3. 补充产品信息（SKU、库存）
+    4. 按到货日期排序，分品牌汇总
+    
+    参数:
+    - days: 查未来多少天（默认30）
+    - brand: 可选品牌过滤（如 "Polarman", "Flamaster"）
+    """
+    now_la = datetime.datetime.now(LA_TZ)
+    today_str = now_la.strftime("%Y-%m-%d")
+    cutoff_date = (now_la + datetime.timedelta(days=days)).strftime("%Y-%m-%d")
+
+    # Step 1: 查已确认的 PO（state = purchase, not done/cancel）
+    po_result = json.loads(await odoo_query(
+        "purchase.order",
+        [
+            ["state", "=", "purchase"],
+            ["company_id", "=", 1],
+        ],
+        ["id", "name", "partner_id", "date_order", "date_planned"],
+        limit=500,
+        order="date_planned asc"
+    ))
+    if isinstance(po_result, dict) and "error" in po_result:
+        return po_result
+    if not po_result:
+        return {
+            "report_type": "Incoming Products",
+            "period": f"{today_str} ~ {cutoff_date}",
+            "days": days,
+            "total_products": 0,
+            "products": [],
+            "by_vendor": {},
+            "note": "No confirmed POs found"
+        }
+    
+    po_ids = [po["id"] for po in po_result]
+    # Build PO lookup
+    po_map = {}
+    for po in po_result:
+        po_map[po["id"]] = {
+            "po_name": po.get("name", ""),
+            "vendor": po["partner_id"][1] if po.get("partner_id") else "Unknown",
+            "vendor_id": po["partner_id"][0] if po.get("partner_id") else 0,
+            "date_order": po.get("date_order", ""),
+            "date_planned": po.get("date_planned", ""),
+        }
+
+    # Step 2: 查 PO lines，筛选 date_planned 在窗口内
+    # date_planned 在 PO line 上是预计到货日期
+    pol_result = json.loads(await odoo_query(
+        "purchase.order.line",
+        [
+            ["order_id", "in", po_ids],
+            ["date_planned", ">=", today_str + " 00:00:00"],
+            ["date_planned", "<=", cutoff_date + " 23:59:59"],
+        ],
+        [
+            "id", "order_id", "product_id", "product_qty",
+            "qty_received", "price_unit", "date_planned",
+        ],
+        limit=2000,
+        order="date_planned asc"
+    ))
+    if isinstance(pol_result, dict) and "error" in pol_result:
+        return pol_result
+
+    # 过滤掉已完全收货的行
+    pending_lines = []
+    for ln in pol_result:
+        qty_ordered = ln.get("product_qty", 0) or 0
+        qty_received = ln.get("qty_received", 0) or 0
+        if qty_ordered > qty_received:
+            ln["_qty_pending"] = qty_ordered - qty_received
+            pending_lines.append(ln)
+
+    if not pending_lines:
+        return {
+            "report_type": "Incoming Products",
+            "period": f"{today_str} ~ {cutoff_date}",
+            "days": days,
+            "total_products": 0,
+            "products": [],
+            "by_vendor": {},
+            "note": "All PO lines in this period have been fully received"
+        }
+
+    # Step 3: 补充产品信息（SKU、名称、当前库存）
+    product_ids = list({ln["product_id"][0] for ln in pending_lines if ln.get("product_id")})
+    prod_map = {}
+    if product_ids:
+        # 分批查（每批200）
+        for i in range(0, len(product_ids), 200):
+            batch = product_ids[i:i+200]
+            prod_r = json.loads(await odoo_query(
+                "product.product",
+                [["id", "in", batch]],
+                ["id", "default_code", "name", "qty_available", "list_price"],
+                limit=len(batch) + 10
+            ))
+            if isinstance(prod_r, list):
+                for p in prod_r:
+                    prod_map[p["id"]] = {
+                        "sku": p.get("default_code") or "",
+                        "name": p.get("name") or "",
+                        "current_stock": p.get("qty_available", 0),
+                        "list_price": p.get("list_price", 0),
+                    }
+
+    # Step 4: 组装结果
+    products = []
+    by_vendor = {}  # vendor_name -> { total_items, total_value, lines }
+    brand_lower = brand.lower().strip() if brand else ""
+
+    # 品牌前缀映射（根据 SKU 前缀判断品牌）
+    BRAND_PREFIXES = {
+        "polarman": ["PLM-", "PLM"],
+        "flamaster": ["FLM-", "FLM"],
+        "chefasst": ["CA-", "CA"],
+        "thunder group": ["?"  ],  # Thunder Group SKU 无固定前缀,用名称匹配
+        "winco": ["?"],
+        "omcan": ["?"],
+    }
+
+    for ln in pending_lines:
+        pid = ln["product_id"][0] if ln.get("product_id") else None
+        po_id = ln["order_id"][0] if ln.get("order_id") else None
+        prod = prod_map.get(pid, {})
+        po_info = po_map.get(po_id, {})
+        sku = prod.get("sku", "")
+        pname = prod.get("name", "")
+
+        # 品牌过滤
+        if brand_lower:
+            matched = False
+            prefixes = BRAND_PREFIXES.get(brand_lower, [])
+            for pfx in prefixes:
+                if pfx != "?" and sku.upper().startswith(pfx.upper()):
+                    matched = True
+                    break
+            # 也按名称匹配（覆盖无固定前缀的品牌）
+            if not matched and brand_lower in pname.lower():
+                matched = True
+            if not matched and brand_lower in sku.lower():
+                matched = True
+            if not matched:
+                continue
+
+        # 解析 date_planned
+        dp_raw = ln.get("date_planned", "")
+        if dp_raw:
+            try:
+                dp_dt = datetime.datetime.fromisoformat(str(dp_raw).replace("Z", "+00:00"))
+                dp_la = dp_dt.astimezone(LA_TZ)
+                eta_str = dp_la.strftime("%Y-%m-%d")
+                days_until = (dp_la.date() - now_la.date()).days
+            except Exception:
+                eta_str = str(dp_raw)[:10]
+                days_until = None
+        else:
+            eta_str = ""
+            days_until = None
+
+        row = {
+            "sku": sku,
+            "product_name": pname,
+            "qty_ordered": ln.get("product_qty", 0),
+            "qty_received": ln.get("qty_received", 0),
+            "qty_pending": ln["_qty_pending"],
+            "unit_cost": ln.get("price_unit", 0),
+            "eta": eta_str,
+            "days_until_arrival": days_until,
+            "current_stock": prod.get("current_stock", 0),
+            "list_price": prod.get("list_price", 0),
+            "po_name": po_info.get("po_name", ""),
+            "vendor": po_info.get("vendor", ""),
+        }
+        products.append(row)
+
+        # 按 vendor 汇总
+        vname = po_info.get("vendor", "Unknown")
+        vgroup = by_vendor.setdefault(vname, {"total_items": 0, "total_qty": 0, "total_value": 0, "po_names": set()})
+        vgroup["total_items"] += 1
+        vgroup["total_qty"] += ln["_qty_pending"]
+        vgroup["total_value"] += ln["_qty_pending"] * (ln.get("price_unit", 0) or 0)
+        vgroup["po_names"].add(po_info.get("po_name", ""))
+
+    # 排序: 最快到的在最前面
+    products.sort(key=lambda x: (x["eta"] or "9999", x["sku"]))
+
+    # Serialize vendor sets
+    vendor_summary = {}
+    for vname, vdata in by_vendor.items():
+        vendor_summary[vname] = {
+            "total_line_items": vdata["total_items"],
+            "total_qty_pending": vdata["total_qty"],
+            "total_value": round(vdata["total_value"], 2),
+            "po_names": sorted(vdata["po_names"]),
+        }
+
+    # 品牌检测 (auto-detect from SKU for summary)
+    by_brand = {}
+    for p in products:
+        sku_up = (p["sku"] or "").upper()
+        if sku_up.startswith("PLM"):
+            b = "Polarman"
+        elif sku_up.startswith("FLM"):
+            b = "Flamaster"
+        elif sku_up.startswith("CA-"):
+            b = "ChefAsst"
+        else:
+            b = "Other"
+        bg = by_brand.setdefault(b, {"count": 0, "total_qty": 0})
+        bg["count"] += 1
+        bg["total_qty"] += p["qty_pending"]
+
+    return {
+        "report_type": "Incoming Products",
+        "period": f"{today_str} ~ {cutoff_date}",
+        "days": days,
+        "brand_filter": brand or "(all)",
+        "total_products": len(products),
+        "by_brand": by_brand,
+        "by_vendor": vendor_summary,
+        "products": products,
+    }
+
+
 # ─────────────────────────────────────────────
 # Tools
 # ─────────────────────────────────────────────
@@ -2040,7 +2275,18 @@ TOOLS = [
         }
     },
     {
-        "name": "odoo_create_invoice_from_so",
+        "name": "get_incoming_products",
+        "description": "Get products arriving soon from confirmed Purchase Orders (ETA within N days). Returns each product's SKU, name, pending qty, ETA date, current stock, PO number, and vendor. Grouped by vendor and brand. Use when user asks '哪些产品快到了', 'what's coming in', '即将到货', 'incoming shipments', 'arriving soon', '到货预报'. This is a read-only API call — no AI involved, 100% accurate from Odoo data.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "days": {"type": "integer", "default": 30, "description": "Look ahead window in days (default 30). E.g. 7 = next week, 30 = next month, 60 = next 2 months."},
+                "brand": {"type": "string", "default": "", "description": "Optional brand filter: 'Polarman', 'Flamaster', 'ChefAsst', etc. Empty = all brands."}
+            },
+            "required": []
+        }
+    },
+    {
         "description": "Create an invoice from a Sales Order. USE THIS when user says 'release S04100', 'create invoice for CMT12345', '给这个订单开票'. For Shopify (#CMT) and Amazon (AMZ) orders, the SO existing in Odoo means payment is confirmed — can proceed directly. For normal orders (S-prefix), require explicit payment confirmation first. Returns the created invoice ID and name.",
         "input_schema": {
             "type": "object",
@@ -2726,7 +2972,11 @@ COST/MARGIN RULES (NO ACCESS):
 
     inventory_rules = ""
     if perms["can_see_inventory"]:
-        inventory_rules = "INVENTORY: Can query stock.quant and view inventory levels."
+        inventory_rules = """INVENTORY: Can query stock.quant and view inventory levels.
+INCOMING PRODUCTS: When user asks '哪些产品快到了', 'what's coming in', '即将到货', 'incoming shipments', '到货预报', '快到了吗', 'arriving soon' — call get_incoming_products(days=30).
+  - Adjust days if user specifies: '下周到的' → days=7, '两个月内' → days=60
+  - Can filter by brand: get_incoming_products(brand='Polarman')
+  - Results are directly from Odoo PO data, 100% accurate"""
     else:
         inventory_rules = "INVENTORY: No access to inventory data."
 
@@ -6198,6 +6448,22 @@ async def run_tool(name, inp, context=None):
             import traceback; traceback.print_exc()
             return json.dumps({"error": f"Restock analysis failed: {str(e)}"})
 
+    if name == "get_incoming_products":
+        days = inp.get("days", 30)
+        brand = inp.get("brand", "")
+        try:
+            result = await incoming_products(days=days, brand=brand)
+            # Strip cost data for roles without can_see_cost
+            role_perms = ROLE_PERMISSIONS.get(role, ROLE_PERMISSIONS["guest"])
+            if not role_perms.get("can_see_cost"):
+                for p in result.get("products", []):
+                    p.pop("unit_cost", None)
+                for v in result.get("by_vendor", {}).values():
+                    v.pop("total_value", None)
+            return json.dumps(result, default=str, ensure_ascii=False)
+        except Exception as e:
+            return json.dumps({"error": f"Incoming products query failed: {str(e)}"})
+
     if name == "search_documents":
         conn = await get_db_conn()
         if not conn:
@@ -9565,6 +9831,7 @@ TOOL_PROGRESS_LABELS_ZH = {
     "odoo_check_stock":            "📦 正在查库存...",
     "odoo_recent_sales":           "💰 正在查最近销售...",
     "odoo_restock_analysis":       "📦 正在分析补货...",
+    "get_incoming_products":       "🚚 正在查即将到货产品...",
     "odoo_create_record":          "✏️ 正在创建记录...",
     "odoo_update_record":          "✏️ 正在更新记录...",
     "odoo_add_order_line":         "➕ 正在添加订单行...",
@@ -9603,6 +9870,7 @@ TOOL_PROGRESS_LABELS_EN = {
     "odoo_check_stock":            "📦 Checking stock...",
     "odoo_recent_sales":           "💰 Fetching recent sales...",
     "odoo_restock_analysis":       "📦 Analyzing restock...",
+    "get_incoming_products":       "🚚 Checking incoming products...",
     "odoo_create_record":          "✏️ Creating record...",
     "odoo_update_record":          "✏️ Updating record...",
     "odoo_add_order_line":         "➕ Adding order line...",
@@ -12141,10 +12409,19 @@ async def login(req: LoginRequest):
 
 @app.get("/export/commission")
 async def export_commission(year: int, month: int, salesperson: str = ""):
-    """Export commission data as Excel. Optional salesperson filter."""
+    """Export commission data as Excel.
+    
+    Structure:
+      - One sheet per salesperson (named after them)
+      - Each sheet has 3 sections:
+        1. Invoice  — tags do NOT contain other people's names
+        2. Share    — tags contain a person's name (e.g. "50/50 Ryan/Gio", "Ryan")
+        3. Credit Note — out_refund moves
+      - Tag column shows tag NAMES (not IDs)
+    """
     from fastapi.responses import StreamingResponse
     import openpyxl
-    from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+    from openpyxl.styles import Font, PatternFill, Alignment
     from io import BytesIO
 
     last_day = calendar.monthrange(year, month)[1]
@@ -12156,7 +12433,22 @@ async def export_commission(year: int, month: int, salesperson: str = ""):
     if err1 or err2:
         return {"error": err1 or err2}
 
-    all_records = invoices + credits
+    # Resolve tag IDs -> tag names
+    all_tag_ids = set()
+    for r in invoices + credits:
+        for tid in (r.get("tag_ids") or []):
+            all_tag_ids.add(tid)
+    tag_name_map = {}
+    if all_tag_ids:
+        tag_result = json.loads(await odoo_query(
+            "account.account.tag",
+            [["id", "in", list(all_tag_ids)]],
+            ["id", "name"],
+            limit=len(all_tag_ids) + 10
+        ))
+        if isinstance(tag_result, list):
+            for t in tag_result:
+                tag_name_map[t["id"]] = t.get("name", "")
 
     def get_salesperson(r):
         user = r.get("invoice_user_id")
@@ -12164,7 +12456,11 @@ async def export_commission(year: int, month: int, salesperson: str = ""):
             return user[1]
         return "Unassigned"
 
-    # COLUMNS: exactly matching Odoo template (9 columns)
+    def tags_to_str(tag_ids):
+        if not tag_ids:
+            return ""
+        return ", ".join(tag_name_map.get(tid, str(tid)) for tid in tag_ids)
+
     headers = [
         "Invoice Partner Display Name",
         "Invoice/Bill Date",
@@ -12177,21 +12473,14 @@ async def export_commission(year: int, month: int, salesperson: str = ""):
         "Tags",
     ]
 
-    # Group all records by salesperson
-    by_person = {}
-    for r in all_records:
-        sp = get_salesperson(r)
-        if sp not in by_person:
-            by_person[sp] = []
+    def build_row(r):
         source = r.get("source_id")
-        tags = r.get("tag_ids", [])
         is_credit = r.get("move_type") == "out_refund"
         sign = -1 if is_credit else 1
         untaxed = r.get("amount_untaxed_signed")
         if untaxed is None:
             untaxed = r.get("amount_untaxed", 0) * sign
-
-        by_person[sp].append({
+        return {
             "Invoice Partner Display Name": r.get("invoice_partner_display_name") or (r["partner_id"][1] if r.get("partner_id") else ""),
             "Invoice/Bill Date": r.get("invoice_date", ""),
             "Number": r.get("name", ""),
@@ -12200,65 +12489,146 @@ async def export_commission(year: int, month: int, salesperson: str = ""):
             "Reference": r.get("ref", "") or "",
             "Source": (source[1] if source and isinstance(source, (list, tuple)) and len(source) > 1 else "") if source else "",
             "Payment Method": r.get("x_payment_method", "") or "",
-            "Tags": ", ".join(str(t) for t in tags) if tags else "",
-        })
+            "Tags": tags_to_str(r.get("tag_ids") or []),
+        }
 
-    # Sort each group by date descending
-    for sp in by_person:
-        by_person[sp].sort(key=lambda x: x["Invoice/Bill Date"] or "", reverse=True)
+    # Group by salesperson, then split into invoice / share / credit
+    # share = invoice whose tag contains a person's name (any salesperson name from the dataset)
+    salesperson_names = set()
+    for r in invoices + credits:
+        sp = get_salesperson(r)
+        if sp != "Unassigned":
+            # extract first name (e.g. "Ryan Smith" -> "Ryan")
+            first = sp.split()[0] if sp else ""
+            if first:
+                salesperson_names.add(first.lower())
+
+    def is_share(tag_str):
+        """Tag contains another person's name -> share row."""
+        if not tag_str:
+            return False
+        tag_lower = tag_str.lower()
+        for name in salesperson_names:
+            if name in tag_lower:
+                return True
+        return False
+
+    by_person = {}  # sp -> {"invoice": [...], "share": [...], "credit": [...]}
+    for r in invoices:
+        sp = get_salesperson(r)
+        row = build_row(r)
+        bucket = by_person.setdefault(sp, {"invoice": [], "share": [], "credit": []})
+        if is_share(row["Tags"]):
+            bucket["share"].append(row)
+        else:
+            bucket["invoice"].append(row)
+    for r in credits:
+        sp = get_salesperson(r)
+        row = build_row(r)
+        bucket = by_person.setdefault(sp, {"invoice": [], "share": [], "credit": []})
+        bucket["credit"].append(row)
+
+    # Sort each section by date desc
+    for sp, sections in by_person.items():
+        for key in sections:
+            sections[key].sort(key=lambda x: x["Invoice/Bill Date"] or "", reverse=True)
 
     # Filter by salesperson if specified
     if salesperson:
-        filtered = {}
-        for sp, rows in by_person.items():
-            if salesperson.lower() in sp.lower():
-                filtered[sp] = rows
+        filtered = {sp: rows for sp, rows in by_person.items() if salesperson.lower() in sp.lower()}
         if filtered:
             by_person = filtered
-        # If no match, keep all (fallback)
 
-    # Sort salespersons by total amount descending
-    sp_totals = {sp: sum(r["Untaxed Amount Signed"] for r in rows) for sp, rows in by_person.items()}
+    # Sort salespersons by total amount desc
+    def section_total(sections):
+        return sum(r["Untaxed Amount Signed"] for s in sections.values() for r in s)
+    sp_totals = {sp: section_total(sections) for sp, sections in by_person.items()}
     sorted_persons = sorted(by_person.keys(), key=lambda sp: sp_totals[sp], reverse=True)
 
     # Build Excel
     wb = openpyxl.Workbook()
-    ws = wb.active
-    ws.title = "Sheet1"
+    # Remove default sheet
+    wb.remove(wb.active)
 
-    # Row 1: Headers
-    for ci, h in enumerate(headers, 1):
-        ws.cell(row=1, column=ci, value=h)
+    bold = Font(bold=True)
+    section_fill = PatternFill("solid", fgColor="DDEEFF")
+    header_fill = PatternFill("solid", fgColor="F0F0F0")
 
-    row_num = 2
-    group_font = Font(bold=True)
+    used_titles = set()
+    def safe_title(name):
+        # Excel sheet name: 31 char max, no [] : * ? / \ characters
+        clean = "".join(c for c in name if c not in "[]:*?/\\")[:28].strip() or "Unknown"
+        title = clean
+        i = 2
+        while title in used_titles:
+            title = f"{clean[:25]}_{i}"
+            i += 1
+        used_titles.add(title)
+        return title
 
     for sp in sorted_persons:
-        rows = by_person[sp]
-        count = len(rows)
-        total = round(sp_totals[sp], 2)
+        sections = by_person[sp]
+        ws = wb.create_sheet(title=safe_title(sp))
 
-        # Group header row: "Name (count)" in col A, total in col E (Untaxed Amount Signed)
-        ws.cell(row=row_num, column=1, value=f"{sp} ({count})")
-        ws.cell(row=row_num, column=1).font = group_font
-        ws.cell(row=row_num, column=5, value=total)
-        ws.cell(row=row_num, column=5).font = group_font
-        ws.cell(row=row_num, column=5).number_format = '#,##0.00'
-        row_num += 1
+        # Title row: salesperson name + total count
+        total_count = sum(len(s) for s in sections.values())
+        ws.cell(row=1, column=1, value=f"{sp} ({total_count})").font = Font(bold=True, size=14)
+        ws.cell(row=1, column=5, value=round(sp_totals[sp], 2)).font = Font(bold=True, size=14)
+        ws.cell(row=1, column=5).number_format = '#,##0.00'
 
-        # Detail rows
-        for r in rows:
-            for ci, h in enumerate(headers, 1):
-                val = r[h]
-                cell = ws.cell(row=row_num, column=ci, value=val)
-                if h == "Untaxed Amount Signed":
-                    cell.number_format = '#,##0.00'
+        # Header row
+        for ci, h in enumerate(headers, 1):
+            c = ws.cell(row=2, column=ci, value=h)
+            c.font = bold
+            c.fill = header_fill
+
+        row_num = 3
+        section_labels = [
+            ("invoice", "Invoice"),
+            ("share",   "Share"),
+            ("credit",  "Credit Note"),
+        ]
+
+        for key, label in section_labels:
+            rows = sections.get(key, [])
+            if not rows:
+                continue
+
+            # Section header
+            section_total_val = round(sum(r["Untaxed Amount Signed"] for r in rows), 2)
+            sc = ws.cell(row=row_num, column=1, value=f"{label} ({len(rows)})")
+            sc.font = bold
+            sc.fill = section_fill
+            for ci in range(2, 10):
+                ws.cell(row=row_num, column=ci).fill = section_fill
+            tc = ws.cell(row=row_num, column=5, value=section_total_val)
+            tc.font = bold
+            tc.fill = section_fill
+            tc.number_format = '#,##0.00'
             row_num += 1
 
-    # Column widths
-    col_widths = [35, 16, 18, 25, 20, 20, 20, 18, 12]
-    for ci, w in enumerate(col_widths, 1):
-        ws.column_dimensions[ws.cell(row=1, column=ci).column_letter].width = w
+            # Detail rows
+            for r in rows:
+                for ci, h in enumerate(headers, 1):
+                    cell = ws.cell(row=row_num, column=ci, value=r[h])
+                    if h == "Untaxed Amount Signed":
+                        cell.number_format = '#,##0.00'
+                row_num += 1
+
+            # Empty row between sections
+            row_num += 1
+
+        # Column widths
+        col_widths = [35, 16, 18, 25, 20, 20, 20, 18, 30]
+        for ci, w in enumerate(col_widths, 1):
+            ws.column_dimensions[ws.cell(row=1, column=ci).column_letter].width = w
+
+        ws.freeze_panes = "A3"
+
+    # Edge case: nobody at all
+    if not sorted_persons:
+        ws = wb.create_sheet(title="Empty")
+        ws["A1"] = "No commission data for this period."
 
     output = BytesIO()
     wb.save(output)
