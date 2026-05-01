@@ -12434,7 +12434,7 @@ async def export_commission(year: int, month: int, salesperson: str = ""):
     if err1 or err2:
         return {"error": err1 or err2}
 
-    # Resolve tag IDs -> tag names
+    # Resolve tag IDs -> tag names (account.move.tag_ids relates to crm.tag)
     all_tag_ids = set()
     for r in invoices + credits:
         for tid in (r.get("tag_ids") or []):
@@ -12442,7 +12442,7 @@ async def export_commission(year: int, month: int, salesperson: str = ""):
     tag_name_map = {}
     if all_tag_ids:
         tag_result = json.loads(await odoo_query(
-            "account.account.tag",
+            "crm.tag",
             [["id", "in", list(all_tag_ids)]],
             ["id", "name"],
             limit=len(all_tag_ids) + 10
