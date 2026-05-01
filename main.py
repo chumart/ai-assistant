@@ -12514,20 +12514,23 @@ async def export_commission(year: int, month: int, salesperson: str = ""):
                 return True
         return False
 
-    by_person = {}  # sp -> {"invoice": [...], "share": [...], "credit": [...]}
+    by_person = {}  # sp -> {"invoice", "share_invoice", "credit", "share_credit"}
     for r in invoices:
         sp = get_salesperson(r)
         row = build_row(r)
-        bucket = by_person.setdefault(sp, {"invoice": [], "share": [], "credit": []})
+        bucket = by_person.setdefault(sp, {"invoice": [], "share_invoice": [], "credit": [], "share_credit": []})
         if is_share(row["Tags"]):
-            bucket["share"].append(row)
+            bucket["share_invoice"].append(row)
         else:
             bucket["invoice"].append(row)
     for r in credits:
         sp = get_salesperson(r)
         row = build_row(r)
-        bucket = by_person.setdefault(sp, {"invoice": [], "share": [], "credit": []})
-        bucket["credit"].append(row)
+        bucket = by_person.setdefault(sp, {"invoice": [], "share_invoice": [], "credit": [], "share_credit": []})
+        if is_share(row["Tags"]):
+            bucket["share_credit"].append(row)
+        else:
+            bucket["credit"].append(row)
 
     # Sort each section by date desc
     for sp, sections in by_person.items():
@@ -12585,9 +12588,10 @@ async def export_commission(year: int, month: int, salesperson: str = ""):
 
         row_num = 3
         section_labels = [
-            ("invoice", "Invoice"),
-            ("share",   "Share"),
-            ("credit",  "Credit Note"),
+            ("invoice",       "Invoice"),
+            ("share_invoice", "Share Invoice"),
+            ("credit",        "Credit Note"),
+            ("share_credit",  "Share Credit Note"),
         ]
 
         for key, label in section_labels:
