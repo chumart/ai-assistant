@@ -2287,6 +2287,7 @@ TOOLS = [
         }
     },
     {
+        "name": "odoo_create_invoice_from_so",
         "description": "Create an invoice from a Sales Order. USE THIS when user says 'release S04100', 'create invoice for CMT12345', '给这个订单开票'. For Shopify (#CMT) and Amazon (AMZ) orders, the SO existing in Odoo means payment is confirmed — can proceed directly. For normal orders (S-prefix), require explicit payment confirmation first. Returns the created invoice ID and name.",
         "input_schema": {
             "type": "object",
