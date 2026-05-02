@@ -6658,6 +6658,10 @@ async def run_tool(name, inp, context=None):
         if not any([street, city, state, zip_code, cust_name, phone, sku]):
             return json.dumps({"error": "Please provide at least one search criterion (address, name, phone, or product SKU)."})
 
+        # === Permission: sales role can only see own orders ===
+        role_perms_local = ROLE_PERMISSIONS.get(role, ROLE_PERMISSIONS["guest"])
+        own_uid = ctx.get("uid", 0) if not role_perms_local.get("can_see_all_sales") else None
+
         try:
             # === Resolve product IDs early (needed by both paths) ===
             product_ids = []
@@ -6771,9 +6775,11 @@ async def run_tool(name, inp, context=None):
 
                     if picking_addr_map:
                         origins = list(picking_addr_map.keys())
+                        origin_domain = [["name", "in", origins], ["company_id", "=", 1]]
+                        if own_uid:
+                            origin_domain.append(["user_id", "=", own_uid])
                         origin_sos = json.loads(await odoo_query(
-                            "sale.order",
-                            [["name", "in", origins], ["company_id", "=", 1]],
+                            "sale.order", origin_domain,
                             ["id", "name"],
                             limit=100
                         ))
@@ -6794,6 +6800,8 @@ async def run_tool(name, inp, context=None):
                     ["partner_shipping_id", "in", partner_ids],
                     ["partner_id", "in", partner_ids],
                 ]
+                if own_uid:
+                    so_domain_a.append(["user_id", "=", own_uid])
                 sos_a = json.loads(await odoo_query(
                     "sale.order", so_domain_a,
                     ["id"], limit=100, order="date_order desc"
@@ -6847,9 +6855,11 @@ async def run_tool(name, inp, context=None):
                 })
 
             # === Fetch full SO details ===
+            final_domain = [["id", "in", list(combined_so_ids)]]
+            if own_uid:
+                final_domain.append(["user_id", "=", own_uid])
             sos_raw = json.loads(await odoo_query(
-                "sale.order",
-                [["id", "in", list(combined_so_ids)]],
+                "sale.order", final_domain,
                 ["name", "partner_id", "partner_shipping_id", "date_order", "state", "amount_total"],
                 limit=30, order="date_order desc"
             ))
