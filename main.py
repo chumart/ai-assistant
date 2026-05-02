@@ -2336,13 +2336,13 @@ TOOLS = [
     },
     {
         "name": "get_shipment_eta",
-        "description": "Query shipment tracking to find when a specific product (by SKU) is arriving. Returns SKU, qty loaded, ETA date, shipment name (e.g. SHIP0005), and status for each matching shipment line. Use when user asks 'PLM-54RS什么时候到', 'when will PLM-54RS arrive', '这个产品什么时候到货', 'ETA for FLM-100', or any question about a specific product's arrival time. Only searches active shipments (not cancelled or done). This is a read-only query — 100% accurate from Odoo shipment tracking data.",
+        "description": "Query shipment tracking for incoming products. Returns SKU, qty loaded, ETA date, shipment name (e.g. SHIP0005), and status. Use when user asks 'PLM-54RS什么时候到', 'when will PLM-54RS arrive', '最近有什么货要到', 'what's coming in', '即将到货', '到货预报'. If sku is empty, returns ALL active incoming shipments. Only shows future ETAs. This is a read-only query — 100% accurate from Odoo shipment tracking data.",
         "input_schema": {
             "type": "object",
             "properties": {
-                "sku": {"type": "string", "description": "Product SKU or partial SKU to search (e.g. 'PLM-54RS', 'FLM-100', 'CA-'). Case-insensitive, supports partial match."}
+                "sku": {"type": "string", "default": "", "description": "Product SKU or partial SKU to search (e.g. 'PLM-54RS', 'FLM-100', 'CA-'). Case-insensitive, supports partial match. Empty = list all active shipments."}
             },
-            "required": ["sku"]
+            "required": []
         }
     },
     {
@@ -3032,7 +3032,9 @@ COST/MARGIN RULES (NO ACCESS):
 
     inventory_rules = ""
     if perms["can_see_inventory"]:
-        inventory_rules = """INVENTORY: Can query stock.quant and view inventory levels.
+        if perms.get("can_see_cost"):
+            # Admin/Finance/Purchase — can see PO-based incoming + shipment tracking
+            inventory_rules = """INVENTORY: Can query stock.quant and view inventory levels.
 INCOMING PRODUCTS: When user asks '哪些产品快到了', 'what's coming in', '即将到货', 'incoming shipments', '到货预报', '快到了吗', 'arriving soon' — call get_incoming_products(days=30).
   - Adjust days if user specifies: '下周到的' → days=7, '两个月内' → days=60
   - Can filter by brand: get_incoming_products(brand='Polarman')
@@ -3040,9 +3042,17 @@ INCOMING PRODUCTS: When user asks '哪些产品快到了', 'what's coming in', '
 SHIPMENT ETA: When user asks about a SPECIFIC product's arrival time (e.g. 'PLM-54RS什么时候到', 'when will FLM-100 arrive', 'ETA for CA-200'):
   - Call get_shipment_eta(sku='PLM-54RS') — queries the shipment tracking module
   - Returns: SKU, product name, qty loaded, ETA date, shipment name (SHIP0005), status
-  - This is MORE ACCURATE than get_incoming_products for specific SKU arrival queries
-  - Use get_incoming_products for broad queries ('what's coming in this month')
-  - Use get_shipment_eta for specific SKU queries ('PLM-54RS什么时候到')"""
+  - For broad queries ('what's coming in this month'), use get_incoming_products
+  - For specific SKU queries ('PLM-54RS什么时候到'), use get_shipment_eta"""
+        else:
+            # Sales/Warehouse/Guest — only shipment tracking, NO PO data
+            inventory_rules = """INVENTORY: Can query stock.quant and view inventory levels.
+INCOMING SHIPMENTS: When user asks about incoming products, what's arriving, '什么时候到', '到货', 'ETA', '快到了吗':
+  - ALWAYS use get_shipment_eta — this queries the shipment tracking module
+  - For broad queries ('最近有什么货要到', 'what's coming in'): call get_shipment_eta(sku='') with empty sku to list all active shipments
+  - For specific SKU queries ('PLM-54RS什么时候到'): call get_shipment_eta(sku='PLM-54RS')
+  - Returns: SKU, product name, qty, ETA date, shipment name (SHIP0005), status
+  - You do NOT have access to Purchase Orders or PO data — NEVER mention PO numbers, vendor names, or costs"""
     else:
         inventory_rules = "INVENTORY: No access to inventory data."
 
@@ -4008,7 +4018,7 @@ async def run_tool(name, inp, context=None):
     role_perms = ROLE_PERMISSIONS.get(role, ROLE_PERMISSIONS["guest"])
     _release_tools = {"odoo_create_invoice_from_so", "odoo_register_payment", "odoo_export_invoice_pdf", "release_so", "print_invoice", "check_so_payment_status"}
     _write_tools = {"odoo_create_record", "odoo_add_order_line", "odoo_confirm_order", "odoo_update_record", "odoo_update_vendor_price"}
-    _cost_tools = {"odoo_find_recent_purchases_by_skus", "odoo_get_product_vendors", "odoo_create_bulk_po", "get_po_with_so_links", "odoo_restock_analysis"}
+    _cost_tools = {"odoo_find_recent_purchases_by_skus", "odoo_get_product_vendors", "odoo_create_bulk_po", "get_po_with_so_links", "odoo_restock_analysis", "get_incoming_products"}
     _finance_tools = {"get_monthly_tax", "get_quarterly_tax", "get_monthly_sales", "get_missing_tax", "odoo_match_payment_to_customer"}
     # v18.3: admin-only tools (raw DB query / sensitive ops)
     _admin_only_tools = {"db_query_admin"}
@@ -6532,29 +6542,33 @@ async def run_tool(name, inp, context=None):
 
     if name == "get_shipment_eta":
         sku_input = (inp.get("sku") or "").strip()
-        if not sku_input:
-            return json.dumps({"error": "sku is required"})
+        now_la = datetime.datetime.now(LA_TZ)
+        today_str = now_la.strftime("%Y-%m-%d")
         try:
-            # Query shipment.tracking.line where sku matches (ilike = case-insensitive partial)
-            # Only include active shipments (exclude done/cancel)
+            # Build domain: active shipments only, ETA >= today (future only)
+            domain = [
+                ["shipment_state", "not in", ["done", "cancel"]],
+                ["eta", ">=", today_str],
+            ]
+            # If sku provided, add filter; otherwise list all active
+            if sku_input:
+                domain.append(["sku", "ilike", sku_input])
             lines_raw = json.loads(await odoo_query(
                 "shipment.tracking.line",
-                [
-                    ["sku", "ilike", sku_input],
-                    ["shipment_state", "not in", ["done", "cancel"]],
-                ],
+                domain,
                 ["sku", "product_name", "qty_loaded", "eta", "shipment_state", "shipment_id"],
-                limit=50,
+                limit=200,
                 order="eta asc"
             ))
             if isinstance(lines_raw, dict) and "error" in lines_raw:
                 return json.dumps(lines_raw)
             if not lines_raw:
+                note = f"No active shipments found matching SKU '{sku_input}'." if sku_input else "No active incoming shipments found."
                 return json.dumps({
-                    "sku_searched": sku_input,
+                    "sku_searched": sku_input or "(all)",
                     "total_found": 0,
                     "results": [],
-                    "note": f"No active shipments found containing SKU matching '{sku_input}'."
+                    "note": note
                 })
             results = []
             for ln in lines_raw:
@@ -6570,7 +6584,7 @@ async def run_tool(name, inp, context=None):
                     "shipment": ship_name,
                 })
             return json.dumps({
-                "sku_searched": sku_input,
+                "sku_searched": sku_input or "(all)",
                 "total_found": len(results),
                 "results": results,
             }, default=str, ensure_ascii=False)
@@ -8547,7 +8561,7 @@ async def chat(req: ChatRequest, background_tasks: BackgroundTasks):
     # Other write tools (PO, product/price edits) — admin/finance only (NOT sales_manager)
     write_tools = {"odoo_create_record", "odoo_add_order_line", "odoo_confirm_order", "odoo_update_record", "odoo_update_vendor_price"}
     # Tools that expose vendor names, prices, PO costs — only admin / finance / purchase should see these
-    cost_tools = {"odoo_find_recent_purchases_by_skus", "odoo_get_product_vendors", "odoo_create_bulk_po", "get_po_with_so_links", "odoo_restock_analysis"}
+    cost_tools = {"odoo_find_recent_purchases_by_skus", "odoo_get_product_vendors", "odoo_create_bulk_po", "get_po_with_so_links", "odoo_restock_analysis", "get_incoming_products"}
     # v18.3: admin-only tools (raw DB query for diagnostics)
     admin_only_tools = {"db_query_admin"}
     for tool in TOOLS:
@@ -8773,7 +8787,7 @@ async def chat_stream(req: ChatRequest, background_tasks: BackgroundTasks):
     # Other write tools (PO, product/price edits) — admin/finance only (NOT sales_manager)
     write_tools = {"odoo_create_record", "odoo_add_order_line", "odoo_confirm_order", "odoo_update_record", "odoo_update_vendor_price"}
     # Tools that expose vendor names, prices, PO costs — only admin / finance / purchase should see these
-    cost_tools = {"odoo_find_recent_purchases_by_skus", "odoo_get_product_vendors", "odoo_create_bulk_po", "get_po_with_so_links", "odoo_restock_analysis"}
+    cost_tools = {"odoo_find_recent_purchases_by_skus", "odoo_get_product_vendors", "odoo_create_bulk_po", "get_po_with_so_links", "odoo_restock_analysis", "get_incoming_products"}
     # v18.3: admin-only tools (raw DB query for diagnostics)
     admin_only_tools = {"db_query_admin"}
     for tool in TOOLS:
@@ -11156,7 +11170,7 @@ async def odoo_bot_chat(req: OdooBotRequest):
     release_tools = {"odoo_create_invoice_from_so", "odoo_register_payment", "odoo_export_invoice_pdf", "release_so", "print_invoice", "check_so_payment_status"}
     # Other write tools (PO, product/price edits) — admin/finance only (NOT sales_manager)
     write_tools = {"odoo_create_record", "odoo_add_order_line", "odoo_confirm_order", "odoo_update_record", "odoo_update_vendor_price"}
-    cost_tools = {"odoo_find_recent_purchases_by_skus", "odoo_get_product_vendors", "odoo_create_bulk_po", "get_po_with_so_links", "odoo_restock_analysis"}
+    cost_tools = {"odoo_find_recent_purchases_by_skus", "odoo_get_product_vendors", "odoo_create_bulk_po", "get_po_with_so_links", "odoo_restock_analysis", "get_incoming_products"}
     # v18.3: admin-only tools
     admin_only_tools = {"db_query_admin"}
     for tool in TOOLS:
