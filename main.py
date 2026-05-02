@@ -1763,7 +1763,7 @@ async def report_shipment_eta():
     """在途货物查询 — 直接 API，不经过 AI。
     
     查所有活跃 shipment（非 done/cancel）的 tracking lines，
-    只返回 SKU、品名、装柜数量、ETA、柜号、状态。
+    只返回 SKU、品名、装柜数量、ETA、单号、状态。
     按 ETA 升序排列，仅返回 ETA >= 今天的（未来的）。
     """
     now_la = datetime.datetime.now(LA_TZ)
@@ -1775,7 +1775,7 @@ async def report_shipment_eta():
                 ["shipment_state", "not in", ["done", "cancel"]],
                 ["eta", ">=", today_str],
             ],
-            ["sku", "product_name", "qty_loaded", "eta", "shipment_state", "container_no"],
+            ["sku", "product_name", "qty_loaded", "eta", "shipment_state", "shipment_id"],
             limit=500,
             order="eta asc"
         ))
@@ -1785,13 +1785,16 @@ async def report_shipment_eta():
         for ln in lines_raw:
             if not ln.get("sku"):
                 continue
+            ship_name = ""
+            if ln.get("shipment_id") and isinstance(ln["shipment_id"], (list, tuple)):
+                ship_name = ln["shipment_id"][1] if len(ln["shipment_id"]) > 1 else str(ln["shipment_id"][0])
             results.append({
                 "sku": ln.get("sku") or "",
                 "product_name": ln.get("product_name") or "",
                 "qty": ln.get("qty_loaded", 0),
                 "eta": ln.get("eta") or "",
+                "shipment": ship_name,
                 "status": ln.get("shipment_state") or "",
-                "container": ln.get("container_no") or "",
             })
         return {
             "report_type": "Shipment ETA",
@@ -2333,7 +2336,7 @@ TOOLS = [
     },
     {
         "name": "get_shipment_eta",
-        "description": "Query shipment tracking to find when a specific product (by SKU) is arriving. Returns SKU, qty loaded in container, and ETA date for each matching shipment line. Use when user asks 'PLM-54RS什么时候到', 'when will PLM-54RS arrive', '这个产品什么时候到货', 'ETA for FLM-100', or any question about a specific product's arrival time. Only searches active shipments (not cancelled or done). This is a read-only query — 100% accurate from Odoo shipment tracking data.",
+        "description": "Query shipment tracking to find when a specific product (by SKU) is arriving. Returns SKU, qty loaded, ETA date, shipment name (e.g. SHIP0005), and status for each matching shipment line. Use when user asks 'PLM-54RS什么时候到', 'when will PLM-54RS arrive', '这个产品什么时候到货', 'ETA for FLM-100', or any question about a specific product's arrival time. Only searches active shipments (not cancelled or done). This is a read-only query — 100% accurate from Odoo shipment tracking data.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -3036,7 +3039,7 @@ INCOMING PRODUCTS: When user asks '哪些产品快到了', 'what's coming in', '
   - Results are directly from Odoo PO data, 100% accurate
 SHIPMENT ETA: When user asks about a SPECIFIC product's arrival time (e.g. 'PLM-54RS什么时候到', 'when will FLM-100 arrive', 'ETA for CA-200'):
   - Call get_shipment_eta(sku='PLM-54RS') — queries the shipment tracking module
-  - Returns: SKU, product name, qty loaded in container, ETA date, shipment status, container number
+  - Returns: SKU, product name, qty loaded, ETA date, shipment name (SHIP0005), status
   - This is MORE ACCURATE than get_incoming_products for specific SKU arrival queries
   - Use get_incoming_products for broad queries ('what's coming in this month')
   - Use get_shipment_eta for specific SKU queries ('PLM-54RS什么时候到')"""
@@ -6540,7 +6543,7 @@ async def run_tool(name, inp, context=None):
                     ["sku", "ilike", sku_input],
                     ["shipment_state", "not in", ["done", "cancel"]],
                 ],
-                ["sku", "product_name", "qty_loaded", "eta", "shipment_state", "container_no"],
+                ["sku", "product_name", "qty_loaded", "eta", "shipment_state", "shipment_id"],
                 limit=50,
                 order="eta asc"
             ))
@@ -6555,13 +6558,16 @@ async def run_tool(name, inp, context=None):
                 })
             results = []
             for ln in lines_raw:
+                ship_name = ""
+                if ln.get("shipment_id") and isinstance(ln["shipment_id"], (list, tuple)):
+                    ship_name = ln["shipment_id"][1] if len(ln["shipment_id"]) > 1 else str(ln["shipment_id"][0])
                 results.append({
                     "sku": ln.get("sku") or "",
                     "product_name": ln.get("product_name") or "",
                     "qty_loaded": ln.get("qty_loaded", 0),
                     "eta": ln.get("eta") or "Unknown",
                     "status": ln.get("shipment_state") or "",
-                    "container_no": ln.get("container_no") or "",
+                    "shipment": ship_name,
                 })
             return json.dumps({
                 "sku_searched": sku_input,
