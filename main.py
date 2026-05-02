@@ -1758,6 +1758,51 @@ async def missing_tax(year: int, month: int):
                 "payment_state":r.get("payment_state","")} for r in records]}
 
 
+@app.get("/report/shipment-eta")
+async def report_shipment_eta():
+    """在途货物查询 — 直接 API，不经过 AI。
+    
+    查所有活跃 shipment（非 done/cancel）的 tracking lines，
+    只返回 SKU、品名、装柜数量、ETA、柜号、状态。
+    按 ETA 升序排列，仅返回 ETA >= 今天的（未来的）。
+    """
+    now_la = datetime.datetime.now(LA_TZ)
+    today_str = now_la.strftime("%Y-%m-%d")
+    try:
+        lines_raw = json.loads(await odoo_query(
+            "shipment.tracking.line",
+            [
+                ["shipment_state", "not in", ["done", "cancel"]],
+                ["eta", ">=", today_str],
+            ],
+            ["sku", "product_name", "qty_loaded", "eta", "shipment_state", "container_no"],
+            limit=500,
+            order="eta asc"
+        ))
+        if isinstance(lines_raw, dict) and "error" in lines_raw:
+            return lines_raw
+        results = []
+        for ln in lines_raw:
+            if not ln.get("sku"):
+                continue
+            results.append({
+                "sku": ln.get("sku") or "",
+                "product_name": ln.get("product_name") or "",
+                "qty": ln.get("qty_loaded", 0),
+                "eta": ln.get("eta") or "",
+                "status": ln.get("shipment_state") or "",
+                "container": ln.get("container_no") or "",
+            })
+        return {
+            "report_type": "Shipment ETA",
+            "as_of": today_str,
+            "total": len(results),
+            "items": results,
+        }
+    except Exception as e:
+        return {"error": f"Shipment ETA query failed: {str(e)}"}
+
+
 @app.get("/report/incoming-products")
 async def incoming_products(days: int = 30, brand: str = ""):
     """30天内即将到货的产品（基于已确认 PO 的 date_planned）。
@@ -2284,6 +2329,17 @@ TOOLS = [
                 "brand": {"type": "string", "default": "", "description": "Optional brand filter: 'Polarman', 'Flamaster', 'ChefAsst', etc. Empty = all brands."}
             },
             "required": []
+        }
+    },
+    {
+        "name": "get_shipment_eta",
+        "description": "Query shipment tracking to find when a specific product (by SKU) is arriving. Returns SKU, qty loaded in container, and ETA date for each matching shipment line. Use when user asks 'PLM-54RS什么时候到', 'when will PLM-54RS arrive', '这个产品什么时候到货', 'ETA for FLM-100', or any question about a specific product's arrival time. Only searches active shipments (not cancelled or done). This is a read-only query — 100% accurate from Odoo shipment tracking data.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "sku": {"type": "string", "description": "Product SKU or partial SKU to search (e.g. 'PLM-54RS', 'FLM-100', 'CA-'). Case-insensitive, supports partial match."}
+            },
+            "required": ["sku"]
         }
     },
     {
@@ -2977,7 +3033,13 @@ COST/MARGIN RULES (NO ACCESS):
 INCOMING PRODUCTS: When user asks '哪些产品快到了', 'what's coming in', '即将到货', 'incoming shipments', '到货预报', '快到了吗', 'arriving soon' — call get_incoming_products(days=30).
   - Adjust days if user specifies: '下周到的' → days=7, '两个月内' → days=60
   - Can filter by brand: get_incoming_products(brand='Polarman')
-  - Results are directly from Odoo PO data, 100% accurate"""
+  - Results are directly from Odoo PO data, 100% accurate
+SHIPMENT ETA: When user asks about a SPECIFIC product's arrival time (e.g. 'PLM-54RS什么时候到', 'when will FLM-100 arrive', 'ETA for CA-200'):
+  - Call get_shipment_eta(sku='PLM-54RS') — queries the shipment tracking module
+  - Returns: SKU, product name, qty loaded in container, ETA date, shipment status, container number
+  - This is MORE ACCURATE than get_incoming_products for specific SKU arrival queries
+  - Use get_incoming_products for broad queries ('what's coming in this month')
+  - Use get_shipment_eta for specific SKU queries ('PLM-54RS什么时候到')"""
     else:
         inventory_rules = "INVENTORY: No access to inventory data."
 
@@ -6465,6 +6527,50 @@ async def run_tool(name, inp, context=None):
         except Exception as e:
             return json.dumps({"error": f"Incoming products query failed: {str(e)}"})
 
+    if name == "get_shipment_eta":
+        sku_input = (inp.get("sku") or "").strip()
+        if not sku_input:
+            return json.dumps({"error": "sku is required"})
+        try:
+            # Query shipment.tracking.line where sku matches (ilike = case-insensitive partial)
+            # Only include active shipments (exclude done/cancel)
+            lines_raw = json.loads(await odoo_query(
+                "shipment.tracking.line",
+                [
+                    ["sku", "ilike", sku_input],
+                    ["shipment_state", "not in", ["done", "cancel"]],
+                ],
+                ["sku", "product_name", "qty_loaded", "eta", "shipment_state", "container_no"],
+                limit=50,
+                order="eta asc"
+            ))
+            if isinstance(lines_raw, dict) and "error" in lines_raw:
+                return json.dumps(lines_raw)
+            if not lines_raw:
+                return json.dumps({
+                    "sku_searched": sku_input,
+                    "total_found": 0,
+                    "results": [],
+                    "note": f"No active shipments found containing SKU matching '{sku_input}'."
+                })
+            results = []
+            for ln in lines_raw:
+                results.append({
+                    "sku": ln.get("sku") or "",
+                    "product_name": ln.get("product_name") or "",
+                    "qty_loaded": ln.get("qty_loaded", 0),
+                    "eta": ln.get("eta") or "Unknown",
+                    "status": ln.get("shipment_state") or "",
+                    "container_no": ln.get("container_no") or "",
+                })
+            return json.dumps({
+                "sku_searched": sku_input,
+                "total_found": len(results),
+                "results": results,
+            }, default=str, ensure_ascii=False)
+        except Exception as e:
+            return json.dumps({"error": f"Shipment ETA query failed: {str(e)}"})
+
     if name == "search_documents":
         conn = await get_db_conn()
         if not conn:
@@ -9833,6 +9939,7 @@ TOOL_PROGRESS_LABELS_ZH = {
     "odoo_recent_sales":           "💰 正在查最近销售...",
     "odoo_restock_analysis":       "📦 正在分析补货...",
     "get_incoming_products":       "🚚 正在查即将到货产品...",
+    "get_shipment_eta":            "📦 正在查询到货时间...",
     "odoo_create_record":          "✏️ 正在创建记录...",
     "odoo_update_record":          "✏️ 正在更新记录...",
     "odoo_add_order_line":         "➕ 正在添加订单行...",
@@ -9872,6 +9979,7 @@ TOOL_PROGRESS_LABELS_EN = {
     "odoo_recent_sales":           "💰 Fetching recent sales...",
     "odoo_restock_analysis":       "📦 Analyzing restock...",
     "get_incoming_products":       "🚚 Checking incoming products...",
+    "get_shipment_eta":            "📦 Checking shipment ETA...",
     "odoo_create_record":          "✏️ Creating record...",
     "odoo_update_record":          "✏️ Updating record...",
     "odoo_add_order_line":         "➕ Adding order line...",
@@ -10207,7 +10315,34 @@ def _is_live_data_query(text: str) -> bool:
     ]
     if any(kw in t for kw in printer_query_patterns):
         return True
-    
+
+    # Shipment ETA queries — arrival times change dynamically
+    # Match when user asks about a specific SKU's arrival or shipment status
+    # Pattern: SKU-like strings (PLM-54RS, FLM-100, CA-xxx) + arrival intent
+    shipment_query_patterns = [
+        "什么时候到",       # "PLM-54RS什么时候到"
+        "when will",       # "when will PLM-54RS arrive"
+        "when does",       # "when does it arrive"
+        "到货",            # "预计到货", "到货时间"
+        "eta",             # "ETA for PLM-54RS"
+        "什么时候来",       # informal "when is it coming"
+        "几时到",           # "几时到货"
+        "多久到",           # "还要多久到"
+        "到了吗",           # "PLM-54RS到了吗"
+        "来了吗",           # "货来了吗"
+        "在途",            # "在途的货"
+        "shipment",        # "shipment status"
+    ]
+    # Also match if text contains a SKU-like pattern (e.g. PLM-54RS, FLM-100, CA-200)
+    import re as _re
+    has_sku_pattern = bool(_re.search(r'[A-Z]{2,4}[-]?\d{2,}', t.upper()))
+    has_arrival_intent = any(kw in t for kw in shipment_query_patterns)
+    if has_sku_pattern and has_arrival_intent:
+        return True
+    # Direct shipment query without SKU
+    if any(kw in t for kw in ["什么时候到", "到货", "在途", "shipment"]):
+        return True
+
     return False
 
 
