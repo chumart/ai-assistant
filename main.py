@@ -3041,7 +3041,8 @@ INCOMING PRODUCTS: When user asks '哪些产品快到了', 'what's coming in', '
   - Results are directly from Odoo PO data, 100% accurate
 SHIPMENT ETA: When user asks about a SPECIFIC product's arrival time (e.g. 'PLM-54RS什么时候到', 'when will FLM-100 arrive', 'ETA for CA-200'):
   - Call get_shipment_eta(sku='PLM-54RS') — queries the shipment tracking module
-  - Returns: SKU, product name, qty loaded, ETA date, shipment name (SHIP0005), status
+  - Returns pre-computed summary with totals — NEVER recalculate, re-sum, or re-count the numbers yourself
+  - Just present the data as returned. Do NOT invent categories or aggregate numbers on your own.
   - For broad queries ('what's coming in this month'), use get_incoming_products
   - For specific SKU queries ('PLM-54RS什么时候到'), use get_shipment_eta"""
         else:
@@ -3051,7 +3052,8 @@ INCOMING SHIPMENTS: When user asks about incoming products, what's arriving, '�
   - ALWAYS use get_shipment_eta — this queries the shipment tracking module
   - For broad queries ('最近有什么货要到', 'what's coming in'): call get_shipment_eta(sku='') with empty sku to list all active shipments
   - For specific SKU queries ('PLM-54RS什么时候到'): call get_shipment_eta(sku='PLM-54RS')
-  - Returns: SKU, product name, qty, ETA date, shipment name (SHIP0005), status
+  - Returns pre-computed summary with totals — NEVER recalculate, re-sum, or re-count the numbers yourself. Present them exactly as returned.
+  - Just show the data in a clean table. Do NOT invent categories, brand groupings, or aggregate numbers on your own.
   - You do NOT have access to Purchase Orders or PO data — NEVER mention PO numbers, vendor names, or costs"""
     else:
         inventory_rules = "INVENTORY: No access to inventory data."
@@ -6557,7 +6559,7 @@ async def run_tool(name, inp, context=None):
                 "shipment.tracking.line",
                 domain,
                 ["sku", "product_name", "qty_loaded", "eta", "shipment_state", "shipment_id"],
-                limit=200,
+                limit=500,
                 order="eta asc"
             ))
             if isinstance(lines_raw, dict) and "error" in lines_raw:
@@ -6570,23 +6572,47 @@ async def run_tool(name, inp, context=None):
                     "results": [],
                     "note": note
                 })
-            results = []
+
+            # Pre-compute summary so AI doesn't need to calculate anything
+            # Group by shipment
+            shipment_groups = {}
             for ln in lines_raw:
                 ship_name = ""
                 if ln.get("shipment_id") and isinstance(ln["shipment_id"], (list, tuple)):
                     ship_name = ln["shipment_id"][1] if len(ln["shipment_id"]) > 1 else str(ln["shipment_id"][0])
-                results.append({
+                key = ship_name or "Unknown"
+                if key not in shipment_groups:
+                    shipment_groups[key] = {
+                        "shipment": key,
+                        "eta": ln.get("eta") or "Unknown",
+                        "status": ln.get("shipment_state") or "",
+                        "items": [],
+                        "total_qty": 0,
+                        "sku_count": 0,
+                    }
+                qty = ln.get("qty_loaded", 0) or 0
+                shipment_groups[key]["items"].append({
                     "sku": ln.get("sku") or "",
                     "product_name": ln.get("product_name") or "",
-                    "qty_loaded": ln.get("qty_loaded", 0),
-                    "eta": ln.get("eta") or "Unknown",
-                    "status": ln.get("shipment_state") or "",
-                    "shipment": ship_name,
+                    "qty": qty,
                 })
+                shipment_groups[key]["total_qty"] += qty
+                shipment_groups[key]["sku_count"] += 1
+
+            # Build final result with pre-computed totals
+            shipments = list(shipment_groups.values())
+            grand_total_qty = sum(s["total_qty"] for s in shipments)
+            grand_total_skus = sum(s["sku_count"] for s in shipments)
+
             return json.dumps({
                 "sku_searched": sku_input or "(all)",
-                "total_found": len(results),
-                "results": results,
+                "summary": {
+                    "total_shipments": len(shipments),
+                    "total_skus": grand_total_skus,
+                    "total_qty": grand_total_qty,
+                },
+                "shipments": shipments,
+                "instruction": "IMPORTANT: All totals are pre-computed and accurate. Do NOT recalculate or re-sum the numbers — just present them as-is. The total_qty in each shipment and in summary are already correct.",
             }, default=str, ensure_ascii=False)
         except Exception as e:
             return json.dumps({"error": f"Shipment ETA query failed: {str(e)}"})
