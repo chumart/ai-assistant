@@ -2346,6 +2346,23 @@ TOOLS = [
         }
     },
     {
+        "name": "find_order_by_address_product",
+        "description": "Find sales orders when customer doesn't remember the order number. Searches by combination of delivery address fragments and/or product SKU. Delivery address has highest priority (checked on sale.order.partner_shipping_id), then invoice address, then customer address. Use when user says 'customer at 123 Main St ordered a PLM-54RS', '加州92618有个客人买了冰柜', 'find order for zip 90210 with FLM-R24', or any query combining address info with product info. At minimum provide state or zip plus a product SKU for best results.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "street": {"type": "string", "description": "Street address or partial (e.g. '123 Main', 'Elm St'). Optional."},
+                "city": {"type": "string", "description": "City name (e.g. 'Irvine', 'Los Angeles'). Optional."},
+                "state": {"type": "string", "description": "State code or name (e.g. 'CA', 'California', 'TX'). Optional but recommended."},
+                "zip": {"type": "string", "description": "ZIP code (e.g. '92618', '90210'). Optional but recommended."},
+                "name": {"type": "string", "description": "Customer or company name (partial OK, e.g. 'John', 'Panda Restaurant'). Optional."},
+                "phone": {"type": "string", "description": "Phone number (partial OK). Optional."},
+                "sku": {"type": "string", "description": "Product internal reference / SKU (e.g. 'PLM-54RS', 'FLM-R24'). Optional but recommended."}
+            },
+            "required": []
+        }
+    },
+    {
         "name": "odoo_create_invoice_from_so",
         "description": "Create an invoice from a Sales Order. USE THIS when user says 'release S04100', 'create invoice for CMT12345', '给这个订单开票'. For Shopify (#CMT) and Amazon (AMZ) orders, the SO existing in Odoo means payment is confirmed — can proceed directly. For normal orders (S-prefix), require explicit payment confirmation first. Returns the created invoice ID and name.",
         "input_schema": {
@@ -3058,6 +3075,16 @@ INCOMING SHIPMENTS: When user asks about incoming products, what's arriving, '�
     else:
         inventory_rules = "INVENTORY: No access to inventory data."
 
+    # Order lookup by address/product
+    order_lookup_rules = """
+ORDER LOOKUP BY ADDRESS/PRODUCT: When customer doesn't know their order number:
+  - Use find_order_by_address_product — searches by address fragments + product SKU
+  - Extract whatever info the user gives: street, city, state, zip, name, phone, product SKU
+  - state + zip + SKU is the strongest combination, but any subset works
+  - Examples: '加州92618买了PLM-54RS的客人' → state='CA', zip='92618', sku='PLM-54RS'
+            'customer on Elm Street in Texas bought a wok range' → street='Elm', state='TX', sku='FLM-WOK'
+  - The tool checks delivery address first (partner_shipping_id), which is the most accurate"""
+
     # Build memory block
     memory_block = ""
     if memories:
@@ -3127,6 +3154,8 @@ KNOWLEDGE BASE RULES (MOST IMPORTANT):
 {cost_rules}
 
 {inventory_rules}
+
+{order_lookup_rules}
 
 GENERAL ODOO RULES:
 - Always include date filters when user mentions a time period
@@ -6617,6 +6646,237 @@ async def run_tool(name, inp, context=None):
         except Exception as e:
             return json.dumps({"error": f"Shipment ETA query failed: {str(e)}"})
 
+    if name == "find_order_by_address_product":
+        street = (inp.get("street") or "").strip()
+        city = (inp.get("city") or "").strip()
+        state = (inp.get("state") or "").strip()
+        zip_code = (inp.get("zip") or "").strip()
+        cust_name = (inp.get("name") or "").strip()
+        phone = (inp.get("phone") or "").strip()
+        sku = (inp.get("sku") or "").strip()
+
+        if not any([street, city, state, zip_code, cust_name, phone, sku]):
+            return json.dumps({"error": "Please provide at least one search criterion (address, name, phone, or product SKU)."})
+
+        try:
+            # Strategy: find matching res.partner IDs first, then find SOs linked to them
+            # Step 1: Build partner search domain for address matching
+            partner_domain = [["customer_rank", ">", 0]]
+            if cust_name:
+                partner_domain.append(["name", "ilike", cust_name])
+            if street:
+                partner_domain.append(["street", "ilike", street])
+            if city:
+                partner_domain.append(["city", "ilike", city])
+            if state:
+                # state could be code (CA) or full name (California)
+                # Search state_id by name or code
+                state_results = json.loads(await odoo_query(
+                    "res.country.state",
+                    ["|", ["code", "ilike", state], ["name", "ilike", state]],
+                    ["id", "name", "code"],
+                    limit=5
+                ))
+                if isinstance(state_results, list) and state_results:
+                    state_ids = [s["id"] for s in state_results]
+                    partner_domain.append(["state_id", "in", state_ids])
+                else:
+                    # Fallback: try matching state text in full address
+                    partner_domain.append("|")
+                    partner_domain.append(["state_id.name", "ilike", state])
+                    partner_domain.append(["state_id.code", "ilike", state])
+            if zip_code:
+                partner_domain.append(["zip", "ilike", zip_code])
+            if phone:
+                partner_domain.append("|")
+                partner_domain.append(["phone", "ilike", phone])
+                partner_domain.append(["mobile", "ilike", phone])
+
+            partners_raw = json.loads(await odoo_query(
+                "res.partner",
+                partner_domain,
+                ["id", "name", "street", "city", "state_id", "zip", "phone", "mobile", "parent_id"],
+                limit=100,
+                order="id desc"
+            ))
+            if isinstance(partners_raw, dict) and "error" in partners_raw:
+                return json.dumps(partners_raw)
+
+            if not partners_raw:
+                return json.dumps({
+                    "total_found": 0,
+                    "orders": [],
+                    "note": "No matching customers found with the given address/name/phone criteria."
+                })
+
+            partner_ids = [p["id"] for p in partners_raw]
+            # Also include parent company IDs for child contacts
+            for p in partners_raw:
+                if p.get("parent_id") and isinstance(p["parent_id"], (list, tuple)):
+                    pid = p["parent_id"][0]
+                    if pid not in partner_ids:
+                        partner_ids.append(pid)
+
+            # Build partner lookup for display
+            partner_map = {}
+            for p in partners_raw:
+                state_name = ""
+                if p.get("state_id") and isinstance(p["state_id"], (list, tuple)):
+                    state_name = p["state_id"][1] if len(p["state_id"]) > 1 else ""
+                partner_map[p["id"]] = {
+                    "name": p.get("name") or "",
+                    "address": ", ".join(filter(None, [
+                        p.get("street") or "",
+                        p.get("city") or "",
+                        state_name,
+                        p.get("zip") or ""
+                    ])),
+                    "phone": p.get("phone") or p.get("mobile") or "",
+                }
+
+            # Step 2: Find SOs where partner_shipping_id OR partner_id matches
+            # Priority: delivery address (partner_shipping_id) > invoice/customer (partner_id)
+            so_domain = [
+                ["company_id", "=", 1],
+                ["state", "not in", ["cancel"]],
+                "|",
+                ["partner_shipping_id", "in", partner_ids],
+                ["partner_id", "in", partner_ids],
+            ]
+
+            so_fields = [
+                "name", "partner_id", "partner_shipping_id",
+                "date_order", "state", "amount_total",
+                "order_line"
+            ]
+            sos_raw = json.loads(await odoo_query(
+                "sale.order", so_domain, so_fields,
+                limit=50, order="date_order desc"
+            ))
+            if isinstance(sos_raw, dict) and "error" in sos_raw:
+                return json.dumps(sos_raw)
+
+            if not sos_raw:
+                return json.dumps({
+                    "total_found": 0,
+                    "orders": [],
+                    "matching_customers": len(partners_raw),
+                    "note": "Found matching customers but no sales orders for them."
+                })
+
+            # Step 3: If SKU provided, filter SOs that contain the product
+            if sku:
+                # Get product IDs matching the SKU
+                products = json.loads(await odoo_query(
+                    "product.product",
+                    [["default_code", "ilike", sku]],
+                    ["id", "name", "default_code"],
+                    limit=20
+                ))
+                if isinstance(products, list) and products:
+                    product_ids = [p["id"] for p in products]
+                    product_name_map = {p["id"]: p.get("default_code") or p.get("name") or "" for p in products}
+
+                    # Get all SO line IDs from our SOs
+                    so_ids = [so["id"] for so in sos_raw]
+                    so_lines = json.loads(await odoo_query(
+                        "sale.order.line",
+                        [["order_id", "in", so_ids], ["product_id", "in", product_ids]],
+                        ["order_id", "product_id", "product_uom_qty"],
+                        limit=200
+                    ))
+                    if isinstance(so_lines, list) and so_lines:
+                        # Only keep SOs that have matching product lines
+                        matching_so_ids = set()
+                        so_product_info = {}  # so_id -> [{sku, qty}]
+                        for sl in so_lines:
+                            so_id = sl["order_id"][0] if isinstance(sl.get("order_id"), (list, tuple)) else sl.get("order_id")
+                            matching_so_ids.add(so_id)
+                            pid = sl["product_id"][0] if isinstance(sl.get("product_id"), (list, tuple)) else sl.get("product_id")
+                            if so_id not in so_product_info:
+                                so_product_info[so_id] = []
+                            so_product_info[so_id].append({
+                                "sku": product_name_map.get(pid, ""),
+                                "qty": sl.get("product_uom_qty", 0),
+                            })
+                        sos_raw = [so for so in sos_raw if so["id"] in matching_so_ids]
+                    else:
+                        return json.dumps({
+                            "total_found": 0,
+                            "orders": [],
+                            "matching_customers": len(partners_raw),
+                            "note": f"Found matching customers but none of their orders contain SKU '{sku}'."
+                        })
+                else:
+                    return json.dumps({
+                        "total_found": 0,
+                        "orders": [],
+                        "note": f"Product SKU '{sku}' not found in Odoo."
+                    })
+
+            # Step 4: Build result
+            orders = []
+            for so in sos_raw[:20]:  # Cap at 20
+                # Delivery address
+                ship_id = None
+                if so.get("partner_shipping_id") and isinstance(so["partner_shipping_id"], (list, tuple)):
+                    ship_id = so["partner_shipping_id"][0]
+                    ship_name = so["partner_shipping_id"][1] if len(so["partner_shipping_id"]) > 1 else ""
+                else:
+                    ship_name = ""
+
+                # Customer
+                cust_id = None
+                if so.get("partner_id") and isinstance(so["partner_id"], (list, tuple)):
+                    cust_id = so["partner_id"][0]
+                    cust_display = so["partner_id"][1] if len(so["partner_id"]) > 1 else ""
+                else:
+                    cust_display = ""
+
+                # Get delivery address details if not already in partner_map
+                delivery_addr = ""
+                if ship_id and ship_id in partner_map:
+                    delivery_addr = partner_map[ship_id]["address"]
+                elif ship_id:
+                    # Fetch it
+                    addr_r = json.loads(await odoo_query(
+                        "res.partner", [["id", "=", ship_id]],
+                        ["street", "city", "state_id", "zip"],
+                        limit=1
+                    ))
+                    if isinstance(addr_r, list) and addr_r:
+                        a = addr_r[0]
+                        st_name = ""
+                        if a.get("state_id") and isinstance(a["state_id"], (list, tuple)):
+                            st_name = a["state_id"][1] if len(a["state_id"]) > 1 else ""
+                        delivery_addr = ", ".join(filter(None, [
+                            a.get("street") or "", a.get("city") or "", st_name, a.get("zip") or ""
+                        ]))
+
+                order_info = {
+                    "order": so.get("name") or "",
+                    "customer": cust_display,
+                    "delivery_address": delivery_addr or ship_name,
+                    "date": so.get("date_order") or "",
+                    "status": so.get("state") or "",
+                    "total": so.get("amount_total") or 0,
+                }
+                # Add product match info if we filtered by SKU
+                if sku and 'so_product_info' in dir() and so["id"] in so_product_info:
+                    order_info["matched_products"] = so_product_info[so["id"]]
+                orders.append(order_info)
+
+            return json.dumps({
+                "total_found": len(orders),
+                "search_criteria": {k: v for k, v in {
+                    "street": street, "city": city, "state": state,
+                    "zip": zip_code, "name": cust_name, "phone": phone, "sku": sku
+                }.items() if v},
+                "orders": orders,
+            }, default=str, ensure_ascii=False)
+        except Exception as e:
+            return json.dumps({"error": f"Order search failed: {str(e)}"})
+
     if name == "search_documents":
         conn = await get_db_conn()
         if not conn:
@@ -9986,6 +10246,7 @@ TOOL_PROGRESS_LABELS_ZH = {
     "odoo_restock_analysis":       "📦 正在分析补货...",
     "get_incoming_products":       "🚚 正在查即将到货产品...",
     "get_shipment_eta":            "📦 正在查询到货时间...",
+    "find_order_by_address_product": "🔍 正在按地址和产品查订单...",
     "odoo_create_record":          "✏️ 正在创建记录...",
     "odoo_update_record":          "✏️ 正在更新记录...",
     "odoo_add_order_line":         "➕ 正在添加订单行...",
@@ -10026,6 +10287,7 @@ TOOL_PROGRESS_LABELS_EN = {
     "odoo_restock_analysis":       "📦 Analyzing restock...",
     "get_incoming_products":       "🚚 Checking incoming products...",
     "get_shipment_eta":            "📦 Checking shipment ETA...",
+    "find_order_by_address_product": "🔍 Searching orders by address & product...",
     "odoo_create_record":          "✏️ Creating record...",
     "odoo_update_record":          "✏️ Updating record...",
     "odoo_add_order_line":         "➕ Adding order line...",
@@ -10387,6 +10649,11 @@ def _is_live_data_query(text: str) -> bool:
         return True
     # Direct shipment query without SKU
     if any(kw in t for kw in ["什么时候到", "到货", "在途", "shipment"]):
+        return True
+
+    # Address-based order lookup — always needs live data
+    address_keywords = ["zip", "邮编", "地址", "address", "street", "哪个客人", "哪个订单", "找订单", "find order", "查订单"]
+    if any(kw in t for kw in address_keywords):
         return True
 
     return False
