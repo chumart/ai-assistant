@@ -2363,6 +2363,19 @@ TOOLS = [
         }
     },
     {
+        "name": "odoo_search_products_by_brand",
+        "description": "Search products filtered by brand (x_brand field in Odoo). USE THIS whenever the user asks about products from a specific brand like 'Thunder Group有什么sponge', 'Winco的刀有哪些', 'show me all Polarman freezers'. This tool resolves brand name → x_brand ID, then filters product.product accurately. ALWAYS prefer this over manual odoo_search when a brand name is mentioned — manual search CANNOT filter by brand reliably and leads to hallucinations. Returns product SKU, name, price, stock qty, and confirmed brand name.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "brand": {"type": "string", "description": "Brand name to filter by (e.g. 'Thunder Group', 'Winco', 'Polarman', 'Flamaster', 'ChefAsst'). Case-insensitive, partial match supported."},
+                "keyword": {"type": "string", "default": "", "description": "Optional product keyword to further filter (e.g. 'sponge', 'knife', 'freezer'). Searches in product name and SKU."},
+                "limit": {"type": "integer", "default": 50, "description": "Max results to return."}
+            },
+            "required": ["brand"]
+        }
+    },
+    {
         "name": "odoo_create_invoice_from_so",
         "description": "Create an invoice from a Sales Order. USE THIS when user says 'release S04100', 'create invoice for CMT12345', '给这个订单开票'. For Shopify (#CMT) and Amazon (AMZ) orders, the SO existing in Odoo means payment is confirmed — can proceed directly. For normal orders (S-prefix), require explicit payment confirmation first. Returns the created invoice ID and name.",
         "input_schema": {
@@ -3115,6 +3128,21 @@ ORDER LOOKUP BY ADDRESS/PRODUCT: When customer doesn't know their order number:
 - 涉及库存/客户/订单：用 odoo_search，company_id=1，stock加 location_id.usage=internal
 - 涉及产品搜索：name 和 default_code 都用 ilike，OR 逻辑
 
+【品牌产品搜索 — 最高优先级规则】
+当用户提到品牌名称（如 Thunder Group, Winco, Polarman, Flamaster, ChefAsst, Omcan 等）并询问该品牌的产品时：
+  ✅ 必须使用 odoo_search_products_by_brand(brand="Thunder Group", keyword="sponge")
+  ❌ 禁止用 odoo_search 手动搜索 product.product 然后猜测品牌归属
+  ❌ 禁止根据 SKU 前缀推断品牌（SP- 不代表 Thunder Group，可能是 Winco 或其他品牌）
+  ❌ 禁止在搜不到结果后编造品牌归属关系
+如果 odoo_search_products_by_brand 返回空结果，如实告知用户："该品牌下没有找到相关产品"，不要自行猜测。
+BRAND PRODUCT SEARCH — HIGHEST PRIORITY RULE:
+When user mentions a brand name and asks about products from that brand:
+  ✅ MUST use odoo_search_products_by_brand(brand="...", keyword="...")
+  ❌ NEVER use odoo_search on product.product and then guess which brand a product belongs to
+  ❌ NEVER infer brand from SKU prefix (SP- does NOT mean Thunder Group; it could be Winco or others)
+  ❌ NEVER fabricate brand attribution when search returns no results
+If the tool returns empty, honestly say "no products found for that brand" — do NOT guess.
+
 【数据展示】
 - 财务数字用 $ 加千位分隔符
 - 表格数据用 Markdown 表格格式 | col | col |
@@ -3165,6 +3193,7 @@ GENERAL ODOO RULES:
 - For product.product, stock.quant: do NOT add company_id filter
 - For stock queries always add ["location_id.usage","=","internal"]
 - For product search use ilike on both name and default_code with OR logic
+- BRAND FILTER: When user mentions a brand name (Thunder Group, Winco, Polarman, Flamaster, ChefAsst, Omcan, etc.) and asks about products → MUST use odoo_search_products_by_brand. NEVER guess brand from SKU prefix.
 - CONTEXT LIMIT: Never set limit > 200 on any query. If you need more data, break into multiple smaller queries (e.g. by date range or by product batch). Large result sets will crash the system.
 - When comparing a PDF/file with Odoo data: extract the specific SKUs from the file FIRST, then query Odoo using only those SKUs. Do NOT pull all records from a vendor and try to match — that will exceed context limits.
 
@@ -4291,6 +4320,88 @@ async def run_tool(name, inp, context=None):
         if result.get("error"):
             return json.dumps({"error": result["error"]})
         return json.dumps({"success": True, "message": "Record updated successfully"})
+
+    if name == "odoo_search_products_by_brand":
+        brand_name = inp.get("brand", "").strip()
+        keyword = inp.get("keyword", "").strip()
+        limit = inp.get("limit", 50)
+        if not brand_name:
+            return json.dumps({"error": "brand is required"})
+
+        # Step 1: resolve brand name → x_brand record ID
+        brand_r = json.loads(await odoo_query(
+            "x_brand",
+            [["x_name", "ilike", brand_name]],
+            ["id", "x_name"],
+            limit=10, order="x_name asc"
+        ))
+        if isinstance(brand_r, dict) and brand_r.get("error"):
+            # x_brand model might not exist — fallback message
+            return json.dumps({"error": f"Could not query brand table: {brand_r.get('error')}. The x_brand model may not be available."})
+        if not isinstance(brand_r, list) or not brand_r:
+            return json.dumps({
+                "brand_query": brand_name,
+                "found": False,
+                "message": f"No brand matching '{brand_name}' found in Odoo x_brand table.",
+                "products": []
+            })
+
+        brand_ids = [b["id"] for b in brand_r]
+        brand_names = [b.get("x_name", "") for b in brand_r]
+        print(f"[BRAND-SEARCH] brand='{brand_name}' → x_brand IDs={brand_ids} names={brand_names}")
+
+        # Step 2: find product.template IDs with this brand
+        tmpl_domain = [["x_brand", "in", brand_ids]]
+        if keyword:
+            tmpl_domain = tmpl_domain + ["|", ["name", "ilike", keyword], ["default_code", "ilike", keyword]]
+        tmpl_r = json.loads(await odoo_query(
+            "product.template",
+            tmpl_domain,
+            ["id", "name", "default_code", "x_brand"],
+            limit=limit * 2, order="default_code asc"
+        ))
+        if not isinstance(tmpl_r, list) or not tmpl_r:
+            return json.dumps({
+                "brand_query": brand_name,
+                "brand_matched": brand_names,
+                "keyword": keyword or "(none)",
+                "found": False,
+                "message": f"Brand '{brand_names[0]}' exists but no products found" + (f" matching '{keyword}'" if keyword else "") + ".",
+                "products": []
+            })
+
+        tmpl_ids = [t["id"] for t in tmpl_r]
+
+        # Step 3: get product.product variants with stock and price
+        prod_r = json.loads(await odoo_query(
+            "product.product",
+            [["product_tmpl_id", "in", tmpl_ids], ["active", "=", True]],
+            ["id", "default_code", "name", "list_price", "qty_available", "product_tmpl_id"],
+            limit=limit, order="default_code asc"
+        ))
+        if not isinstance(prod_r, list):
+            prod_r = []
+
+        products = []
+        for p in prod_r:
+            products.append({
+                "sku": p.get("default_code") or "",
+                "name": p.get("name") or "",
+                "price": p.get("list_price", 0),
+                "qty_available": p.get("qty_available", 0),
+                "product_id": p.get("id"),
+            })
+
+        print(f"[BRAND-SEARCH] brand='{brand_names}' keyword='{keyword}' → {len(products)} products")
+        return json.dumps({
+            "brand_query": brand_name,
+            "brand_matched": brand_names,
+            "keyword": keyword or "(none)",
+            "found": True,
+            "total": len(products),
+            "products": products,
+            "instruction": "These products are confirmed to belong to the brand via Odoo x_brand field. Show them in a clean table. Do NOT add or remove products from this list."
+        }, ensure_ascii=False)
 
     if name == "odoo_search_products_by_sku":
         skus = inp.get("skus", [])
@@ -10293,6 +10404,7 @@ TOOL_PROGRESS_LABELS_ZH = {
     "get_incoming_products":       "🚚 正在查即将到货产品...",
     "get_shipment_eta":            "📦 正在查询到货时间...",
     "find_order_by_address_product": "🔍 正在按地址和产品查订单...",
+    "odoo_search_products_by_brand": "🏷 正在按品牌搜索产品...",
     "odoo_create_record":          "✏️ 正在创建记录...",
     "odoo_update_record":          "✏️ 正在更新记录...",
     "odoo_add_order_line":         "➕ 正在添加订单行...",
@@ -10334,6 +10446,7 @@ TOOL_PROGRESS_LABELS_EN = {
     "get_incoming_products":       "🚚 Checking incoming products...",
     "get_shipment_eta":            "📦 Checking shipment ETA...",
     "find_order_by_address_product": "🔍 Searching orders by address & product...",
+    "odoo_search_products_by_brand": "🏷 Searching products by brand...",
     "odoo_create_record":          "✏️ Creating record...",
     "odoo_update_record":          "✏️ Updating record...",
     "odoo_add_order_line":         "➕ Adding order line...",
@@ -10700,6 +10813,14 @@ def _is_live_data_query(text: str) -> bool:
     # Address-based order lookup — always needs live data
     address_keywords = ["zip", "邮编", "地址", "address", "street", "哪个客人", "哪个订单", "找订单", "find order", "查订单"]
     if any(kw in t for kw in address_keywords):
+        return True
+
+    # Brand + product query — must search Odoo, never guess from SKU prefix
+    brand_names = ["thunder group", "winco", "omcan", "polarman", "flamaster", "chefasst",
+                   "true", "turbo air", "beverage-air", "continental", "atosa"]
+    product_intent = ["有没有", "有什么", "哪些", "产品", "型号", "product", "model",
+                      "sponge", "knife", "刀", "pan", "锅", "shelf", "架", "catalog"]
+    if any(b in t for b in brand_names) and any(kw in t for kw in product_intent):
         return True
 
     return False
