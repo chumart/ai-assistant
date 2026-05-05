@@ -4283,8 +4283,9 @@ async def run_tool(name, inp, context=None):
         query = inp.get("query", "")
         top_k = min(inp.get("top_k", 10), 20)
         doc_name = inp.get("doc_name", "")
+        category = inp.get("category", "")
 
-        results = await search_knowledge(query, top_k, doc_name_filter=doc_name)
+        results = await search_knowledge(query, top_k, category=category or None, doc_name_filter=doc_name or None)
         if not results:
             return "No relevant knowledge found in knowledge base or documents."
         parts = []
