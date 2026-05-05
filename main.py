@@ -15,7 +15,6 @@ import hashlib
 from urllib.parse import urljoin, urlparse
 from typing import Optional
 from zoneinfo import ZoneInfo
-1
 
 app = FastAPI()
 
