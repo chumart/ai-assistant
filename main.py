@@ -800,6 +800,41 @@ async def r2_delete(r2_key: str) -> bool:
         print(f"R2 delete error: {e}")
         return False
 
+async def r2_presign(r2_key: str, expires: int = 3600, download_name: str = "") -> str:
+    """Generate a presigned URL for an R2 object (no public URL needed)."""
+    try:
+        import asyncio
+        loop = asyncio.get_event_loop()
+        client = get_r2_client()
+        if not client:
+            return ""
+        params = {'Bucket': R2_BUCKET, 'Key': r2_key}
+        if download_name:
+            params['ResponseContentDisposition'] = f'attachment; filename="{download_name}"'
+        url = await loop.run_in_executor(None, lambda: client.generate_presigned_url(
+            'get_object', Params=params, ExpiresIn=expires
+        ))
+        return url
+    except Exception as e:
+        print(f"R2 presign error: {e}")
+        return ""
+
+async def r2_download_bytes(r2_key: str) -> bytes | None:
+    """Download file bytes from R2 via S3 API (no public URL needed)."""
+    try:
+        import asyncio
+        loop = asyncio.get_event_loop()
+        client = get_r2_client()
+        if not client:
+            return None
+        response = await loop.run_in_executor(None, lambda: client.get_object(
+            Bucket=R2_BUCKET, Key=r2_key
+        ))
+        return response['Body'].read()
+    except Exception as e:
+        print(f"R2 download error: {e}")
+        return None
+
 # ─────────────────────────────────────────────
 # Document text extraction
 # ─────────────────────────────────────────────
@@ -1142,20 +1177,70 @@ async def crawl_site(site: dict, log_id: int):
     total_chunks = 0
     total_pages = 0
 
+    # Strict domain whitelist — only crawl our own domains
+    allowed_domains = {urlparse(s["url"]).netloc for s in TARGET_SITES}
+    allowed_domains.update({d.replace("www.", "") for d in allowed_domains})
+    allowed_domains.update({"www." + d for d in allowed_domains})
+    base_domain = urlparse(base_url).netloc
+
+    if base_domain not in allowed_domains:
+        print(f"[CRAWLER] BLOCKED: {base_domain} is not in allowed domains {allowed_domains}")
+        return
+
     # Delete old data for this site
     await conn.execute("DELETE FROM knowledge_chunks WHERE site_url = $1", base_url)
 
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
+        "User-Agent": "ChumartBot/1.0 (+https://www.chumartusa.com/bot-info)",
         "Accept": "text/html,application/xhtml+xml",
         "Accept-Language": "en-US,en;q=0.9"
     }
+
+    # Check robots.txt first
+    robots_url = f"{urlparse(base_url).scheme}://{base_domain}/robots.txt"
+    disallowed_paths = []
+    try:
+        async with httpx.AsyncClient(timeout=10) as rc:
+            robots_r = await rc.get(robots_url, headers=headers)
+            if robots_r.status_code == 200:
+                current_agent_applies = False
+                for line in robots_r.text.splitlines():
+                    line = line.strip().lower()
+                    if line.startswith("user-agent:"):
+                        agent = line.split(":", 1)[1].strip()
+                        current_agent_applies = agent in ("*", "chumartbot")
+                    elif line.startswith("disallow:") and current_agent_applies:
+                        path = line.split(":", 1)[1].strip()
+                        if path:
+                            disallowed_paths.append(path)
+                print(f"[CRAWLER] robots.txt for {base_domain}: {len(disallowed_paths)} disallowed paths")
+    except Exception as e:
+        print(f"[CRAWLER] Could not fetch robots.txt for {base_domain}: {e}")
+
+    def is_allowed_by_robots(url: str) -> bool:
+        path = urlparse(url).path
+        for dp in disallowed_paths:
+            if path.startswith(dp):
+                return False
+        return True
 
     async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
         while to_visit and len(visited) < 200:  # Max 200 pages per site
             url = to_visit.pop(0)
             if url in visited:
                 continue
+
+            # Domain safety check — never follow links outside allowed domains
+            url_domain = urlparse(url).netloc
+            if url_domain not in allowed_domains:
+                print(f"[CRAWLER] SKIPPED external: {url}")
+                continue
+
+            # robots.txt check
+            if not is_allowed_by_robots(url):
+                print(f"[CRAWLER] SKIPPED robots.txt disallowed: {url}")
+                continue
+
             visited.add(url)
 
             try:
@@ -1173,10 +1258,11 @@ async def crawl_site(site: dict, log_id: int):
                 if len(text) < 100:
                     continue
 
-                # Get new links to crawl
+                # Get new links to crawl — only same domain
                 new_links = extract_links(html, url)
                 for link in new_links:
-                    if link not in visited and link not in to_visit:
+                    link_domain = urlparse(link).netloc
+                    if link_domain in allowed_domains and link not in visited and link not in to_visit:
                         to_visit.append(link)
 
                 # Chunk and embed
@@ -1192,11 +1278,11 @@ async def crawl_site(site: dict, log_id: int):
                         total_chunks += 1
 
                 total_pages += 1
-                print(f"Crawled: {url} ({len(chunks)} chunks)")
-                await asyncio.sleep(0.5)  # Be polite
+                print(f"[CRAWLER] Crawled: {url} ({len(chunks)} chunks)")
+                await asyncio.sleep(1.0)  # Be polite — 1 second between requests
 
             except Exception as e:
-                print(f"Error crawling {url}: {e}")
+                print(f"[CRAWLER] Error crawling {url}: {e}")
                 continue
 
     # Update crawl log
@@ -7414,7 +7500,9 @@ async def run_tool(name, inp, context=None):
             if not ok:
                 return json.dumps({"error": "Failed to upload PDF to storage"})
 
-            download_url = f"{R2_PUBLIC_URL}/{r2_key}"
+            download_url = await r2_presign(r2_key, expires=7200, download_name=f"{safe_name}.pdf")
+            if not download_url:
+                download_url = f"{R2_PUBLIC_URL}/{r2_key}"  # fallback
 
             print(f"EXPORT_PDF: {inv_name} → {len(pdf_bytes)} bytes → {r2_key}")
 
@@ -8606,15 +8694,12 @@ async def reindex_docs(admin_key: str = "", background_tasks: BackgroundTasks = 
                 category = row["category"]
                 mime_type = row["mime_type"]
                 original_name = row["original_name"]
-                # Fetch file bytes from R2
-                url = f"{R2_PUBLIC_URL}/{r2_key}"
-                async with httpx.AsyncClient(timeout=60) as c:
-                    r = await c.get(url)
-                    if r.status_code != 200:
-                        print(f"REINDEX FAIL fetch {original_name}: HTTP {r.status_code}")
-                        fail_count += 1
-                        continue
-                    file_bytes = r.content
+                # Fetch file bytes from R2 via S3 API (no public URL needed)
+                file_bytes = await r2_download_bytes(r2_key)
+                if not file_bytes:
+                    print(f"REINDEX FAIL fetch {original_name}: could not download from R2")
+                    fail_count += 1
+                    continue
                 text = await extract_text_from_file(file_bytes, original_name, mime_type)
                 if text:
                     count = await process_document_to_kb(doc_id, original_name, text, category)
@@ -9731,7 +9816,9 @@ async def upload_doc(
         doc_id = str(uuid.uuid4())
         ext = file.filename.rsplit('.', 1)[-1].lower() if '.' in file.filename else 'bin'
         r2_key = f"{category}/{doc_id}.{ext}"
-        public_url = f"{R2_PUBLIC_URL}/{r2_key}"
+        # Use signed URL endpoint instead of R2 public URL
+        backend_host = os.getenv("RAILWAY_PUBLIC_DOMAIN", "chumart-ai.up.railway.app")
+        public_url = f"https://{backend_host}/docs/signed-url/{doc_id}"
 
         # Determine mime type
         mime_map = {
