@@ -416,6 +416,26 @@ async def init_db():
             ON received_payments(channel, external_ref)
             WHERE external_ref != ''
         """)
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS po_reminder_schedules (
+                id SERIAL PRIMARY KEY,
+                time_pt VARCHAR(10) NOT NULL,
+                target_user VARCHAR(100) NOT NULL DEFAULT 'Ashley',
+                active BOOLEAN NOT NULL DEFAULT TRUE,
+                only_payment_pos BOOLEAN NOT NULL DEFAULT TRUE,
+                created_at TIMESTAMPTZ DEFAULT NOW(),
+                updated_at TIMESTAMPTZ DEFAULT NOW()
+            )
+        """)
+        # Insert default schedules if empty
+        existing = await conn.fetchval("SELECT COUNT(*) FROM po_reminder_schedules")
+        if existing == 0:
+            await conn.execute("""
+                INSERT INTO po_reminder_schedules (time_pt, target_user, active, only_payment_pos) VALUES
+                ('10:30', 'Ashley', TRUE, TRUE),
+                ('15:30', 'Ashley', TRUE, TRUE)
+            """)
+            print("Default PO reminder schedules created: 10:30 AM, 3:30 PM")
         print("DB initialized OK")
     except Exception as e:
         print(f"DB init error: {e}")
@@ -490,6 +510,19 @@ async def startup():
             print("Zelle Gmail monitor started (90s interval)")
         scheduler.start()
         print("Reminder scheduler started (60s interval)")
+
+        # PO confirmation reminders — check every minute, fire based on DB schedule
+        try:
+            scheduler.add_job(
+                _po_reminder_check,
+                "interval",
+                seconds=60,
+                id="po_reminder_checker",
+                replace_existing=True,
+            )
+            print("PO reminder checker started (60s interval, reads schedules from DB)")
+        except Exception as e:
+            print(f"WARNING: Failed to schedule PO reminder checker: {e}")
     except ImportError:
         print("WARNING: apscheduler not installed — reminders will not fire automatically")
     except Exception as e:
@@ -709,6 +742,214 @@ async def _check_due_reminders():
         print(f"check_due_reminders error: {e}")
     finally:
         await conn.close()
+
+
+# Track last fired times to avoid duplicate sends within the same minute
+_po_reminder_last_fired = {}
+
+async def _po_reminder_check():
+    """Check DB for active PO reminder schedules and fire if current time matches."""
+    import datetime, pytz
+    pt = pytz.timezone("America/Los_Angeles")
+    now_pt = datetime.datetime.now(pt)
+    current_hm = now_pt.strftime("%H:%M")  # e.g. "10:30", "15:30"
+    today_key = now_pt.strftime("%Y-%m-%d")
+
+    conn = await get_db_conn()
+    if not conn:
+        return
+    try:
+        rows = await conn.fetch(
+            "SELECT id, time_pt, target_user, only_payment_pos FROM po_reminder_schedules WHERE active = TRUE"
+        )
+        for row in rows:
+            schedule_time = row["time_pt"].strip()  # e.g. "10:30"
+            fire_key = f"{row['id']}_{today_key}_{schedule_time}"
+            if current_hm == schedule_time and fire_key not in _po_reminder_last_fired:
+                _po_reminder_last_fired[fire_key] = True
+                # Clean old keys (keep only today's)
+                for k in list(_po_reminder_last_fired.keys()):
+                    if today_key not in k:
+                        del _po_reminder_last_fired[k]
+                # Fire the reminder
+                await _po_confirmation_reminder(
+                    target_user=row["target_user"],
+                    only_payment_pos=row["only_payment_pos"],
+                )
+    except Exception as e:
+        print(f"[PO-REMINDER] check error: {e}")
+    finally:
+        await conn.close()
+
+
+async def _po_confirmation_reminder(target_user: str = "Ashley", only_payment_pos: bool = True):
+    """PO confirmation reminder. Queries Odoo for draft POs and sends message via Odoo Discuss."""
+    import datetime, pytz
+    pt = pytz.timezone("America/Los_Angeles")
+    now_pt = datetime.datetime.now(pt)
+    time_label = now_pt.strftime("%I:%M %p")
+    print(f"[PO-REMINDER] Running at {time_label} PT for {target_user}")
+
+    try:
+        cookies = await odoo_get_session()
+
+        # 1. Get configured brand IDs (purchase-on-payment brands)
+        brand_ids = []
+        if only_payment_pos:
+            brand_r = await _odoo_call("purchase.on.payment.brand", "search_read",
+                [[["active", "=", True]]],
+                {"fields": ["id", "brand_id", "name"], "limit": 100},
+                cookies=cookies)
+            if brand_r:
+                brand_ids = [b["brand_id"][0] if isinstance(b.get("brand_id"), list) else b.get("brand_id") for b in brand_r]
+                brand_names = [b.get("name", "") for b in brand_r]
+                print(f"[PO-REMINDER] Payment brands: {brand_names} (IDs={brand_ids})")
+
+        # 2. Find draft POs
+        po_domain = [["state", "=", "draft"], ["company_id", "=", 1]]
+        po_r = await _odoo_call("purchase.order", "search_read",
+            [po_domain],
+            {"fields": ["id", "name", "partner_id", "amount_total", "date_order", "origin", "order_line"],
+             "limit": 200, "order": "partner_id asc, date_order desc"},
+            cookies=cookies)
+
+        if not po_r:
+            # Send "no POs" message
+            msg_body = f"🕐 <b>PO Confirmation — {time_label} PT</b><br/><br/>目前没有待确认的 PO。No draft POs at this time."
+            await _send_po_reminder_message(target_user, msg_body, cookies)
+            print(f"[PO-REMINDER] No draft POs found. Sent 'no POs' message to {target_user}.")
+            return
+
+        # 3. If only_payment_pos, filter POs that contain products from configured brands
+        if only_payment_pos and brand_ids:
+            filtered_pos = []
+            for po in po_r:
+                # Check PO lines for matching brand products
+                line_ids = po.get("order_line", [])
+                if not line_ids:
+                    continue
+                # Read PO lines to check product brands
+                line_r = await _odoo_call("purchase.order.line", "read",
+                    [line_ids],
+                    {"fields": ["product_id"]},
+                    cookies=cookies)
+                if not line_r:
+                    continue
+                product_ids = [l["product_id"][0] if isinstance(l.get("product_id"), list) else l.get("product_id") for l in line_r if l.get("product_id")]
+                if not product_ids:
+                    continue
+                # Check if any product belongs to configured brands
+                prod_r = await _odoo_call("product.product", "read",
+                    [product_ids],
+                    {"fields": ["product_tmpl_id"]},
+                    cookies=cookies)
+                tmpl_ids = list(set(p["product_tmpl_id"][0] if isinstance(p.get("product_tmpl_id"), list) else p.get("product_tmpl_id") for p in prod_r if p.get("product_tmpl_id")))
+                if not tmpl_ids:
+                    continue
+                tmpl_r = await _odoo_call("product.template", "read",
+                    [tmpl_ids],
+                    {"fields": ["x_brand"]},
+                    cookies=cookies)
+                po_brand_ids = [t["x_brand"][0] if isinstance(t.get("x_brand"), list) else t.get("x_brand") for t in tmpl_r if t.get("x_brand")]
+                if any(bid in brand_ids for bid in po_brand_ids):
+                    filtered_pos.append(po)
+
+            po_r = filtered_pos
+            print(f"[PO-REMINDER] After brand filter: {len(po_r)} POs")
+
+        if not po_r:
+            msg_body = f"🕐 <b>PO Confirmation — {time_label} PT</b><br/><br/>目前没有待确认的 PO（付款触发的）。No payment-triggered draft POs at this time."
+            await _send_po_reminder_message(target_user, msg_body, cookies)
+            print(f"[PO-REMINDER] No matching POs after brand filter. Sent message to {target_user}.")
+            return
+
+        # 4. Build summary message
+        total_pos = len(po_r)
+        total_amount = sum(p.get("amount_total", 0) for p in po_r)
+        vendors = {}
+        for po in po_r:
+            vendor_name = po.get("partner_id", [0, "Unknown"])[1] if isinstance(po.get("partner_id"), list) else str(po.get("partner_id", "Unknown"))
+            if vendor_name not in vendors:
+                vendors[vendor_name] = []
+            vendors[vendor_name].append(po)
+
+        lines = [f"🕐 <b>PO Confirmation Reminder — {time_label} PT</b>", ""]
+        lines.append(f"有 <b>{total_pos}</b> 个待确认 PO，总金额 <b>${total_amount:,.2f}</b>：")
+        lines.append("")
+        for vendor, pos in vendors.items():
+            vendor_total = sum(p.get("amount_total", 0) for p in pos)
+            po_names = ", ".join(p.get("name", "?") for p in pos)
+            origins = ", ".join(set(p.get("origin", "") for p in pos if p.get("origin")))
+            lines.append(f"• <b>{vendor}</b>: {len(pos)} PO(s) — ${vendor_total:,.2f}")
+            lines.append(f"  {po_names}")
+            if origins:
+                lines.append(f"  来源 SO: {origins}")
+        lines.append("")
+        lines.append("请在 Odoo 中确认这些 PO，或在这里回复。")
+
+        msg_body = "<br/>".join(lines)
+        await _send_po_reminder_message(target_user, msg_body, cookies)
+        print(f"[PO-REMINDER] Sent to {target_user}: {total_pos} POs, ${total_amount:,.2f}")
+
+    except Exception as e:
+        import traceback
+        print(f"[PO-REMINDER] Error: {e}")
+        traceback.print_exc()
+
+
+async def _send_po_reminder_message(target_user: str, msg_body: str, cookies=None):
+    """Send a message to target user via Odoo Discuss DM from ChumartAI bot."""
+    if not cookies:
+        cookies = await odoo_get_session()
+
+    # Find target user
+    user_r = await _odoo_call("res.users", "search_read",
+        [[["name", "ilike", target_user], ["active", "=", True]]],
+        {"fields": ["id", "name", "partner_id"], "limit": 5},
+        cookies=cookies)
+    if not user_r:
+        print(f"[PO-REMINDER] Could not find user '{target_user}' in Odoo.")
+        return
+
+    target = user_r[0]
+    target_partner_id = target["partner_id"][0] if isinstance(target.get("partner_id"), list) else target.get("partner_id")
+
+    # Find bot partner
+    bot_r = await _odoo_call("res.partner", "search_read",
+        [[["name", "ilike", "chumart%ai"]]],
+        {"fields": ["id", "name"], "limit": 5},
+        cookies=cookies)
+    if not bot_r:
+        print(f"[PO-REMINDER] Could not find ChumartAI bot partner.")
+        return
+    exact = [p for p in bot_r if p.get("name", "").lower().replace(" ", "") == "chumartai"]
+    bot_partner_id = (exact[0] if exact else bot_r[0])["id"]
+
+    # Find existing DM channel
+    channel_r = await _odoo_call("discuss.channel", "search_read",
+        [[["channel_type", "=", "chat"],
+          ["channel_partner_ids", "in", [target_partner_id]],
+          ["channel_partner_ids", "in", [bot_partner_id]]]],
+        {"fields": ["id", "name"], "limit": 5},
+        cookies=cookies)
+
+    if channel_r:
+        channel_id = channel_r[0]["id"]
+    else:
+        try:
+            create_r = await _odoo_call("discuss.channel", "channel_get",
+                [[target_partner_id]], {}, cookies=cookies)
+            if create_r and isinstance(create_r, dict) and create_r.get("id"):
+                channel_id = create_r["id"]
+            else:
+                print(f"[PO-REMINDER] Could not create DM channel for {target_user}.")
+                return
+        except Exception as e:
+            print(f"[PO-REMINDER] Failed to create DM channel: {e}")
+            return
+
+    await _odoo_bot_post_progress(channel_id, msg_body)
+
 
 # ─────────────────────────────────────────────
 # Embedding
@@ -10109,6 +10350,113 @@ async def admin_delete_reminder(reminder_id: int, admin_key: str = ""):
         return {"error": f"Reminder {reminder_id} not found"}
     finally:
         await conn.close()
+
+
+# ─── PO Reminder Schedule Endpoints ───────────────────────────
+@app.get("/admin/po-reminders")
+async def list_po_reminders(admin_key: str = ""):
+    """List all PO reminder schedules."""
+    if admin_key != os.getenv("ADMIN_KEY", "chumart2024"):
+        return {"error": "Invalid admin key"}
+    conn = await get_db_conn()
+    if not conn:
+        return {"error": "DB not connected"}
+    try:
+        rows = await conn.fetch("SELECT * FROM po_reminder_schedules ORDER BY time_pt ASC")
+        return {"schedules": [dict(r) for r in rows]}
+    finally:
+        await conn.close()
+
+@app.post("/admin/po-reminders")
+async def create_po_reminder(admin_key: str = "", time_pt: str = "", target_user: str = "Ashley", only_payment_pos: bool = True):
+    """Create a new PO reminder schedule."""
+    if admin_key != os.getenv("ADMIN_KEY", "chumart2024"):
+        return {"error": "Invalid admin key"}
+    if not time_pt or ":" not in time_pt:
+        return {"error": "time_pt is required in HH:MM format (24h), e.g. '10:30', '15:30'"}
+    # Validate time format
+    try:
+        h, m = time_pt.strip().split(":")
+        h, m = int(h), int(m)
+        if not (0 <= h <= 23 and 0 <= m <= 59):
+            raise ValueError
+        time_pt = f"{h:02d}:{m:02d}"
+    except:
+        return {"error": "Invalid time format. Use HH:MM (24h), e.g. '10:30', '15:30'"}
+
+    conn = await get_db_conn()
+    if not conn:
+        return {"error": "DB not connected"}
+    try:
+        row = await conn.fetchrow(
+            "INSERT INTO po_reminder_schedules (time_pt, target_user, active, only_payment_pos) VALUES ($1, $2, TRUE, $3) RETURNING *",
+            time_pt, target_user.strip(), only_payment_pos
+        )
+        return {"success": True, "schedule": dict(row)}
+    finally:
+        await conn.close()
+
+@app.put("/admin/po-reminders/{schedule_id}")
+async def update_po_reminder(schedule_id: int, admin_key: str = "", time_pt: str = "", target_user: str = "", active: bool = None, only_payment_pos: bool = None):
+    """Update a PO reminder schedule."""
+    if admin_key != os.getenv("ADMIN_KEY", "chumart2024"):
+        return {"error": "Invalid admin key"}
+    conn = await get_db_conn()
+    if not conn:
+        return {"error": "DB not connected"}
+    try:
+        existing = await conn.fetchrow("SELECT * FROM po_reminder_schedules WHERE id=$1", schedule_id)
+        if not existing:
+            return {"error": f"Schedule {schedule_id} not found"}
+
+        new_time = existing["time_pt"]
+        if time_pt and ":" in time_pt:
+            try:
+                h, m = time_pt.strip().split(":")
+                h, m = int(h), int(m)
+                if 0 <= h <= 23 and 0 <= m <= 59:
+                    new_time = f"{h:02d}:{m:02d}"
+            except:
+                pass
+
+        new_target = target_user.strip() if target_user else existing["target_user"]
+        new_active = active if active is not None else existing["active"]
+        new_only = only_payment_pos if only_payment_pos is not None else existing["only_payment_pos"]
+
+        await conn.execute(
+            "UPDATE po_reminder_schedules SET time_pt=$1, target_user=$2, active=$3, only_payment_pos=$4, updated_at=NOW() WHERE id=$5",
+            new_time, new_target, new_active, new_only, schedule_id
+        )
+        return {"success": True, "id": schedule_id}
+    finally:
+        await conn.close()
+
+@app.delete("/admin/po-reminders/{schedule_id}")
+async def delete_po_reminder(schedule_id: int, admin_key: str = ""):
+    """Delete a PO reminder schedule."""
+    if admin_key != os.getenv("ADMIN_KEY", "chumart2024"):
+        return {"error": "Invalid admin key"}
+    conn = await get_db_conn()
+    if not conn:
+        return {"error": "DB not connected"}
+    try:
+        result = await conn.execute("DELETE FROM po_reminder_schedules WHERE id=$1", schedule_id)
+        if result.endswith(" 1"):
+            return {"status": "deleted", "id": schedule_id}
+        return {"error": f"Schedule {schedule_id} not found"}
+    finally:
+        await conn.close()
+
+@app.post("/admin/po-reminders/test")
+async def test_po_reminder(admin_key: str = "", target_user: str = "Ashley", only_payment_pos: bool = True):
+    """Test-fire a PO reminder immediately."""
+    if admin_key != os.getenv("ADMIN_KEY", "chumart2024"):
+        return {"error": "Invalid admin key"}
+    try:
+        await _po_confirmation_reminder(target_user=target_user, only_payment_pos=only_payment_pos)
+        return {"success": True, "message": f"Test reminder sent to {target_user}"}
+    except Exception as e:
+        return {"error": str(e)}
 
 
 @app.get("/api/reminder-users")
