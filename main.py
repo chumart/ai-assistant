@@ -421,8 +421,9 @@ async def init_db():
                 id SERIAL PRIMARY KEY,
                 time_pt VARCHAR(10) NOT NULL,
                 target_user VARCHAR(100) NOT NULL DEFAULT 'Ashley',
+                message TEXT NOT NULL DEFAULT '',
                 active BOOLEAN NOT NULL DEFAULT TRUE,
-                only_payment_pos BOOLEAN NOT NULL DEFAULT TRUE,
+                only_payment_pos VARCHAR(20) NOT NULL DEFAULT 'none',
                 created_at TIMESTAMPTZ DEFAULT NOW(),
                 updated_at TIMESTAMPTZ DEFAULT NOW()
             )
@@ -431,9 +432,9 @@ async def init_db():
         existing = await conn.fetchval("SELECT COUNT(*) FROM po_reminder_schedules")
         if existing == 0:
             await conn.execute("""
-                INSERT INTO po_reminder_schedules (time_pt, target_user, active, only_payment_pos) VALUES
-                ('10:30', 'Ashley', TRUE, TRUE),
-                ('15:30', 'Ashley', TRUE, TRUE)
+                INSERT INTO po_reminder_schedules (time_pt, target_user, message, active, only_payment_pos) VALUES
+                ('10:30', 'Ashley', 'Please review and confirm today''s PO orders', TRUE, 'payment'),
+                ('15:30', 'Ashley', 'Afternoon PO check — please confirm any remaining draft POs', TRUE, 'payment')
             """)
             print("Default PO reminder schedules created: 10:30 AM, 3:30 PM")
         print("DB initialized OK")
@@ -760,7 +761,7 @@ async def _po_reminder_check():
         return
     try:
         rows = await conn.fetch(
-            "SELECT id, time_pt, target_user, only_payment_pos FROM po_reminder_schedules WHERE active = TRUE"
+            "SELECT id, time_pt, target_user, message, only_payment_pos FROM po_reminder_schedules WHERE active = TRUE"
         )
         for row in rows:
             schedule_time = row["time_pt"].strip()  # e.g. "10:30"
@@ -772,9 +773,12 @@ async def _po_reminder_check():
                     if today_key not in k:
                         del _po_reminder_last_fired[k]
                 # Fire the reminder
+                po_mode = row["only_payment_pos"] or "none"
                 await _po_confirmation_reminder(
                     target_user=row["target_user"],
-                    only_payment_pos=row["only_payment_pos"],
+                    message=row["message"] or "",
+                    only_payment_pos=(po_mode == "payment"),
+                    attach_all_draft=(po_mode == "all_draft"),
                 )
     except Exception as e:
         print(f"[PO-REMINDER] check error: {e}")
@@ -782,8 +786,8 @@ async def _po_reminder_check():
         await conn.close()
 
 
-async def _po_confirmation_reminder(target_user: str = "Ashley", only_payment_pos: bool = True):
-    """PO confirmation reminder. Queries Odoo for draft POs and sends message via Odoo Discuss."""
+async def _po_confirmation_reminder(target_user: str = "Ashley", message: str = "", only_payment_pos: bool = False, attach_all_draft: bool = False):
+    """Scheduled message with optional PO list attachment. Sends via Odoo Discuss."""
     import datetime, pytz
     pt = pytz.timezone("America/Los_Angeles")
     now_pt = datetime.datetime.now(pt)
@@ -793,103 +797,95 @@ async def _po_confirmation_reminder(target_user: str = "Ashley", only_payment_po
     try:
         cookies = await odoo_get_session()
 
-        # 1. Get configured brand IDs (purchase-on-payment brands)
-        brand_ids = []
-        if only_payment_pos:
-            brand_r = await _odoo_call("purchase.on.payment.brand", "search_read",
-                [[["active", "=", True]]],
-                {"fields": ["id", "brand_id", "name"], "limit": 100},
+        # Build message body
+        lines = [f"🕐 <b>{time_label} PT</b>"]
+        if message:
+            lines.append("")
+            lines.append(message)
+
+        # Optionally attach PO list
+        attach_pos = only_payment_pos or attach_all_draft
+        if attach_pos:
+            brand_ids = []
+            if only_payment_pos:
+                brand_r = await _odoo_call("purchase.on.payment.brand", "search_read",
+                    [[["active", "=", True]]],
+                    {"fields": ["id", "brand_id", "name"], "limit": 100},
+                    cookies=cookies)
+                if brand_r:
+                    brand_ids = [b["brand_id"][0] if isinstance(b.get("brand_id"), list) else b.get("brand_id") for b in brand_r]
+                    print(f"[PO-REMINDER] Payment brands: IDs={brand_ids}")
+
+            # Find draft POs
+            po_domain = [["state", "=", "draft"], ["company_id", "=", 1]]
+            po_r = await _odoo_call("purchase.order", "search_read",
+                [po_domain],
+                {"fields": ["id", "name", "partner_id", "amount_total", "date_order", "origin", "order_line"],
+                 "limit": 200, "order": "partner_id asc, date_order desc"},
                 cookies=cookies)
-            if brand_r:
-                brand_ids = [b["brand_id"][0] if isinstance(b.get("brand_id"), list) else b.get("brand_id") for b in brand_r]
-                brand_names = [b.get("name", "") for b in brand_r]
-                print(f"[PO-REMINDER] Payment brands: {brand_names} (IDs={brand_ids})")
 
-        # 2. Find draft POs
-        po_domain = [["state", "=", "draft"], ["company_id", "=", 1]]
-        po_r = await _odoo_call("purchase.order", "search_read",
-            [po_domain],
-            {"fields": ["id", "name", "partner_id", "amount_total", "date_order", "origin", "order_line"],
-             "limit": 200, "order": "partner_id asc, date_order desc"},
-            cookies=cookies)
+            if not po_r:
+                lines.append("")
+                lines.append("No draft POs at this time.")
+            else:
+                # Filter by brand if only_payment_pos
+                if only_payment_pos and brand_ids:
+                    filtered_pos = []
+                    for po in po_r:
+                        line_ids = po.get("order_line", [])
+                        if not line_ids:
+                            continue
+                        line_r = await _odoo_call("purchase.order.line", "read",
+                            [line_ids], {"fields": ["product_id"]}, cookies=cookies)
+                        if not line_r:
+                            continue
+                        product_ids = [l["product_id"][0] if isinstance(l.get("product_id"), list) else l.get("product_id") for l in line_r if l.get("product_id")]
+                        if not product_ids:
+                            continue
+                        prod_r = await _odoo_call("product.product", "read",
+                            [product_ids], {"fields": ["product_tmpl_id"]}, cookies=cookies)
+                        tmpl_ids = list(set(p["product_tmpl_id"][0] if isinstance(p.get("product_tmpl_id"), list) else p.get("product_tmpl_id") for p in prod_r if p.get("product_tmpl_id")))
+                        if not tmpl_ids:
+                            continue
+                        tmpl_r = await _odoo_call("product.template", "read",
+                            [tmpl_ids], {"fields": ["x_brand"]}, cookies=cookies)
+                        po_brand_ids = [t["x_brand"][0] if isinstance(t.get("x_brand"), list) else t.get("x_brand") for t in tmpl_r if t.get("x_brand")]
+                        if any(bid in brand_ids for bid in po_brand_ids):
+                            filtered_pos.append(po)
+                    po_r = filtered_pos
 
-        if not po_r:
-            # Send "no POs" message
-            msg_body = f"🕐 <b>PO Confirmation — {time_label} PT</b><br/><br/>目前没有待确认的 PO。No draft POs at this time."
-            await _send_po_reminder_message(target_user, msg_body, cookies)
-            print(f"[PO-REMINDER] No draft POs found. Sent 'no POs' message to {target_user}.")
-            return
-
-        # 3. If only_payment_pos, filter POs that contain products from configured brands
-        if only_payment_pos and brand_ids:
-            filtered_pos = []
-            for po in po_r:
-                # Check PO lines for matching brand products
-                line_ids = po.get("order_line", [])
-                if not line_ids:
-                    continue
-                # Read PO lines to check product brands
-                line_r = await _odoo_call("purchase.order.line", "read",
-                    [line_ids],
-                    {"fields": ["product_id"]},
-                    cookies=cookies)
-                if not line_r:
-                    continue
-                product_ids = [l["product_id"][0] if isinstance(l.get("product_id"), list) else l.get("product_id") for l in line_r if l.get("product_id")]
-                if not product_ids:
-                    continue
-                # Check if any product belongs to configured brands
-                prod_r = await _odoo_call("product.product", "read",
-                    [product_ids],
-                    {"fields": ["product_tmpl_id"]},
-                    cookies=cookies)
-                tmpl_ids = list(set(p["product_tmpl_id"][0] if isinstance(p.get("product_tmpl_id"), list) else p.get("product_tmpl_id") for p in prod_r if p.get("product_tmpl_id")))
-                if not tmpl_ids:
-                    continue
-                tmpl_r = await _odoo_call("product.template", "read",
-                    [tmpl_ids],
-                    {"fields": ["x_brand"]},
-                    cookies=cookies)
-                po_brand_ids = [t["x_brand"][0] if isinstance(t.get("x_brand"), list) else t.get("x_brand") for t in tmpl_r if t.get("x_brand")]
-                if any(bid in brand_ids for bid in po_brand_ids):
-                    filtered_pos.append(po)
-
-            po_r = filtered_pos
-            print(f"[PO-REMINDER] After brand filter: {len(po_r)} POs")
-
-        if not po_r:
-            msg_body = f"🕐 <b>PO Confirmation — {time_label} PT</b><br/><br/>目前没有待确认的 PO（付款触发的）。No payment-triggered draft POs at this time."
-            await _send_po_reminder_message(target_user, msg_body, cookies)
-            print(f"[PO-REMINDER] No matching POs after brand filter. Sent message to {target_user}.")
-            return
-
-        # 4. Build summary message
-        total_pos = len(po_r)
-        total_amount = sum(p.get("amount_total", 0) for p in po_r)
-        vendors = {}
-        for po in po_r:
-            vendor_name = po.get("partner_id", [0, "Unknown"])[1] if isinstance(po.get("partner_id"), list) else str(po.get("partner_id", "Unknown"))
-            if vendor_name not in vendors:
-                vendors[vendor_name] = []
-            vendors[vendor_name].append(po)
-
-        lines = [f"🕐 <b>PO Confirmation Reminder — {time_label} PT</b>", ""]
-        lines.append(f"有 <b>{total_pos}</b> 个待确认 PO，总金额 <b>${total_amount:,.2f}</b>：")
-        lines.append("")
-        for vendor, pos in vendors.items():
-            vendor_total = sum(p.get("amount_total", 0) for p in pos)
-            po_names = ", ".join(p.get("name", "?") for p in pos)
-            origins = ", ".join(set(p.get("origin", "") for p in pos if p.get("origin")))
-            lines.append(f"• <b>{vendor}</b>: {len(pos)} PO(s) — ${vendor_total:,.2f}")
-            lines.append(f"  {po_names}")
-            if origins:
-                lines.append(f"  来源 SO: {origins}")
-        lines.append("")
-        lines.append("请在 Odoo 中确认这些 PO，或在这里回复。")
+                if po_r:
+                    total_pos = len(po_r)
+                    total_amount = sum(p.get("amount_total", 0) for p in po_r)
+                    vendors = {}
+                    for po in po_r:
+                        vendor_name = po.get("partner_id", [0, "Unknown"])[1] if isinstance(po.get("partner_id"), list) else str(po.get("partner_id", "Unknown"))
+                        if vendor_name not in vendors:
+                            vendors[vendor_name] = []
+                        vendors[vendor_name].append(po)
+                    lines.append("")
+                    lines.append(f"<b>{total_pos}</b> draft PO(s), total <b>${total_amount:,.2f}</b>:")
+                    for vendor, pos in vendors.items():
+                        vendor_total = sum(p.get("amount_total", 0) for p in pos)
+                        po_names = ", ".join(p.get("name", "?") for p in pos)
+                        origins = ", ".join(set(p.get("origin", "") for p in pos if p.get("origin")))
+                        lines.append(f"• <b>{vendor}</b>: {len(pos)} PO(s) — ${vendor_total:,.2f}")
+                        lines.append(f"  {po_names}")
+                        if origins:
+                            lines.append(f"  SO: {origins}")
+                else:
+                    lines.append("")
+                    lines.append("No matching draft POs at this time.")
 
         msg_body = "<br/>".join(lines)
+
+        # If no message and no PO attachment, skip
+        if not message and not attach_pos:
+            print(f"[PO-REMINDER] No message and no PO attachment. Skipping.")
+            return
+
         await _send_po_reminder_message(target_user, msg_body, cookies)
-        print(f"[PO-REMINDER] Sent to {target_user}: {total_pos} POs, ${total_amount:,.2f}")
+        print(f"[PO-REMINDER] Sent to {target_user}: {msg_body[:80]}...")
 
     except Exception as e:
         import traceback
@@ -898,7 +894,26 @@ async def _po_confirmation_reminder(target_user: str = "Ashley", only_payment_po
 
 
 async def _send_po_reminder_message(target_user: str, msg_body: str, cookies=None):
-    """Send a message to target user via Odoo Discuss DM from ChumartAI bot."""
+    """Send a message to target user via Odoo Discuss DM from ChumartAI bot.
+    If target_user is 'ALL', sends to all internal users."""
+    if not cookies:
+        cookies = await odoo_get_session()
+
+    if target_user.upper() == "ALL":
+        all_users = await _odoo_call("res.users", "search_read",
+            [[["active", "=", True], ["share", "=", False], ["id", "not in", [1]]]],
+            {"fields": ["id", "name"], "limit": 50},
+            cookies=cookies)
+        if all_users:
+            for u in all_users:
+                await _send_po_reminder_to_user(u["name"], msg_body, cookies)
+            print(f"[PO-REMINDER] Sent to ALL ({len(all_users)} users)")
+        return
+
+    await _send_po_reminder_to_user(target_user, msg_body, cookies)
+
+
+async def _send_po_reminder_to_user(target_user: str, msg_body: str, cookies=None):
     if not cookies:
         cookies = await odoo_get_session()
 
@@ -10368,13 +10383,14 @@ async def list_po_reminders(admin_key: str = ""):
         await conn.close()
 
 @app.post("/admin/po-reminders")
-async def create_po_reminder(admin_key: str = "", time_pt: str = "", target_user: str = "Ashley", only_payment_pos: bool = True):
-    """Create a new PO reminder schedule."""
+async def create_po_reminder(admin_key: str = "", time_pt: str = "", target_user: str = "Ashley", message: str = "", only_payment_pos: str = "none"):
+    """Create a new scheduled message."""
     if admin_key != os.getenv("ADMIN_KEY", "chumart2024"):
         return {"error": "Invalid admin key"}
     if not time_pt or ":" not in time_pt:
         return {"error": "time_pt is required in HH:MM format (24h), e.g. '10:30', '15:30'"}
-    # Validate time format
+    if only_payment_pos not in ("none", "payment", "all_draft"):
+        only_payment_pos = "none"
     try:
         h, m = time_pt.strip().split(":")
         h, m = int(h), int(m)
@@ -10389,8 +10405,8 @@ async def create_po_reminder(admin_key: str = "", time_pt: str = "", target_user
         return {"error": "DB not connected"}
     try:
         row = await conn.fetchrow(
-            "INSERT INTO po_reminder_schedules (time_pt, target_user, active, only_payment_pos) VALUES ($1, $2, TRUE, $3) RETURNING *",
-            time_pt, target_user.strip(), only_payment_pos
+            "INSERT INTO po_reminder_schedules (time_pt, target_user, message, active, only_payment_pos) VALUES ($1, $2, $3, TRUE, $4) RETURNING *",
+            time_pt, target_user.strip(), message.strip(), only_payment_pos
         )
         return {"success": True, "schedule": dict(row)}
     finally:
@@ -10448,13 +10464,39 @@ async def delete_po_reminder(schedule_id: int, admin_key: str = ""):
         await conn.close()
 
 @app.post("/admin/po-reminders/test")
-async def test_po_reminder(admin_key: str = "", target_user: str = "Ashley", only_payment_pos: bool = True):
-    """Test-fire a PO reminder immediately."""
+async def test_po_reminder(admin_key: str = "", target_user: str = "Ashley", message: str = "", only_payment_pos: str = "none"):
+    """Test-fire a scheduled message immediately."""
     if admin_key != os.getenv("ADMIN_KEY", "chumart2024"):
         return {"error": "Invalid admin key"}
     try:
-        await _po_confirmation_reminder(target_user=target_user, only_payment_pos=only_payment_pos)
-        return {"success": True, "message": f"Test reminder sent to {target_user}"}
+        await _po_confirmation_reminder(
+            target_user=target_user,
+            message=message,
+            only_payment_pos=(only_payment_pos == "payment"),
+            attach_all_draft=(only_payment_pos == "all_draft"),
+        )
+        return {"success": True, "message": f"Test message sent to {target_user}"}
+    except Exception as e:
+        return {"error": str(e)}
+
+@app.get("/admin/odoo-users")
+async def admin_list_odoo_users(admin_key: str = ""):
+    """List Odoo internal users for dropdowns in admin panel."""
+    if admin_key != os.getenv("ADMIN_KEY", "chumart2024"):
+        return {"error": "Invalid admin key"}
+    try:
+        raw = await odoo_query(
+            "res.users",
+            [["active", "=", True], ["share", "=", False]],
+            ["id", "name"],
+            limit=50
+        )
+        users = json.loads(raw) if isinstance(raw, str) else raw
+        user_list = sorted(
+            [{"uid": u["id"], "name": u["name"]} for u in users if u["id"] not in (1,)],
+            key=lambda x: x["name"]
+        )
+        return {"users": user_list}
     except Exception as e:
         return {"error": str(e)}
 
