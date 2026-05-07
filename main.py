@@ -837,9 +837,8 @@ async def _po_confirmation_reminder(target_user: str = "Ashley", message: str = 
         cookies = await odoo_get_session()
 
         # Build message body (plain text — Odoo Discuss escapes HTML tags)
-        lines = [f"🕐 {time_label} PT"]
+        lines = []
         if message:
-            lines.append("")
             lines.append(message)
 
         # Optionally attach PO list
