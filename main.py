@@ -424,6 +424,8 @@ async def init_db():
                 message TEXT NOT NULL DEFAULT '',
                 active BOOLEAN NOT NULL DEFAULT TRUE,
                 only_payment_pos VARCHAR(20) NOT NULL DEFAULT 'none',
+                frequency VARCHAR(20) NOT NULL DEFAULT 'everyday',
+                one_time_date VARCHAR(10) DEFAULT NULL,
                 created_at TIMESTAMPTZ DEFAULT NOW(),
                 updated_at TIMESTAMPTZ DEFAULT NOW()
             )
@@ -432,9 +434,9 @@ async def init_db():
         existing = await conn.fetchval("SELECT COUNT(*) FROM po_reminder_schedules")
         if existing == 0:
             await conn.execute("""
-                INSERT INTO po_reminder_schedules (time_pt, target_user, message, active, only_payment_pos) VALUES
-                ('10:30', 'Ashley', 'Please review and confirm today''s PO orders', TRUE, 'payment'),
-                ('15:30', 'Ashley', 'Afternoon PO check — please confirm any remaining draft POs', TRUE, 'payment')
+                INSERT INTO po_reminder_schedules (time_pt, target_user, message, active, only_payment_pos, frequency) VALUES
+                ('10:30', 'Ashley', 'Please review and confirm today''s PO orders', TRUE, 'payment', 'weekday'),
+                ('15:30', 'Ashley', 'Afternoon PO check — please confirm any remaining draft POs', TRUE, 'payment', 'weekday')
             """)
             print("Default PO reminder schedules created: 10:30 AM, 3:30 PM")
         print("DB initialized OK")
@@ -750,29 +752,43 @@ _po_reminder_last_fired = {}
 
 async def _po_reminder_check():
     """Check DB for active PO reminder schedules and fire if current time matches."""
-    import datetime, pytz
-    pt = pytz.timezone("America/Los_Angeles")
+    import datetime
+    from zoneinfo import ZoneInfo
+    pt = ZoneInfo("America/Los_Angeles")
     now_pt = datetime.datetime.now(pt)
-    current_hm = now_pt.strftime("%H:%M")  # e.g. "10:30", "15:30"
+    current_hm = now_pt.strftime("%H:%M")
     today_key = now_pt.strftime("%Y-%m-%d")
+    today_weekday = now_pt.weekday()  # 0=Mon, 6=Sun
 
     conn = await get_db_conn()
     if not conn:
         return
     try:
         rows = await conn.fetch(
-            "SELECT id, time_pt, target_user, message, only_payment_pos FROM po_reminder_schedules WHERE active = TRUE"
+            "SELECT id, time_pt, target_user, message, only_payment_pos, frequency, one_time_date FROM po_reminder_schedules WHERE active = TRUE"
         )
         for row in rows:
-            schedule_time = row["time_pt"].strip()  # e.g. "10:30"
+            schedule_time = row["time_pt"].strip()
+            freq = row["frequency"] or "everyday"
             fire_key = f"{row['id']}_{today_key}_{schedule_time}"
+
+            # Check if this schedule should fire today
+            should_fire = False
             if current_hm == schedule_time and fire_key not in _po_reminder_last_fired:
+                if freq == "everyday":
+                    should_fire = True
+                elif freq == "weekday" and today_weekday < 5:  # Mon-Fri
+                    should_fire = True
+                elif freq == "onetime":
+                    otd = row["one_time_date"] or ""
+                    if otd == today_key:
+                        should_fire = True
+
+            if should_fire:
                 _po_reminder_last_fired[fire_key] = True
-                # Clean old keys (keep only today's)
                 for k in list(_po_reminder_last_fired.keys()):
                     if today_key not in k:
                         del _po_reminder_last_fired[k]
-                # Fire the reminder
                 po_mode = row["only_payment_pos"] or "none"
                 await _po_confirmation_reminder(
                     target_user=row["target_user"],
@@ -780,6 +796,10 @@ async def _po_reminder_check():
                     only_payment_pos=(po_mode == "payment"),
                     attach_all_draft=(po_mode == "all_draft"),
                 )
+                # Auto-deactivate one-time schedules after firing
+                if freq == "onetime":
+                    await conn.execute("UPDATE po_reminder_schedules SET active=FALSE, updated_at=NOW() WHERE id=$1", row["id"])
+                    print(f"[PO-REMINDER] One-time schedule {row['id']} auto-deactivated")
     except Exception as e:
         print(f"[PO-REMINDER] check error: {e}")
     finally:
@@ -788,8 +808,9 @@ async def _po_reminder_check():
 
 async def _po_confirmation_reminder(target_user: str = "Ashley", message: str = "", only_payment_pos: bool = False, attach_all_draft: bool = False):
     """Scheduled message with optional PO list attachment. Sends via Odoo Discuss."""
-    import datetime, pytz
-    pt = pytz.timezone("America/Los_Angeles")
+    import datetime
+    from zoneinfo import ZoneInfo
+    pt = ZoneInfo("America/Los_Angeles")
     now_pt = datetime.datetime.now(pt)
     time_label = now_pt.strftime("%I:%M %p")
     print(f"[PO-REMINDER] Running at {time_label} PT for {target_user}")
@@ -10383,7 +10404,7 @@ async def list_po_reminders(admin_key: str = ""):
         await conn.close()
 
 @app.post("/admin/po-reminders")
-async def create_po_reminder(admin_key: str = "", time_pt: str = "", target_user: str = "Ashley", message: str = "", only_payment_pos: str = "none"):
+async def create_po_reminder(admin_key: str = "", time_pt: str = "", target_user: str = "Ashley", message: str = "", only_payment_pos: str = "none", frequency: str = "everyday", one_time_date: str = ""):
     """Create a new scheduled message."""
     if admin_key != os.getenv("ADMIN_KEY", "chumart2024"):
         return {"error": "Invalid admin key"}
@@ -10391,6 +10412,8 @@ async def create_po_reminder(admin_key: str = "", time_pt: str = "", target_user
         return {"error": "time_pt is required in HH:MM format (24h), e.g. '10:30', '15:30'"}
     if only_payment_pos not in ("none", "payment", "all_draft"):
         only_payment_pos = "none"
+    if frequency not in ("everyday", "weekday", "onetime"):
+        frequency = "everyday"
     try:
         h, m = time_pt.strip().split(":")
         h, m = int(h), int(m)
@@ -10405,15 +10428,15 @@ async def create_po_reminder(admin_key: str = "", time_pt: str = "", target_user
         return {"error": "DB not connected"}
     try:
         row = await conn.fetchrow(
-            "INSERT INTO po_reminder_schedules (time_pt, target_user, message, active, only_payment_pos) VALUES ($1, $2, $3, TRUE, $4) RETURNING *",
-            time_pt, target_user.strip(), message.strip(), only_payment_pos
+            "INSERT INTO po_reminder_schedules (time_pt, target_user, message, active, only_payment_pos, frequency, one_time_date) VALUES ($1, $2, $3, TRUE, $4, $5, $6) RETURNING *",
+            time_pt, target_user.strip(), message.strip(), only_payment_pos, frequency, one_time_date.strip() or None
         )
         return {"success": True, "schedule": dict(row)}
     finally:
         await conn.close()
 
 @app.put("/admin/po-reminders/{schedule_id}")
-async def update_po_reminder(schedule_id: int, admin_key: str = "", time_pt: str = "", target_user: str = "", message: str = None, active: bool = None, only_payment_pos: str = None):
+async def update_po_reminder(schedule_id: int, admin_key: str = "", time_pt: str = "", target_user: str = "", message: str = None, active: bool = None, only_payment_pos: str = None, frequency: str = None, one_time_date: str = None):
     """Update a scheduled message."""
     if admin_key != os.getenv("ADMIN_KEY", "chumart2024"):
         return {"error": "Invalid admin key"}
@@ -10439,10 +10462,12 @@ async def update_po_reminder(schedule_id: int, admin_key: str = "", time_pt: str
         new_active = active if active is not None else existing["active"]
         new_message = message if message is not None else existing["message"]
         new_only = only_payment_pos if only_payment_pos in ("none", "payment", "all_draft") else existing["only_payment_pos"]
+        new_freq = frequency if frequency in ("everyday", "weekday", "onetime") else existing["frequency"]
+        new_otd = one_time_date if one_time_date is not None else existing["one_time_date"]
 
         await conn.execute(
-            "UPDATE po_reminder_schedules SET time_pt=$1, target_user=$2, active=$3, only_payment_pos=$4, message=$5, updated_at=NOW() WHERE id=$6",
-            new_time, new_target, new_active, new_only, new_message, schedule_id
+            "UPDATE po_reminder_schedules SET time_pt=$1, target_user=$2, active=$3, only_payment_pos=$4, message=$5, frequency=$6, one_time_date=$7, updated_at=NOW() WHERE id=$8",
+            new_time, new_target, new_active, new_only, new_message, new_freq, new_otd or None, schedule_id
         )
         return {"success": True, "id": schedule_id}
     finally:
