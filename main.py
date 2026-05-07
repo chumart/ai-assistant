@@ -10413,8 +10413,8 @@ async def create_po_reminder(admin_key: str = "", time_pt: str = "", target_user
         await conn.close()
 
 @app.put("/admin/po-reminders/{schedule_id}")
-async def update_po_reminder(schedule_id: int, admin_key: str = "", time_pt: str = "", target_user: str = "", active: bool = None, only_payment_pos: bool = None):
-    """Update a PO reminder schedule."""
+async def update_po_reminder(schedule_id: int, admin_key: str = "", time_pt: str = "", target_user: str = "", message: str = None, active: bool = None, only_payment_pos: str = None):
+    """Update a scheduled message."""
     if admin_key != os.getenv("ADMIN_KEY", "chumart2024"):
         return {"error": "Invalid admin key"}
     conn = await get_db_conn()
@@ -10437,11 +10437,12 @@ async def update_po_reminder(schedule_id: int, admin_key: str = "", time_pt: str
 
         new_target = target_user.strip() if target_user else existing["target_user"]
         new_active = active if active is not None else existing["active"]
-        new_only = only_payment_pos if only_payment_pos is not None else existing["only_payment_pos"]
+        new_message = message if message is not None else existing["message"]
+        new_only = only_payment_pos if only_payment_pos in ("none", "payment", "all_draft") else existing["only_payment_pos"]
 
         await conn.execute(
-            "UPDATE po_reminder_schedules SET time_pt=$1, target_user=$2, active=$3, only_payment_pos=$4, updated_at=NOW() WHERE id=$5",
-            new_time, new_target, new_active, new_only, schedule_id
+            "UPDATE po_reminder_schedules SET time_pt=$1, target_user=$2, active=$3, only_payment_pos=$4, message=$5, updated_at=NOW() WHERE id=$6",
+            new_time, new_target, new_active, new_only, new_message, schedule_id
         )
         return {"success": True, "id": schedule_id}
     finally:
