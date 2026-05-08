@@ -7746,6 +7746,7 @@ async def run_tool(name, inp, context=None):
                 print(f"[REGISTER-PAYMENT] Journal '{journal_name}' resolved via Odoo lookup → ID={journal_id}")
             else:
                 print(f"[REGISTER-PAYMENT] Journal '{journal_name}' → ID={journal_id} (from ID map)")
+                journal = {"id": journal_id, "name": journal_name}
 
             pay_amount = amount if amount else float(inv.get("amount_residual") or inv.get("amount_total") or 0)
 
