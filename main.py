@@ -4498,6 +4498,51 @@ Examples of correct priority:
 Include rough cost hint for common fixes where relevant ("$10-30 零件" / "$200+ 压缩机更换")."""
 
 
+async def _check_print_job_and_notify(job_id, inv_name, auth_b64, channel_id, retries=3, delay=8):
+    """Background task: wait, poll PrintNode for job status, send receipt to Odoo Discuss."""
+    for attempt in range(retries):
+        await asyncio.sleep(delay)
+        try:
+            async with httpx.AsyncClient(timeout=15) as c:
+                r = await c.get(
+                    f"https://api.printnode.com/printjobs/{job_id}",
+                    headers={"Authorization": f"Basic {auth_b64}"}
+                )
+                if r.status_code != 200:
+                    continue
+                data = r.json()
+                if isinstance(data, list) and data:
+                    data = data[0]
+                state = (data.get("state") or "").lower()
+
+                if state == "done":
+                    print(f"[PRINT-RECEIPT] ✅ Job {job_id} ({inv_name}) printed OK")
+                    return  # Success — no need to notify, silence is good
+                elif state == "error":
+                    error_msg = data.get("message") or "Unknown printer error"
+                    print(f"[PRINT-RECEIPT] ❌ Job {job_id} ({inv_name}) FAILED: {error_msg}")
+                    try:
+                        cookies = await odoo_get_session()
+                        alert = (
+                            f"🚨 Print Failed!\n"
+                            f"Invoice: {inv_name}\n"
+                            f"Job: {job_id}\n"
+                            f"Error: {error_msg}\n"
+                            f"Please reprint manually."
+                        )
+                        await _odoo_bot_post_progress(channel_id, alert)
+                        if channel_id != 58:
+                            await _odoo_bot_post_progress(58, alert)
+                    except Exception as e:
+                        print(f"[PRINT-RECEIPT] Failed to send alert: {e}")
+                    return
+                # else: still processing, retry
+        except Exception as e:
+            print(f"[PRINT-RECEIPT] Check error (attempt {attempt+1}): {e}")
+    # After all retries, still not done/error — send a warning
+    print(f"[PRINT-RECEIPT] ⚠️ Job {job_id} ({inv_name}) status unknown after {retries} checks")
+
+
 async def run_tool(name, inp, context=None):
     """context = dict with user info: {uid, username, role}"""
     ctx = context or {}
@@ -7970,14 +8015,17 @@ async def run_tool(name, inp, context=None):
                 if len(pdf_bytes) < 100:
                     return json.dumps({"error": "PDF generation returned empty file"})
 
-            # 3) Build PrintNode options (color/paper/duplex — fall back to env defaults)
+            # 3) Build PrintNode options (color/duplex — fall back to env defaults)
+            # NOTE: "paper" option removed — HP OfficeJet Pro 9120e does not support it
             color_override = inp.get("color")
             paper_override = (inp.get("paper") or "").strip()
             duplex_override = (inp.get("duplex") or "").strip()
             options = {
                 "color": color_override if color_override is not None else PRINTNODE_DEFAULT_COLOR,
-                "paper": paper_override or PRINTNODE_DEFAULT_PAPER,
             }
+            # Only include paper if explicitly overridden by the caller
+            if paper_override:
+                options["paper"] = paper_override
             # Duplex: explicit "none"/"single" override means no duplex; otherwise use override or default
             if duplex_override.lower() in ("none", "single", "off"):
                 pass  # don't include duplex in options → single-sided
@@ -8016,6 +8064,16 @@ async def run_tool(name, inp, context=None):
                     job_id = r.text.strip()
 
             print(f"[PRINT] Invoice {inv_name} → PrintNode printer={printer_id}, job_id={job_id}, copies={copies}")
+
+            # Fire-and-forget: check print status after delay, send receipt to Odoo Discuss
+            channel_id = ctx.get("channel_id", 58)
+            asyncio.create_task(_check_print_job_and_notify(
+                job_id=int(job_id) if str(job_id).isdigit() else job_id,
+                inv_name=inv_name,
+                auth_b64=auth_b64,
+                channel_id=channel_id,
+            ))
+
             return json.dumps({
                 "success": True,
                 "invoice_name": inv_name,
@@ -8195,7 +8253,7 @@ async def run_tool(name, inp, context=None):
             # Step 2: 先创建 Invoice (Odoo 允许在 capture 前创建)
             # 这样 capture 后 Odoo 收到 webhook 看到已有 invoice 会自动 reconcile payment
             # ============================================
-            ctx_local = {"uid": ctx.get("uid", 0), "username": ctx.get("username", "manual_release"), "role": "admin"}
+            ctx_local = {"uid": ctx.get("uid", 0), "username": ctx.get("username", "manual_release"), "role": "admin", "channel_id": channel_id}
 
             r1_str = await run_tool("odoo_create_invoice_from_so", {
                 "so_name": so_name,
@@ -12363,7 +12421,7 @@ This rule has NO exceptions. Even if the user insists, do not continue. Direct t
 
     # Call Claude — Sonnet for admin/finance (better reasoning for reminders/invoicing),
     # Haiku for others (faster, cheaper).
-    tool_context = {"uid": uid, "username": author, "role": role}
+    tool_context = {"uid": uid, "username": author, "role": role, "channel_id": req.channel_id}
     headers = {"x-api-key": ANTHROPIC_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json"}
     bot_model = "claude-sonnet-4-5" if role in ("admin", "finance", "sales_manager") else "claude-haiku-4-5-20251001"
     print(f"[ODOO-BOT] uid={uid} role={role} model={bot_model}")
