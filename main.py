@@ -1628,7 +1628,7 @@ async def crawl_site(site: dict, log_id: int):
 # ─────────────────────────────────────────────
 
 async def search_knowledge(query: str, top_k: int = 10, category: str = None, doc_name_filter: str = None) -> list:
-    """Vector similarity search in knowledge base."""
+    """Hybrid search: exact text match (boosted) + vector similarity search, merged and deduplicated."""
     conn = await get_db_conn()
     if not conn:
         return []
@@ -1637,44 +1637,115 @@ async def search_knowledge(query: str, top_k: int = 10, category: str = None, do
         if not embedding:
             return []
 
+        # Build WHERE clause fragments
+        where_parts = []
+        params_extra = []
+        param_idx = 3  # $1=embedding, $2=query for ILIKE
         if category and doc_name_filter:
-            rows = await conn.fetch("""
-                SELECT site_name, site_url, page_url, page_title, chunk_text,
-                       1 - (embedding <=> $1::vector) AS similarity
-                FROM knowledge_chunks
-                WHERE (category = $2 OR category = $3)
-                  AND site_name ILIKE $4
-                ORDER BY embedding <=> $1::vector
-                LIMIT $5
-            """, json.dumps(embedding), category, f"doc_{category}", f"%{doc_name_filter}%", top_k)
+            where_parts.append(f"(category = ${param_idx} OR category = ${param_idx+1})")
+            params_extra.extend([category, f"doc_{category}"])
+            param_idx += 2
+            where_parts.append(f"site_name ILIKE ${param_idx}")
+            params_extra.append(f"%{doc_name_filter}%")
+            param_idx += 1
         elif doc_name_filter:
-            rows = await conn.fetch("""
-                SELECT site_name, site_url, page_url, page_title, chunk_text,
-                       1 - (embedding <=> $1::vector) AS similarity
-                FROM knowledge_chunks
-                WHERE site_name ILIKE $2
-                ORDER BY embedding <=> $1::vector
-                LIMIT $3
-            """, json.dumps(embedding), f"%{doc_name_filter}%", top_k)
+            where_parts.append(f"site_name ILIKE ${param_idx}")
+            params_extra.append(f"%{doc_name_filter}%")
+            param_idx += 1
         elif category:
-            rows = await conn.fetch("""
-                SELECT site_name, site_url, page_url, page_title, chunk_text,
-                       1 - (embedding <=> $1::vector) AS similarity
-                FROM knowledge_chunks
-                WHERE category = $2 OR category = $3
-                ORDER BY embedding <=> $1::vector
-                LIMIT $4
-            """, json.dumps(embedding), category, f"doc_{category}", top_k)
-        else:
-            rows = await conn.fetch("""
-                SELECT site_name, site_url, page_url, page_title, chunk_text,
-                       1 - (embedding <=> $1::vector) AS similarity
-                FROM knowledge_chunks
-                ORDER BY embedding <=> $1::vector
-                LIMIT $2
-            """, json.dumps(embedding), top_k)
+            where_parts.append(f"(category = ${param_idx} OR category = ${param_idx+1})")
+            params_extra.extend([category, f"doc_{category}"])
+            param_idx += 2
 
-        return [dict(r) for r in rows]
+        where_sql = (" AND " + " AND ".join(where_parts)) if where_parts else ""
+
+        # Step 1: Exact text match (ILIKE) — these get a similarity boost
+        exact_rows = []
+        try:
+            exact_sql = f"""
+                SELECT id, site_name, site_url, page_url, page_title, chunk_text,
+                       0.99 AS similarity
+                FROM knowledge_chunks
+                WHERE chunk_text ILIKE $1 {where_sql.replace('$1', '$___').replace('$2', '$1').replace('$___', '$1') if False else where_sql}
+                LIMIT $2
+            """
+            # Simpler approach: build query directly
+            eq_where = f"chunk_text ILIKE $1" + (" AND " + " AND ".join(where_parts) if where_parts else "")
+            # Renumber params: $1=search_pattern, $2=limit, $3+...=extra
+            eq_params_map = {}
+            eq_where_final = eq_where
+            for i, wp in enumerate(where_parts):
+                old_param = f"${i+3}"
+                new_param = f"${i+3}"
+                # params already numbered from $3
+            
+            exact_sql = f"""
+                SELECT id, site_name, site_url, page_url, page_title, chunk_text,
+                       0.99 AS similarity
+                FROM knowledge_chunks
+                WHERE chunk_text ILIKE $1 {(" AND " + " AND ".join(where_parts)) if where_parts else ""}
+                LIMIT $2
+            """
+            exact_params = [f"%{query}%", top_k] + params_extra
+            exact_rows = await conn.fetch(exact_sql, *exact_params)
+            if exact_rows:
+                print(f"[SEARCH-HYBRID] Exact text match for '{query}': {len(exact_rows)} hits")
+        except Exception as e:
+            print(f"[SEARCH-HYBRID] Exact match error (non-fatal): {e}")
+
+        # Step 2: Vector similarity search (standard)
+        vec_where = where_sql
+        # Renumber: $1=embedding, then extras start at $2
+        # Rebuild where for vector query
+        vec_where_parts = []
+        vec_params = [json.dumps(embedding)]
+        vp_idx = 2
+        if category and doc_name_filter:
+            vec_where_parts.append(f"(category = ${vp_idx} OR category = ${vp_idx+1})")
+            vec_params.extend([category, f"doc_{category}"])
+            vp_idx += 2
+            vec_where_parts.append(f"site_name ILIKE ${vp_idx}")
+            vec_params.append(f"%{doc_name_filter}%")
+            vp_idx += 1
+        elif doc_name_filter:
+            vec_where_parts.append(f"site_name ILIKE ${vp_idx}")
+            vec_params.append(f"%{doc_name_filter}%")
+            vp_idx += 1
+        elif category:
+            vec_where_parts.append(f"(category = ${vp_idx} OR category = ${vp_idx+1})")
+            vec_params.extend([category, f"doc_{category}"])
+            vp_idx += 2
+
+        vec_where_sql = (" WHERE " + " AND ".join(vec_where_parts)) if vec_where_parts else ""
+        vec_sql = f"""
+            SELECT id, site_name, site_url, page_url, page_title, chunk_text,
+                   1 - (embedding <=> $1::vector) AS similarity
+            FROM knowledge_chunks
+            {vec_where_sql}
+            ORDER BY embedding <=> $1::vector
+            LIMIT ${vp_idx}
+        """
+        vec_params.append(top_k)
+        vec_rows = await conn.fetch(vec_sql, *vec_params)
+
+        # Step 3: Merge — exact matches first (deduplicated by id), then vector results
+        seen_ids = set()
+        merged = []
+        for r in exact_rows:
+            rid = r["id"]
+            if rid not in seen_ids:
+                seen_ids.add(rid)
+                merged.append(dict(r))
+        for r in vec_rows:
+            rid = r["id"]
+            if rid not in seen_ids:
+                seen_ids.add(rid)
+                merged.append(dict(r))
+
+        if exact_rows:
+            print(f"[SEARCH-HYBRID] Final: {len(exact_rows)} exact + {len(vec_rows)} vector → {len(merged)} unique (returning top {top_k})")
+
+        return merged[:top_k]
     except Exception as e:
         print(f"Search error: {e}")
         return []
@@ -10485,7 +10556,7 @@ async def get_document_chunks(doc_id: str, admin_key: str = ""):
 
 @app.get("/admin/kb-search")
 async def kb_search_test(q: str = "", admin_key: str = "", limit: int = 5):
-    """Test knowledge base search — returns top matching chunks for a query."""
+    """Test knowledge base search — hybrid: exact text match (boosted) + vector similarity."""
     if admin_key != os.getenv("ADMIN_KEY", "chumart2024"):
         return {"error": "Invalid admin key"}
     if not q.strip():
@@ -10500,7 +10571,22 @@ async def kb_search_test(q: str = "", admin_key: str = "", limit: int = 5):
     if not conn:
         return {"error": "DB not connected"}
     try:
-        rows = await conn.fetch("""
+        # Step 1: Exact text match (ILIKE) — boosted to score 0.99
+        exact_rows = []
+        try:
+            exact_rows = await conn.fetch("""
+                SELECT kc.id, kc.chunk_text, kc.site_name, kc.page_title, kc.category,
+                       kc.site_url,
+                       0.99 AS score
+                FROM knowledge_chunks kc
+                WHERE kc.chunk_text ILIKE $1
+                LIMIT $2
+            """, f"%{q.strip()}%", limit)
+        except Exception as e:
+            print(f"[KB-SEARCH] Exact match error: {e}")
+
+        # Step 2: Vector similarity search
+        vec_rows = await conn.fetch("""
             SELECT kc.id, kc.chunk_text, kc.site_name, kc.page_title, kc.category,
                    kc.site_url,
                    1 - (kc.embedding <=> $1::vector) AS score
@@ -10509,10 +10595,17 @@ async def kb_search_test(q: str = "", admin_key: str = "", limit: int = 5):
             ORDER BY kc.embedding <=> $1::vector
             LIMIT $2
         """, json.dumps(embedding), limit)
-        results = []
-        for r in rows:
+
+        # Step 3: Merge — exact first, then vector, deduplicated
+        seen_ids = set()
+        merged = []
+        for r in list(exact_rows) + list(vec_rows):
+            rid = r["id"]
+            if rid in seen_ids:
+                continue
+            seen_ids.add(rid)
             doc_id = r["site_url"].replace("doc:", "") if r["site_url"] and r["site_url"].startswith("doc:") else None
-            results.append({
+            merged.append({
                 "score": round(float(r["score"]), 4),
                 "chunk_id": r["id"],
                 "doc_id": doc_id,
@@ -10522,7 +10615,8 @@ async def kb_search_test(q: str = "", admin_key: str = "", limit: int = 5):
                 "text": r["chunk_text"],
                 "char_count": len(r["chunk_text"] or ""),
             })
-        return {"query": q, "limit": limit, "results": results}
+
+        return {"query": q, "limit": limit, "results": merged[:limit]}
     finally:
         await conn.close()
 
