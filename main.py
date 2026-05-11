@@ -4498,6 +4498,108 @@ Examples of correct priority:
 Include rough cost hint for common fixes where relevant ("$10-30 零件" / "$200+ 压缩机更换")."""
 
 
+async def _smart_product_search(inp, base_domain):
+    """Smart product search: when AI searches product.product with ilike keywords,
+    auto-split into individual words and search each word separately, then merge results.
+    This handles cases like "ice cream freezer" where the product name might be in Chinese
+    or use different word combinations.
+    
+    Returns None if this search doesn't qualify for smart search (let normal flow handle it).
+    """
+    domain = inp.get("domain", [])
+    fields = inp.get("fields", ["id", "default_code", "name", "qty_available", "list_price"])
+    limit = inp.get("limit", 50)
+    order = inp.get("order", "id desc")
+
+    # Extract ilike search terms from domain
+    ilike_terms = []
+    non_ilike_conditions = []
+    i = 0
+    flat = domain if not any(isinstance(d, str) and d in ("|", "&", "!") for d in domain) else None
+    
+    # Only do smart search for simple domains (no complex | & operators at top level, or single | group)
+    if flat is None:
+        # Check if it's a simple "|" pattern like ["|", [field, "ilike", val], [field, "ilike", val]]
+        has_ilike = False
+        for item in domain:
+            if isinstance(item, list) and len(item) == 3 and item[1] == "ilike":
+                has_ilike = True
+                break
+        if not has_ilike:
+            return None  # No ilike conditions, skip smart search
+    
+    # Collect all ilike values
+    for item in domain:
+        if isinstance(item, list) and len(item) == 3 and item[1] == "ilike":
+            ilike_terms.append({"field": item[0], "value": item[2]})
+        elif isinstance(item, list) and len(item) == 3:
+            non_ilike_conditions.append(item)
+        # Skip operators like "|", "&"
+    
+    if not ilike_terms:
+        return None  # No ilike terms, skip smart search
+    
+    # Get the search keywords (use the longest ilike term)
+    search_text = max([t["value"] for t in ilike_terms], key=len)
+    search_fields = list(set(t["field"] for t in ilike_terms))
+    
+    # Split into individual words (ignore short words like "a", "of", "the")
+    words = [w.strip() for w in search_text.split() if len(w.strip()) >= 2]
+    
+    if len(words) <= 1:
+        return None  # Single word, normal search is fine
+    
+    print(f"[SMART-SEARCH] Product search '{search_text}' → split into {words}")
+    
+    # Strategy 1: Original search (exact phrase match)
+    all_results = {}
+    
+    async def _do_search(search_domain, label):
+        try:
+            result_str = await odoo_query("product.product", search_domain + non_ilike_conditions, fields, limit, order)
+            results = json.loads(result_str)
+            if isinstance(results, list):
+                for r in results:
+                    rid = r.get("id")
+                    if rid and rid not in all_results:
+                        all_results[rid] = r
+                print(f"[SMART-SEARCH] {label}: found {len(results)} products")
+            return results
+        except Exception as e:
+            print(f"[SMART-SEARCH] {label} error: {e}")
+            return []
+
+    # Strategy 1: Original exact phrase
+    orig_domain = []
+    if len(search_fields) > 1:
+        orig_domain.append("|")
+    for f in search_fields:
+        orig_domain.append([f, "ilike", search_text])
+    await _do_search(orig_domain, f"exact '{search_text}'")
+    
+    # Strategy 2: Each individual word (OR across fields, AND across words is too strict, so OR all)
+    for word in words:
+        word_domain = []
+        if len(search_fields) > 1:
+            word_domain.append("|")
+        for f in search_fields:
+            word_domain.append([f, "ilike", word])
+        await _do_search(word_domain, f"word '{word}'")
+    
+    # Strategy 3: SKU prefix detection — if any word looks like a brand prefix (2-5 uppercase letters),
+    # search default_code specifically
+    for word in words:
+        if word.upper() == word and 2 <= len(word) <= 5 and word.isalpha():
+            await _do_search([["default_code", "ilike", word]], f"SKU prefix '{word}'")
+    
+    if not all_results:
+        return json.dumps([])
+    
+    final = list(all_results.values())[:limit]
+    print(f"[SMART-SEARCH] Total unique results: {len(final)}")
+    return json.dumps(final, default=str, ensure_ascii=False)
+
+
 async def _check_print_job_and_notify(job_id, inv_name, auth_b64, channel_id, retries=3, delay=8):
     """Background task: wait, poll PrintNode for job status, send receipt to Odoo Discuss."""
     for attempt in range(retries):
@@ -4580,8 +4682,6 @@ async def run_tool(name, inp, context=None):
         model = inp["model"]
         domain = inp.get("domain", [])
         # ── Block bank.statement.line searches — almost always wrong intent ──
-        # Users ask "this $X line corresponds to which invoice/credit note", not
-        # "find the bank line itself". Searching the line returns the same line back.
         if model in ("account.bank.statement.line", "account.bank.statement"):
             print(f"[BLOCKED] odoo_search on {model} — bank statement lines should not be searched (use account.move/account.payment instead)")
             return json.dumps({
@@ -4590,9 +4690,14 @@ async def run_tool(name, inp, context=None):
                          f"account.payment by amount instead.",
                 "results": []
             })
+
+        # ── Smart product search: auto split keywords & multi-strategy ──
+        if model == "product.product":
+            smart_results = await _smart_product_search(inp, domain)
+            if smart_results is not None:
+                return smart_results
+
         # NOTE: res.partner is intentionally excluded from auto company_id filter.
-        # Partners are typically shared across companies (company_id is False/null),
-        # so adding company_id=1 would filter them all out.
         models_with_company = ["account.move","sale.order","purchase.order","account.payment",
                                "crm.lead","repair.order","stock.picking"]
         if model in models_with_company:
