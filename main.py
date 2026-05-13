@@ -9188,6 +9188,21 @@ async def admin_crawl(req: CrawlRequest, background_tasks: BackgroundTasks):
         "message": "Crawling started in background. Check /admin/kb-status for progress."
     }
 
+TRAINING_MANUAL_PATH = os.path.join(os.path.dirname(__file__), "training_manual.md")
+
+@app.get("/training-manual")
+async def get_training_manual(lang: str = "en"):
+    """Return training manual content. lang=en for English first, lang=zh for Chinese first."""
+    try:
+        if os.path.exists(TRAINING_MANUAL_PATH):
+            with open(TRAINING_MANUAL_PATH, "r", encoding="utf-8") as f:
+                content = f.read()
+        else:
+            content = "Training manual not found. Please contact admin."
+        return {"content": content, "lang": lang}
+    except Exception as e:
+        return {"error": str(e)}
+
 @app.get("/admin/kb-status")
 async def kb_status():
     conn = await get_db_conn()
