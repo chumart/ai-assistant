@@ -2596,7 +2596,7 @@ TOOLS = [
     },
     {
         "name": "odoo_add_order_line",
-        "description": "Add a product line to an existing purchase.order or sale.order. ALWAYS include the sku field — it is used to verify/correct the product_id.",
+        "description": "Add a SINGLE product line to an existing purchase.order or sale.order. ALWAYS include the sku field — it is used to verify/correct the product_id. For adding MULTIPLE lines at once (e.g. from an Excel file), use odoo_batch_add_order_lines instead.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -2608,6 +2608,31 @@ TOOLS = [
                 "price_unit": {"type": "number", "description": "Unit price (optional, will use product default if 0)"}
             },
             "required": ["order_type", "order_id", "product_id", "quantity"]
+        }
+    },
+    {
+        "name": "odoo_batch_add_order_lines",
+        "description": "Add MULTIPLE product lines to an existing purchase.order or sale.order in ONE call. Use this when adding more than 3 lines (e.g. from an Excel/CSV file). Each line needs sku + quantity. The tool resolves SKUs to product_ids automatically — you do NOT need to look up product_ids first. Returns a summary of successes and failures.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "order_type": {"type": "string", "description": "purchase or sale"},
+                "order_id": {"type": "integer", "description": "The ID of the order"},
+                "lines": {
+                    "type": "array",
+                    "description": "Array of lines to add. Each line must have sku and quantity.",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "sku": {"type": "string", "description": "Product SKU/default_code"},
+                            "quantity": {"type": "number", "description": "Quantity to order"},
+                            "price_unit": {"type": "number", "description": "Unit price (optional)"}
+                        },
+                        "required": ["sku", "quantity"]
+                    }
+                }
+            },
+            "required": ["order_type", "order_id", "lines"]
         }
     },
     {
@@ -4078,7 +4103,7 @@ This applies to EVERY write operation:
   - Reminders: cancel_reminder, update_reminder, create_reminder
   - Invoices/PO/SO: odoo_create_invoice_from_so, odoo_register_payment, odoo_export_invoice_pdf,
     print_invoice, release_so, odoo_update_record, odoo_create_record, odoo_create_bulk_po,
-    odoo_confirm_order, odoo_add_order_line
+    odoo_confirm_order, odoo_add_order_line, odoo_batch_add_order_lines
   - Anything that changes data anywhere
 
 NEVER fabricate result fields like invoice numbers, PO numbers, IDs, amounts, job IDs,
@@ -4725,7 +4750,7 @@ async def run_tool(name, inp, context=None):
     role = ctx.get("role", "guest")
     role_perms = ROLE_PERMISSIONS.get(role, ROLE_PERMISSIONS["guest"])
     _release_tools = {"odoo_create_invoice_from_so", "odoo_register_payment", "odoo_export_invoice_pdf", "release_so", "print_invoice", "check_so_payment_status"}
-    _write_tools = {"odoo_create_record", "odoo_add_order_line", "odoo_confirm_order", "odoo_update_record", "odoo_update_vendor_price"}
+    _write_tools = {"odoo_create_record", "odoo_add_order_line", "odoo_batch_add_order_lines", "odoo_confirm_order", "odoo_update_record", "odoo_update_vendor_price"}
     _cost_tools = {"odoo_find_recent_purchases_by_skus", "odoo_get_product_vendors", "odoo_create_bulk_po", "get_po_with_so_links", "odoo_restock_analysis", "get_incoming_products"}
     _finance_tools = {"get_monthly_tax", "get_quarterly_tax", "get_monthly_sales", "get_missing_tax", "odoo_match_payment_to_customer"}
     # v18.3: admin-only tools (raw DB query / sensitive ops)
@@ -4957,6 +4982,96 @@ async def run_tool(name, inp, context=None):
             return json.dumps({"error": result["error"]})
         return json.dumps({"success": True, "line_id": result["id"],
                            "message": f"Product line added successfully"})
+
+    if name == "odoo_batch_add_order_lines":
+        order_type = inp["order_type"]
+        order_id = inp["order_id"]
+        lines = inp.get("lines", [])
+        line_model = "purchase.order.line" if order_type == "purchase" else "sale.order.line"
+        order_field = "order_id"
+        qty_field = "product_qty" if order_type == "purchase" else "product_uom_qty"
+
+        if not lines:
+            return json.dumps({"error": "No lines provided"})
+
+        print(f"[BATCH-ADD] Adding {len(lines)} lines to {order_type} order {order_id}")
+
+        # Step 1: Batch resolve all SKUs to product_ids in one query
+        all_skus = [l["sku"].strip() for l in lines if l.get("sku")]
+        unique_skus = list(set(s.upper() for s in all_skus))
+
+        sku_to_product = {}
+        if unique_skus:
+            # Query in batches of 200 to avoid URL length issues
+            for batch_start in range(0, len(unique_skus), 200):
+                batch_skus = unique_skus[batch_start:batch_start+200]
+                sku_r = json.loads(await odoo_query("product.product",
+                    [["default_code", "in", batch_skus], ["active", "=", True]],
+                    ["id", "name", "default_code", "list_price"], limit=500))
+                if isinstance(sku_r, list):
+                    for p in sku_r:
+                        code = (p.get("default_code") or "").upper()
+                        if code:
+                            sku_to_product[code] = p
+            # Also try case-insensitive match for unresolved SKUs
+            unresolved = [s for s in unique_skus if s not in sku_to_product]
+            if unresolved:
+                for batch_start in range(0, len(unresolved), 50):
+                    batch = unresolved[batch_start:batch_start+50]
+                    for sku in batch:
+                        ilr = json.loads(await odoo_query("product.product",
+                            [["default_code", "ilike", sku], ["active", "=", True]],
+                            ["id", "name", "default_code", "list_price"], limit=1))
+                        if isinstance(ilr, list) and ilr:
+                            sku_to_product[sku] = ilr[0]
+
+        print(f"[BATCH-ADD] Resolved {len(sku_to_product)}/{len(unique_skus)} SKUs")
+
+        # Step 2: Create order lines
+        successes = []
+        failures = []
+        for line in lines:
+            sku = (line.get("sku") or "").strip().upper()
+            qty = line.get("quantity", 0)
+            price = line.get("price_unit", 0)
+
+            if not sku:
+                failures.append({"sku": sku, "error": "Empty SKU"})
+                continue
+
+            product = sku_to_product.get(sku)
+            if not product:
+                failures.append({"sku": sku, "error": "SKU not found in Odoo"})
+                continue
+
+            vals = {
+                order_field: order_id,
+                "product_id": product["id"],
+                qty_field: qty,
+            }
+            if price:
+                vals["price_unit"] = price
+
+            try:
+                result = await odoo_create(line_model, vals)
+                if result.get("error"):
+                    failures.append({"sku": sku, "product": product.get("name", ""), "error": result["error"]})
+                else:
+                    successes.append({"sku": sku, "product": product.get("name", ""), "line_id": result["id"], "qty": qty})
+            except Exception as e:
+                failures.append({"sku": sku, "product": product.get("name", ""), "error": str(e)[:200]})
+
+        print(f"[BATCH-ADD] Done: {len(successes)} success, {len(failures)} failed")
+
+        return json.dumps({
+            "success": len(failures) == 0,
+            "total_lines": len(lines),
+            "added": len(successes),
+            "failed": len(failures),
+            "successes": successes,
+            "failures": failures,
+            "message": f"Added {len(successes)}/{len(lines)} lines to {order_type} order. {len(failures)} failed." if failures else f"All {len(successes)} lines added successfully.",
+        }, ensure_ascii=False)
 
     if name == "odoo_confirm_order":
         model = "purchase.order" if inp["order_type"] == "purchase" else "sale.order"
@@ -9188,20 +9303,19 @@ async def admin_crawl(req: CrawlRequest, background_tasks: BackgroundTasks):
         "message": "Crawling started in background. Check /admin/kb-status for progress."
     }
 
-TRAINING_MANUAL_PATH = os.path.join(os.path.dirname(__file__), "training_manual.md")
+TRAINING_MANUAL_PATH = os.path.join(os.path.dirname(__file__), "Chumart_Training_Manual.pdf")
 
-@app.get("/training-manual")
-async def get_training_manual(lang: str = "en"):
-    """Return training manual content. lang=en for English first, lang=zh for Chinese first."""
-    try:
-        if os.path.exists(TRAINING_MANUAL_PATH):
-            with open(TRAINING_MANUAL_PATH, "r", encoding="utf-8") as f:
-                content = f.read()
-        else:
-            content = "Training manual not found. Please contact admin."
-        return {"content": content, "lang": lang}
-    except Exception as e:
-        return {"error": str(e)}
+@app.get("/training-manual/download")
+async def download_training_manual():
+    """Download training manual as PDF."""
+    from fastapi.responses import FileResponse
+    if not os.path.exists(TRAINING_MANUAL_PATH):
+        return {"error": "Training manual not found"}
+    return FileResponse(
+        TRAINING_MANUAL_PATH,
+        media_type="application/pdf",
+        filename="Chumart_Training_Manual.pdf",
+    )
 
 @app.get("/admin/kb-status")
 async def kb_status():
@@ -9705,7 +9819,7 @@ async def chat(req: ChatRequest, background_tasks: BackgroundTasks):
     # Release-related tools — allowed for can_release_so (admin/finance/sales_manager)
     release_tools = {"odoo_create_invoice_from_so", "odoo_register_payment", "odoo_export_invoice_pdf", "release_so", "print_invoice", "check_so_payment_status"}
     # Other write tools (PO, product/price edits) — admin/finance only (NOT sales_manager)
-    write_tools = {"odoo_create_record", "odoo_add_order_line", "odoo_confirm_order", "odoo_update_record", "odoo_update_vendor_price"}
+    write_tools = {"odoo_create_record", "odoo_add_order_line", "odoo_batch_add_order_lines", "odoo_confirm_order", "odoo_update_record", "odoo_update_vendor_price"}
     # Tools that expose vendor names, prices, PO costs — only admin / finance / purchase should see these
     cost_tools = {"odoo_find_recent_purchases_by_skus", "odoo_get_product_vendors", "odoo_create_bulk_po", "get_po_with_so_links", "odoo_restock_analysis", "get_incoming_products"}
     # v18.3: admin-only tools (raw DB query for diagnostics)
@@ -9931,7 +10045,7 @@ async def chat_stream(req: ChatRequest, background_tasks: BackgroundTasks):
     # Release-related tools — allowed for can_release_so (admin/finance/sales_manager)
     release_tools = {"odoo_create_invoice_from_so", "odoo_register_payment", "odoo_export_invoice_pdf", "release_so", "print_invoice", "check_so_payment_status"}
     # Other write tools (PO, product/price edits) — admin/finance only (NOT sales_manager)
-    write_tools = {"odoo_create_record", "odoo_add_order_line", "odoo_confirm_order", "odoo_update_record", "odoo_update_vendor_price"}
+    write_tools = {"odoo_create_record", "odoo_add_order_line", "odoo_batch_add_order_lines", "odoo_confirm_order", "odoo_update_record", "odoo_update_vendor_price"}
     # Tools that expose vendor names, prices, PO costs — only admin / finance / purchase should see these
     cost_tools = {"odoo_find_recent_purchases_by_skus", "odoo_get_product_vendors", "odoo_create_bulk_po", "get_po_with_so_links", "odoo_restock_analysis", "get_incoming_products"}
     # v18.3: admin-only tools (raw DB query for diagnostics)
@@ -11275,6 +11389,7 @@ TOOL_PROGRESS_LABELS_ZH = {
     "odoo_create_record":          "✏️ 正在创建记录...",
     "odoo_update_record":          "✏️ 正在更新记录...",
     "odoo_add_order_line":         "➕ 正在添加订单行...",
+    "odoo_batch_add_order_lines":  "➕ 正在批量添加订单行...",
     "odoo_confirm_order":          "✅ 正在确认订单...",
     "odoo_update_vendor_price":    "💲 正在更新供应商价格...",
     "odoo_create_invoice_from_so": "📄 正在创建发票...",
@@ -11317,6 +11432,7 @@ TOOL_PROGRESS_LABELS_EN = {
     "odoo_create_record":          "✏️ Creating record...",
     "odoo_update_record":          "✏️ Updating record...",
     "odoo_add_order_line":         "➕ Adding order line...",
+    "odoo_batch_add_order_lines":  "➕ Adding order lines (batch)...",
     "odoo_confirm_order":          "✅ Confirming order...",
     "odoo_update_vendor_price":    "💲 Updating vendor price...",
     "odoo_create_invoice_from_so": "📄 Creating invoice...",
@@ -12496,7 +12612,7 @@ async def odoo_bot_chat(req: OdooBotRequest):
     # Release-related tools — allowed for can_release_so (admin/finance/sales_manager)
     release_tools = {"odoo_create_invoice_from_so", "odoo_register_payment", "odoo_export_invoice_pdf", "release_so", "print_invoice", "check_so_payment_status"}
     # Other write tools (PO, product/price edits) — admin/finance only (NOT sales_manager)
-    write_tools = {"odoo_create_record", "odoo_add_order_line", "odoo_confirm_order", "odoo_update_record", "odoo_update_vendor_price"}
+    write_tools = {"odoo_create_record", "odoo_add_order_line", "odoo_batch_add_order_lines", "odoo_confirm_order", "odoo_update_record", "odoo_update_vendor_price"}
     cost_tools = {"odoo_find_recent_purchases_by_skus", "odoo_get_product_vendors", "odoo_create_bulk_po", "get_po_with_so_links", "odoo_restock_analysis", "get_incoming_products"}
     # v18.3: admin-only tools
     admin_only_tools = {"db_query_admin"}
