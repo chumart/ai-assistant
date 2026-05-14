@@ -2612,27 +2612,28 @@ TOOLS = [
     },
     {
         "name": "odoo_batch_add_order_lines",
-        "description": "⚡ FAST BATCH — Add MULTIPLE product lines to a PO/SO in ONE call. MANDATORY when user uploads Excel/CSV to add to a PO. Workflow: (1) odoo_search to get order_id, (2) call THIS tool with SKU+qty lines — DONE. This tool auto-resolves SKUs → product_ids internally. NEVER call odoo_search_products_by_sku or odoo_get_product_vendors before this tool — it handles everything. NEVER show a confirmation list — just execute. Supports 500+ lines per call.",
+        "description": "⚡ FAST BATCH — Add MULTIPLE product lines to a PO/SO in ONE call using Odoo's native batch wizard. Gets correct vendor prices automatically. TWO modes: (A) pass order_id to add lines to an EXISTING PO, (B) omit order_id to CREATE NEW POs grouped by vendor automatically. MANDATORY when user uploads Excel/CSV. INPUT: either pass file_base64 (raw Excel — PREFERRED, fastest) OR lines array with SKU+qty. NEVER call odoo_search_products_by_sku before this. NEVER show a confirmation list — just execute.",
         "input_schema": {
             "type": "object",
             "properties": {
                 "order_type": {"type": "string", "description": "purchase or sale"},
-                "order_id": {"type": "integer", "description": "The ID of the order"},
+                "order_id": {"type": "integer", "description": "ID of existing order to add lines to. OMIT to create new POs grouped by vendor."},
+                "file_base64": {"type": "string", "description": "Base64-encoded Excel file content. PREFERRED — pass the raw attachment data directly. When provided, lines array is ignored."},
+                "file_name": {"type": "string", "description": "Original filename (e.g. 'orders.xlsx'). Required when using file_base64."},
                 "lines": {
                     "type": "array",
-                    "description": "Array of lines to add. Each line must have sku and quantity.",
+                    "description": "Array of SKU+qty lines. Only used if file_base64 is not provided.",
                     "items": {
                         "type": "object",
                         "properties": {
-                            "sku": {"type": "string", "description": "Product SKU/default_code"},
-                            "quantity": {"type": "number", "description": "Quantity to order"},
-                            "price_unit": {"type": "number", "description": "Unit price (optional)"}
+                            "sku": {"type": "string", "description": "Product SKU"},
+                            "quantity": {"type": "number", "description": "Quantity"}
                         },
                         "required": ["sku", "quantity"]
                     }
                 }
             },
-            "required": ["order_type", "order_id", "lines"]
+            "required": ["order_type"]
         }
     },
     {
@@ -4115,22 +4116,19 @@ number being 01099.
 When the user uploads an Excel/CSV and asks to add products to a PO or SO:
 
 CASE A — User specifies an existing PO (e.g. "加进P00491"):
-1. Extract SKU + quantity from the file data
-2. Look up the PO with odoo_search to get order_id (ONE call)
-3. Call odoo_batch_add_order_lines with ALL lines at once
+1. Look up the PO with odoo_search to get order_id (ONE call)
+2. Call odoo_batch_add_order_lines with order_type + order_id — the tool auto-uses the uploaded Excel file
 
 CASE B — User wants a NEW PO (e.g. "帮我建个PO" / "create a new PO for these"):
-1. Extract SKU + quantity from the file data
-2. If vendor is not specified, ask which vendor (ONE question, do NOT list products)
-3. Create PO with odoo_create_record (partner_id = vendor ID)
-4. Call odoo_batch_add_order_lines with the new order_id
+1. Call odoo_batch_add_order_lines with order_type="purchase" and NO order_id — the tool creates POs grouped by vendor automatically
 
 CRITICAL — do NOT:
-  ❌ Call odoo_search_products_by_sku first (batch tool resolves SKUs itself)
-  ❌ Call odoo_get_product_vendors (not needed for adding lines)
-  ❌ Show a full product confirmation table and wait for "确认" (just execute)
-  ❌ Call odoo_add_order_line in a loop (use batch tool instead)
-If the file has price info, include price_unit in each line. If quantity is missing, use 1.
+  ❌ Call odoo_search_products_by_sku (the batch tool handles SKU resolution)
+  ❌ Call odoo_get_product_vendors (the batch tool handles vendor lookup)
+  ❌ Extract SKUs from the Excel manually (the batch tool reads the Excel directly)
+  ❌ Show a product confirmation table and wait for "确认"
+  ❌ Call odoo_add_order_line in a loop
+The tool auto-detects the uploaded Excel — just call it with order_type (and order_id if adding to existing PO).
 
 🔒 HARD RULE FOR RELEASE/INVOICE INTENT 🔒
 When the user's latest message contains release intent — keywords like:
@@ -5006,152 +5004,164 @@ async def run_tool(name, inp, context=None):
 
     if name == "odoo_batch_add_order_lines":
         order_type = inp["order_type"]
-        order_id = inp["order_id"]
+        order_id = inp.get("order_id")
         lines = inp.get("lines", [])
-        line_model = "purchase.order.line" if order_type == "purchase" else "sale.order.line"
-        order_field = "order_id"
-        qty_field = "product_qty" if order_type == "purchase" else "product_uom_qty"
+        file_base64 = inp.get("file_base64", "")
+        file_name = inp.get("file_name", "upload.xlsx")
 
-        if not lines:
-            return json.dumps({"error": "No lines provided"})
+        # Auto-use stored Excel from current user's last upload
+        uid = ctx.get("uid", 0)
+        if not file_base64 and not lines and uid in ODOO_BOT_LAST_EXCEL:
+            stored = ODOO_BOT_LAST_EXCEL[uid]
+            file_base64 = stored["base64"]
+            file_name = stored["filename"]
+            print(f"[BATCH-ADD] Auto-using stored Excel: {file_name}")
+        elif not file_base64 and not lines:
+            return json.dumps({"error": "Provide either file_base64 or lines array, or upload an Excel file"})
 
-        print(f"[BATCH-ADD] Adding {len(lines)} lines to {order_type} order {order_id}")
+        print(f"[BATCH-ADD] Mode: {'file' if file_base64 else 'text'}, lines={len(lines)}, order_id={order_id}")
 
-        # Step 1: Batch resolve all SKUs to product_ids in one query
-        all_skus = [l["sku"].strip() for l in lines if l.get("sku")]
-        unique_skus = list(set(s.upper() for s in all_skus))
-
-        sku_to_product = {}
-        if unique_skus:
-            # Query in batches of 200 to avoid URL length issues
-            for batch_start in range(0, len(unique_skus), 200):
-                batch_skus = unique_skus[batch_start:batch_start+200]
-                sku_r = json.loads(await odoo_query("product.product",
-                    [["default_code", "in", batch_skus], ["active", "=", True]],
-                    ["id", "name", "default_code", "list_price"], limit=500))
-                if isinstance(sku_r, list):
-                    for p in sku_r:
-                        code = (p.get("default_code") or "").upper()
-                        if code:
-                            sku_to_product[code] = p
-            # Also try case-insensitive match for unresolved SKUs
-            unresolved = [s for s in unique_skus if s not in sku_to_product]
-            if unresolved:
-                for batch_start in range(0, len(unresolved), 50):
-                    batch = unresolved[batch_start:batch_start+50]
-                    for sku in batch:
-                        ilr = json.loads(await odoo_query("product.product",
-                            [["default_code", "ilike", sku], ["active", "=", True]],
-                            ["id", "name", "default_code", "list_price"], limit=1))
-                        if isinstance(ilr, list) and ilr:
-                            sku_to_product[sku] = ilr[0]
-
-        print(f"[BATCH-ADD] Resolved {len(sku_to_product)}/{len(unique_skus)} SKUs")
-
-        # Step 2: Fetch vendor prices from product.supplierinfo
-        # When no price_unit is provided, Odoo's API create may not use the correct vendor price.
-        # We explicitly look up supplierinfo prices for the vendor on this PO.
-        vendor_prices = {}  # product_id -> price
         try:
-            # Get the vendor (partner_id) from the PO/SO
-            order_model = "purchase.order" if order_type == "purchase" else "sale.order"
-            order_r = json.loads(await odoo_query(order_model,
-                [["id", "=", order_id]], ["partner_id"], limit=1))
-            vendor_id = None
-            if isinstance(order_r, list) and order_r:
-                pid = order_r[0].get("partner_id")
-                vendor_id = pid[0] if isinstance(pid, list) else pid
+            cookies = await odoo_get_session()
 
-            if vendor_id and order_type == "purchase":
-                all_product_ids = [p["id"] for p in sku_to_product.values()]
-                # Get product_tmpl_id for each product
-                if all_product_ids:
-                    tmpl_map = {}  # product_id -> product_tmpl_id
-                    for batch_start in range(0, len(all_product_ids), 200):
-                        batch_pids = all_product_ids[batch_start:batch_start+200]
-                        prod_r = json.loads(await odoo_query("product.product",
-                            [["id", "in", batch_pids]],
-                            ["id", "product_tmpl_id"], limit=500))
-                        if isinstance(prod_r, list):
-                            for p in prod_r:
-                                tmpl = p.get("product_tmpl_id")
-                                tmpl_id = tmpl[0] if isinstance(tmpl, list) else tmpl
-                                if tmpl_id:
-                                    tmpl_map[p["id"]] = tmpl_id
+            # Build wizard create vals
+            if file_base64:
+                # Direct Excel passthrough — let Odoo wizard parse it
+                wiz_vals = {
+                    "input_mode": "file",
+                    "upload_file": file_base64,
+                    "upload_filename": file_name,
+                }
+                print(f"[BATCH-ADD] Passing Excel file directly to wizard: {file_name}")
+            else:
+                # Build text from lines array
+                text_lines = []
+                for line in lines:
+                    sku = (line.get("sku") or "").strip()
+                    qty = line.get("quantity", 1)
+                    if sku:
+                        text_lines.append(f"{sku} {qty}")
+                wiz_vals = {
+                    "input_mode": "text",
+                    "input_text": "\n".join(text_lines),
+                }
 
-                    # Query supplierinfo for this vendor
-                    all_tmpl_ids = list(set(tmpl_map.values()))
-                    if all_tmpl_ids:
-                        for batch_start in range(0, len(all_tmpl_ids), 200):
-                            batch_tmpl = all_tmpl_ids[batch_start:batch_start+200]
-                            si_r = json.loads(await odoo_query("product.supplierinfo",
-                                [["partner_id", "=", vendor_id], ["product_tmpl_id", "in", batch_tmpl]],
-                                ["product_tmpl_id", "price", "min_qty"],
-                                limit=1000, order="min_qty asc"))
-                            if isinstance(si_r, list):
-                                # Build tmpl_id -> price (use the first/lowest min_qty entry)
-                                tmpl_prices = {}
-                                for si in si_r:
-                                    tid = si["product_tmpl_id"][0] if isinstance(si.get("product_tmpl_id"), list) else si.get("product_tmpl_id")
-                                    if tid and tid not in tmpl_prices:
-                                        tmpl_prices[tid] = si.get("price", 0)
-                                # Map back to product_id
-                                for pid, tid in tmpl_map.items():
-                                    if tid in tmpl_prices:
-                                        vendor_prices[pid] = tmpl_prices[tid]
+            # Step 1: Create the wizard
+            wiz_result = await _odoo_call("purchase.batch.po.wizard", "create",
+                [[wiz_vals]], {}, cookies=cookies)
+            wiz_id = wiz_result if isinstance(wiz_result, int) else wiz_result[0] if isinstance(wiz_result, list) else wiz_result.get("id") if isinstance(wiz_result, dict) else None
+            if not wiz_id:
+                return json.dumps({"error": f"Failed to create batch wizard: {wiz_result}"})
+            print(f"[BATCH-ADD] Wizard created: id={wiz_id}")
 
-                print(f"[BATCH-ADD] Fetched {len(vendor_prices)} vendor prices from supplierinfo")
+            # Step 2: Call action_preview to parse and match products
+            preview_result = await _odoo_call("purchase.batch.po.wizard", "action_preview",
+                [[wiz_id]], {}, cookies=cookies)
+            print(f"[BATCH-ADD] Preview done")
+
+            # Step 3: Read wizard state to check results
+            wiz_data = await _odoo_call("purchase.batch.po.wizard", "read",
+                [[wiz_id]], {"fields": ["state", "result_count", "not_found_count", "po_count", "skus_not_found"]},
+                cookies=cookies)
+            if isinstance(wiz_data, list) and wiz_data:
+                wiz_data = wiz_data[0]
+            print(f"[BATCH-ADD] Preview results: {wiz_data}")
+
+            result_count = wiz_data.get("result_count", 0)
+            not_found_count = wiz_data.get("not_found_count", 0)
+            skus_not_found = wiz_data.get("skus_not_found", "")
+
+            if result_count == 0:
+                return json.dumps({
+                    "success": False,
+                    "error": "No products matched",
+                    "skus_not_found": skus_not_found,
+                    "message": f"None of the {len(lines)} SKUs were found in Odoo. Not found: {skus_not_found}",
+                })
+
+            # Step 4: If order_id is provided, we need to add lines to existing PO
+            # If no order_id, let the wizard create new POs grouped by vendor
+            if order_id:
+                # Read the preview lines and add them to the existing PO manually
+                line_data = await _odoo_call("purchase.batch.po.line", "search_read",
+                    [[["wizard_id", "=", wiz_id]]],
+                    {"fields": ["product_id", "qty", "unit_price", "vendor_id", "status", "status_note", "default_code"]},
+                    cookies=cookies)
+
+                if not line_data:
+                    return json.dumps({"error": "No preview lines found after parsing"})
+
+                # Determine the correct model/fields based on order_type
+                line_model = "purchase.order.line" if order_type == "purchase" else "sale.order.line"
+                order_field = "order_id"
+                qty_field = "product_qty" if order_type == "purchase" else "product_uom_qty"
+
+                successes = []
+                failures = []
+                for pl in line_data:
+                    pid = pl["product_id"][0] if isinstance(pl.get("product_id"), list) else pl.get("product_id")
+                    sku = pl.get("default_code", "?")
+                    if not pid:
+                        failures.append({"sku": sku, "error": "No product_id"})
+                        continue
+                    vals = {
+                        order_field: order_id,
+                        "product_id": pid,
+                        qty_field: pl.get("qty", 1),
+                        "price_unit": pl.get("unit_price", 0),
+                    }
+                    try:
+                        result = await odoo_create(line_model, vals, cookies=cookies)
+                        if result.get("error"):
+                            failures.append({"sku": sku, "error": result["error"]})
+                        else:
+                            successes.append({"sku": sku, "qty": pl.get("qty", 1), "price": pl.get("unit_price", 0)})
+                    except Exception as e:
+                        failures.append({"sku": sku, "error": str(e)[:200]})
+
+                print(f"[BATCH-ADD] Added to existing PO: {len(successes)} success, {len(failures)} failed")
+                return json.dumps({
+                    "success": len(failures) == 0,
+                    "total_lines": len(lines),
+                    "added": len(successes),
+                    "failed": len(failures),
+                    "failures": failures,
+                    "skus_not_found": skus_not_found,
+                    "message": f"Added {len(successes)}/{result_count} lines. {not_found_count} SKUs not found." + (f" Failed: {len(failures)}" if failures else ""),
+                }, ensure_ascii=False)
+
+            else:
+                # No order_id — let wizard create new POs grouped by vendor
+                create_result = await _odoo_call("purchase.batch.po.wizard", "action_create_pos",
+                    [[wiz_id]], {}, cookies=cookies)
+
+                # Read the final wizard state
+                wiz_final = await _odoo_call("purchase.batch.po.wizard", "read",
+                    [[wiz_id]], {"fields": ["state", "created_po_ids", "created_po_names"]},
+                    cookies=cookies)
+                if isinstance(wiz_final, list) and wiz_final:
+                    wiz_final = wiz_final[0]
+
+                created_po_names = wiz_final.get("created_po_names", "")
+                created_po_ids = wiz_final.get("created_po_ids", "")
+
+                print(f"[BATCH-ADD] Wizard done: {created_po_names}")
+                return json.dumps({
+                    "success": True,
+                    "total_lines": len(lines),
+                    "matched": result_count,
+                    "not_found_count": not_found_count,
+                    "skus_not_found": skus_not_found,
+                    "created_pos": created_po_names,
+                    "created_po_ids": created_po_ids,
+                    "message": created_po_names + (f"\n\nSKUs not found: {skus_not_found}" if not_found_count else ""),
+                }, ensure_ascii=False)
+
         except Exception as e:
-            print(f"[BATCH-ADD] Vendor price lookup failed (non-fatal): {e}")
-
-        # Step 3: Create order lines
-        successes = []
-        failures = []
-        for line in lines:
-            sku = (line.get("sku") or "").strip().upper()
-            qty = line.get("quantity", 0)
-            price = line.get("price_unit", 0)
-
-            if not sku:
-                failures.append({"sku": sku, "error": "Empty SKU"})
-                continue
-
-            product = sku_to_product.get(sku)
-            if not product:
-                failures.append({"sku": sku, "error": "SKU not found in Odoo"})
-                continue
-
-            vals = {
-                order_field: order_id,
-                "product_id": product["id"],
-                qty_field: qty,
-            }
-            # Price priority: Excel price > vendor supplierinfo price > let Odoo default
-            if price:
-                vals["price_unit"] = price
-            elif product["id"] in vendor_prices:
-                vals["price_unit"] = vendor_prices[product["id"]]
-
-            try:
-                result = await odoo_create(line_model, vals)
-                if result.get("error"):
-                    failures.append({"sku": sku, "product": product.get("name", ""), "error": result["error"]})
-                else:
-                    successes.append({"sku": sku, "product": product.get("name", ""), "line_id": result["id"], "qty": qty})
-            except Exception as e:
-                failures.append({"sku": sku, "product": product.get("name", ""), "error": str(e)[:200]})
-
-        print(f"[BATCH-ADD] Done: {len(successes)} success, {len(failures)} failed")
-
-        return json.dumps({
-            "success": len(failures) == 0,
-            "total_lines": len(lines),
-            "added": len(successes),
-            "failed": len(failures),
-            "successes": successes,
-            "failures": failures,
-            "message": f"Added {len(successes)}/{len(lines)} lines to {order_type} order. {len(failures)} failed." if failures else f"All {len(successes)} lines added successfully.",
-        }, ensure_ascii=False)
+            import traceback
+            print(f"[BATCH-ADD] Error: {e}")
+            traceback.print_exc()
+            return json.dumps({"error": f"Batch add failed: {str(e)[:300]}"})
 
     if name == "odoo_confirm_order":
         model = "purchase.order" if inp["order_type"] == "purchase" else "sale.order"
@@ -11442,6 +11452,7 @@ class OdooBotRequest(BaseModel):
 
 # In-memory conversation history per Odoo user (last 10 turns)
 ODOO_BOT_HISTORY: dict = {}  # uid -> list of {role, content}
+ODOO_BOT_LAST_EXCEL: dict = {}  # uid -> {"base64": str, "filename": str} — last uploaded Excel for batch PO tool
 
 
 # Map tool name → friendly progress label (zh + en) shown in Discuss as "正在..."/"Working on..."
@@ -12455,12 +12466,14 @@ async def _build_odoo_bot_user_content(text: str, attachments: list, user_lang: 
                 print(f"[ODOO-BOT] attached PDF: {att_name} ({len(raw) / 1024:.1f}KB)")
                 continue
 
-            # ── Excel / CSV: extract to text ──
+            # ── Excel / CSV: extract to text AND store base64 for batch PO tool ──
             if mime in ODOO_BOT_EXCEL_MIMES:
                 try:
                     excel_text = _extract_excel_text(raw, mime, att_name)
                     extracted_texts.append(f"\n\n--- File: {att_name} ---\n{excel_text}")
-                    print(f"[ODOO-BOT] extracted Excel/CSV: {att_name}")
+                    # Store base64 for odoo_batch_add_order_lines to use directly
+                    _build_odoo_bot_user_content._last_excel = {"base64": att_data, "filename": att_name}
+                    print(f"[ODOO-BOT] extracted Excel/CSV: {att_name} (base64 stored for batch tool)")
                 except Exception as e:
                     skipped.append(f"{att_name} (Excel parse error: {e})")
                 continue
@@ -12718,6 +12731,11 @@ async def odoo_bot_chat(req: OdooBotRequest):
     # Build the user message — text only, OR multimodal if attachments are present
     try:
         user_content = await _build_odoo_bot_user_content(req.message, req.attachments, user_lang)
+        # Store last Excel attachment for batch PO tool
+        if hasattr(_build_odoo_bot_user_content, '_last_excel') and _build_odoo_bot_user_content._last_excel:
+            ODOO_BOT_LAST_EXCEL[uid] = _build_odoo_bot_user_content._last_excel
+            _build_odoo_bot_user_content._last_excel = None
+            print(f"[ODOO-BOT] Stored Excel for uid={uid}: {ODOO_BOT_LAST_EXCEL[uid]['filename']}")
     except Exception as e:
         print(f"[ODOO-BOT] _build_odoo_bot_user_content error: {e}")
         import traceback; traceback.print_exc()
