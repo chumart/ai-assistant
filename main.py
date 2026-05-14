@@ -9589,8 +9589,9 @@ async def extract_file(file: UploadFile = File(...)):
                 wb.close()
                 text = "\n".join(all_text)
                 # Store base64 for batch PO tool (will be picked up by chat endpoint)
-                _EXTRACT_FILE_LAST_EXCEL["_last"] = {"base64": base64.b64encode(content).decode('utf-8'), "filename": file.filename}
-                print(f"EXTRACT-FILE: {file.filename} (xlsx) → {len(text)} chars, {len(all_text)} rows")
+                b64_data = base64.b64encode(content).decode('utf-8')
+                _EXTRACT_FILE_LAST_EXCEL["_last"] = {"base64": b64_data, "filename": file.filename}
+                print(f"EXTRACT-FILE: {file.filename} (xlsx) → {len(text)} chars, {len(all_text)} rows, base64={len(b64_data)} chars stored")
                 return {"text": text, "name": file.filename}
             except Exception as e:
                 print(f"EXTRACT-FILE xlsx error: {e}")
@@ -9954,10 +9955,14 @@ async def chat(req: ChatRequest, background_tasks: BackgroundTasks):
         )
         openai_image_content = None
         # Store Excel base64 for batch PO if available
+        print(f"[CHAT-FILE] file_name='{req.file_name}', is_xlsx={req.file_name.lower().endswith(('.xlsx', '.xls'))}, has_last={_EXTRACT_FILE_LAST_EXCEL.get('_last') is not None}")
         if req.file_name.lower().endswith(('.xlsx', '.xls')) and _EXTRACT_FILE_LAST_EXCEL.get("_last"):
-            stored = _EXTRACT_FILE_LAST_EXCEL.pop("_last")
+            stored = _EXTRACT_FILE_LAST_EXCEL["_last"]
+            _EXTRACT_FILE_LAST_EXCEL["_last"] = None
             ODOO_BOT_LAST_EXCEL[verified_uid] = stored
             print(f"[CHAT] Stored Excel base64 for uid={verified_uid}: {stored['filename']}")
+        elif req.file_name.lower().endswith(('.xlsx', '.xls')):
+            print(f"[CHAT-FILE] WARNING: xlsx detected but no base64 in _EXTRACT_FILE_LAST_EXCEL")
     else:
         user_message_content = req.message
         openai_image_content = None
@@ -12773,6 +12778,19 @@ async def odoo_bot_chat(req: OdooBotRequest):
     # Only triggers for "AMZxxx release" / "#CMTxxx 开票" — single SO, no extras.
     # 防止 AI 被对话历史污染产生幻觉 (上次成功的 INV 号被模式补全)。
     has_attachments = bool(req.attachments)
+
+    # ── Early Excel extraction: store base64 BEFORE fastpath check ──
+    if has_attachments:
+        for att in req.attachments:
+            try:
+                att_name = att.name if hasattr(att, 'name') else att.get('name', '')
+                att_data = att.data_base64 if hasattr(att, 'data_base64') else att.get('data_base64', '')
+                if att_name and att_data and att_name.lower().endswith(('.xlsx', '.xls')):
+                    ODOO_BOT_LAST_EXCEL[uid] = {"base64": att_data, "filename": att_name}
+                    print(f"[ODOO-BOT] Early Excel store for uid={uid}: {att_name}")
+                    break
+            except Exception:
+                pass
 
     # ── BATCH PO FASTPATH: Excel + PO creation intent → direct wizard call ──
     # Triggers when: (A) Excel uploaded in THIS message, or (B) Excel uploaded in a PREVIOUS message
