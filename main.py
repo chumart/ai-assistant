@@ -12662,6 +12662,139 @@ async def odoo_bot_chat(req: OdooBotRequest):
     # Only triggers for "AMZxxx release" / "#CMTxxx 开票" — single SO, no extras.
     # 防止 AI 被对话历史污染产生幻觉 (上次成功的 INV 号被模式补全)。
     has_attachments = bool(req.attachments)
+
+    # ── BATCH PO FASTPATH: Excel + PO creation intent → direct wizard call ──
+    # Triggers when: (A) Excel uploaded in THIS message, or (B) Excel uploaded in a PREVIOUS message
+    has_stored_excel = uid in ODOO_BOT_LAST_EXCEL
+    if (has_attachments or has_stored_excel) and has_stored_excel:
+        msg_lower = (req.message or "").lower().strip()
+        po_keywords = ["创建po", "创建个po", "生成po", "生成个po", "建个po", "建一个po", "create po",
+                        "创建采购", "生成采购", "加进p0", "加进p00", "加到p0", "加到p00",
+                        "添加到p0", "添加到p00", "batch po", "批量po", "批量采购"]
+        # Also match "加进P00xxx" pattern
+        import re as _re
+        po_add_match = _re.search(r'(?:加进|加到|添加到|add to)\s*p\d{3,}', msg_lower)
+        is_batch_po = any(kw in msg_lower for kw in po_keywords) or po_add_match
+
+        if is_batch_po and perms.get("can_write_odoo"):
+            print(f"[FASTPATH-BATCH-PO] Detected Excel + PO intent from uid={uid}")
+            stored_excel = ODOO_BOT_LAST_EXCEL.get(uid, {})
+
+            try:
+                cookies = await odoo_get_session()
+
+                # Determine if adding to existing PO or creating new
+                existing_po_match = _re.search(r'p\d{3,}', msg_lower)
+                order_id = None
+                po_name = None
+                if existing_po_match:
+                    po_name = existing_po_match.group(0).upper()
+                    # Look up PO
+                    po_r = json.loads(await odoo_query("purchase.order",
+                        [["name", "=ilike", po_name], ["company_id", "=", 1]],
+                        ["id", "name", "state"], limit=1))
+                    if isinstance(po_r, list) and po_r:
+                        order_id = po_r[0]["id"]
+                        po_name = po_r[0]["name"]
+                        print(f"[FASTPATH-BATCH-PO] Adding to existing PO: {po_name} (id={order_id})")
+
+                # Progress message
+                await _odoo_bot_post_progress(req.channel_id,
+                    "➕ 正在批量添加订单行..." if user_lang == "zh" else "➕ Adding order lines (batch)...")
+
+                # Create wizard with Excel file
+                wiz_vals = {
+                    "input_mode": "file",
+                    "upload_file": stored_excel["base64"],
+                    "upload_filename": stored_excel["filename"],
+                }
+                wiz_result = await _odoo_call("purchase.batch.po.wizard", "create",
+                    [[wiz_vals]], {}, cookies=cookies)
+                wiz_id = wiz_result if isinstance(wiz_result, int) else wiz_result[0] if isinstance(wiz_result, list) else None
+                if not wiz_id:
+                    reply = f"⚠️ Failed to create batch wizard: {wiz_result}"
+                    print(f"[FASTPATH-BATCH-PO] {reply}")
+                    return {"reply": reply}
+
+                # Preview
+                await _odoo_call("purchase.batch.po.wizard", "action_preview",
+                    [[wiz_id]], {}, cookies=cookies)
+
+                wiz_data = await _odoo_call("purchase.batch.po.wizard", "read",
+                    [[wiz_id]], {"fields": ["state", "result_count", "not_found_count", "po_count", "skus_not_found"]},
+                    cookies=cookies)
+                if isinstance(wiz_data, list) and wiz_data:
+                    wiz_data = wiz_data[0]
+
+                result_count = wiz_data.get("result_count", 0)
+                not_found_count = wiz_data.get("not_found_count", 0)
+                skus_not_found = wiz_data.get("skus_not_found", "")
+
+                if result_count == 0:
+                    reply = f"⚠️ No products matched from the Excel file.\nSKUs not found: {skus_not_found}"
+                    return {"reply": reply}
+
+                if order_id:
+                    # Add lines to existing PO
+                    line_data = await _odoo_call("purchase.batch.po.line", "search_read",
+                        [[["wizard_id", "=", wiz_id]]],
+                        {"fields": ["product_id", "qty", "unit_price", "default_code"]},
+                        cookies=cookies)
+
+                    successes = 0
+                    failures = []
+                    for pl in (line_data or []):
+                        pid = pl["product_id"][0] if isinstance(pl.get("product_id"), list) else pl.get("product_id")
+                        if not pid:
+                            continue
+                        vals = {
+                            "order_id": order_id,
+                            "product_id": pid,
+                            "product_qty": pl.get("qty", 1),
+                            "price_unit": pl.get("unit_price", 0),
+                        }
+                        try:
+                            r = await odoo_create("purchase.order.line", vals, cookies=cookies)
+                            if r.get("error"):
+                                failures.append(f"{pl.get('default_code','?')}: {r['error'][:80]}")
+                            else:
+                                successes += 1
+                        except Exception as e:
+                            failures.append(f"{pl.get('default_code','?')}: {str(e)[:80]}")
+
+                    reply = f"✅ **{po_name} — Added {successes}/{result_count} lines**"
+                    if not_found_count:
+                        reply += f"\n⚠️ SKUs not found: {skus_not_found}"
+                    if failures:
+                        reply += f"\n❌ Failed ({len(failures)}): {'; '.join(failures[:5])}"
+                else:
+                    # Create new POs grouped by vendor
+                    await _odoo_call("purchase.batch.po.wizard", "action_create_pos",
+                        [[wiz_id]], {}, cookies=cookies)
+
+                    wiz_final = await _odoo_call("purchase.batch.po.wizard", "read",
+                        [[wiz_id]], {"fields": ["created_po_names", "created_po_ids"]},
+                        cookies=cookies)
+                    if isinstance(wiz_final, list) and wiz_final:
+                        wiz_final = wiz_final[0]
+
+                    reply = f"✅ **{wiz_final.get('created_po_names', 'POs created')}**"
+                    if not_found_count:
+                        reply += f"\n⚠️ SKUs not found: {skus_not_found}"
+
+                # Clean up stored Excel
+                ODOO_BOT_LAST_EXCEL.pop(uid, None)
+
+                print(f"[FASTPATH-BATCH-PO] Done: {reply[:100]}...")
+                return {"reply": reply}
+
+            except Exception as e:
+                import traceback
+                print(f"[FASTPATH-BATCH-PO] Error: {e}")
+                traceback.print_exc()
+                reply = f"⚠️ Batch PO error: {str(e)[:200]}"
+                return {"reply": reply}
+
     is_simple, fp_so_name, fp_mtype = _is_simple_marketplace_release(
         req.message or "", has_attachments
     )
