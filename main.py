@@ -9983,7 +9983,7 @@ async def chat(req: ChatRequest, background_tasks: BackgroundTasks):
     msg_lower = (req.message or "").lower().strip()
     has_stored_excel_chat = verified_uid in ODOO_BOT_LAST_EXCEL
     po_create_regex_chat = _re.search(r'(创建|生成|建|做|开|下|新建).{0,4}(po|采购单|采购)', msg_lower)
-    po_add_match_chat = _re.search(r'(?:加进|加到|添加到|增加到|导入到|add\s*to)\s*p\d{3,}', msg_lower)
+    po_add_match_chat = _re.search(r'(?:加进|加到|添加到|增加到|导入到|add\s*to)\s*po?0*\d{2,}', msg_lower)
     po_kw_chat = any(kw in msg_lower for kw in ["create po", "new po", "make po", "batch po", "批量po"])
     is_batch_po_chat = po_create_regex_chat or po_add_match_chat or po_kw_chat
 
@@ -9995,17 +9995,19 @@ async def chat(req: ChatRequest, background_tasks: BackgroundTasks):
             try:
                 cookies = await odoo_get_session()
                 # Check for existing PO reference
-                existing_po_match = _re.search(r'p\d{3,}', msg_lower)
+                existing_po_match = _re.search(r'po?0*(\d{2,})', msg_lower)
                 order_id = None
                 po_name = None
                 if existing_po_match and not po_create_regex_chat:
-                    po_ref = existing_po_match.group(0).upper()
-                    po_r = json.loads(await odoo_query("purchase.order",
-                        [["name", "=ilike", po_ref], ["company_id", "=", 1]],
-                        ["id", "name", "state"], limit=1))
-                    if isinstance(po_r, list) and po_r:
-                        order_id = po_r[0]["id"]
-                        po_name = po_r[0]["name"]
+                    po_digits = existing_po_match.group(1)
+                    for pattern in [f"P{po_digits.zfill(5)}", f"P0{po_digits}", f"P{po_digits}"]:
+                        po_r = json.loads(await odoo_query("purchase.order",
+                            [["name", "=ilike", pattern], ["company_id", "=", 1]],
+                            ["id", "name", "state"], limit=1))
+                        if isinstance(po_r, list) and po_r:
+                            order_id = po_r[0]["id"]
+                            po_name = po_r[0]["name"]
+                            break
 
                 yield f"data: {json.dumps({'type': 'text', 'text': '➕ 正在通过 Odoo 批量工具处理...'})}\n\n"
 
@@ -12809,7 +12811,7 @@ async def odoo_bot_chat(req: OdooBotRequest):
         # Smart regex: match Chinese PO creation intent (任何组合的 创建/生成/建/做/开/下 + 任意修饰词 + PO/采购/采购单)
         po_create_regex = re.search(r'(创建|生成|建|做|开|下|新建).{0,4}(po|采购单|采购)', msg_lower)
         # Match "加进/加到/添加到 P00xxx"
-        po_add_match = re.search(r'(?:加进|加到|添加到|增加到|导入到|add\s*to)\s*p\d{3,}', msg_lower)
+        po_add_match = re.search(r'(?:加进|加到|添加到|增加到|导入到|add\s*to)\s*po?0*\d{2,}', msg_lower)
         is_batch_po = any(kw in msg_lower for kw in po_keywords) or po_create_regex or po_add_match
 
         if is_batch_po and perms.get("can_write_odoo"):
@@ -12820,19 +12822,22 @@ async def odoo_bot_chat(req: OdooBotRequest):
                 cookies = await odoo_get_session()
 
                 # Determine if adding to existing PO or creating new
-                existing_po_match = re.search(r'p\d{3,}', msg_lower)
+                existing_po_match = re.search(r'po?0*(\d{2,})', msg_lower)
                 order_id = None
                 po_name = None
-                if existing_po_match:
-                    po_name = existing_po_match.group(0).upper()
-                    # Look up PO
-                    po_r = json.loads(await odoo_query("purchase.order",
-                        [["name", "=ilike", po_name], ["company_id", "=", 1]],
-                        ["id", "name", "state"], limit=1))
-                    if isinstance(po_r, list) and po_r:
-                        order_id = po_r[0]["id"]
-                        po_name = po_r[0]["name"]
-                        print(f"[FASTPATH-BATCH-PO] Adding to existing PO: {po_name} (id={order_id})")
+                if existing_po_match and not po_create_regex:
+                    po_digits = existing_po_match.group(1)
+                    # Try multiple formats: P00503, PO503, P503
+                    search_patterns = [f"P{po_digits.zfill(5)}", f"P0{po_digits}", f"P{po_digits}", existing_po_match.group(0).upper()]
+                    for pattern in search_patterns:
+                        po_r = json.loads(await odoo_query("purchase.order",
+                            [["name", "=ilike", pattern], ["company_id", "=", 1]],
+                            ["id", "name", "state"], limit=1))
+                        if isinstance(po_r, list) and po_r:
+                            order_id = po_r[0]["id"]
+                            po_name = po_r[0]["name"]
+                            print(f"[FASTPATH-BATCH-PO] Found PO: {po_name} (id={order_id}) via pattern '{pattern}'")
+                            break
 
                 # Progress message
                 await _odoo_bot_post_progress(req.channel_id,
