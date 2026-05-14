@@ -5009,15 +5009,21 @@ async def run_tool(name, inp, context=None):
         file_base64 = inp.get("file_base64", "")
         file_name = inp.get("file_name", "upload.xlsx")
 
+        # Validate file_base64 is real base64, not AI placeholder text
+        if file_base64 and (len(file_base64) < 100 or file_base64.startswith("[") or " " in file_base64[:50]):
+            print(f"[BATCH-ADD] Invalid file_base64 (AI placeholder detected), ignoring: {file_base64[:60]}")
+            file_base64 = ""
+
         # Auto-use stored Excel from current user's last upload
         uid = ctx.get("uid", 0)
-        if not file_base64 and not lines and uid in ODOO_BOT_LAST_EXCEL:
+        if not file_base64 and uid in ODOO_BOT_LAST_EXCEL:
             stored = ODOO_BOT_LAST_EXCEL[uid]
             file_base64 = stored["base64"]
             file_name = stored["filename"]
             print(f"[BATCH-ADD] Auto-using stored Excel: {file_name}")
-        elif not file_base64 and not lines:
-            return json.dumps({"error": "Provide either file_base64 or lines array, or upload an Excel file"})
+        
+        if not file_base64 and not lines:
+            return json.dumps({"error": "No Excel file or SKU lines provided. Please upload an Excel file first."})
 
         print(f"[BATCH-ADD] Mode: {'file' if file_base64 else 'text'}, lines={len(lines)}, order_id={order_id}")
 
@@ -9977,7 +9983,7 @@ async def chat(req: ChatRequest, background_tasks: BackgroundTasks):
     msg_lower = (req.message or "").lower().strip()
     has_stored_excel_chat = verified_uid in ODOO_BOT_LAST_EXCEL
     po_create_regex_chat = _re.search(r'(创建|生成|建|做|开|下|新建).{0,4}(po|采购单|采购)', msg_lower)
-    po_add_match_chat = _re.search(r'(?:加进|加到|添加到|add\s*to)\s*p\d{3,}', msg_lower)
+    po_add_match_chat = _re.search(r'(?:加进|加到|添加到|增加到|导入到|add\s*to)\s*p\d{3,}', msg_lower)
     po_kw_chat = any(kw in msg_lower for kw in ["create po", "new po", "make po", "batch po", "批量po"])
     is_batch_po_chat = po_create_regex_chat or po_add_match_chat or po_kw_chat
 
@@ -12803,7 +12809,7 @@ async def odoo_bot_chat(req: OdooBotRequest):
         # Smart regex: match Chinese PO creation intent (任何组合的 创建/生成/建/做/开/下 + 任意修饰词 + PO/采购/采购单)
         po_create_regex = re.search(r'(创建|生成|建|做|开|下|新建).{0,4}(po|采购单|采购)', msg_lower)
         # Match "加进/加到/添加到 P00xxx"
-        po_add_match = re.search(r'(?:加进|加到|添加到|add\s*to)\s*p\d{3,}', msg_lower)
+        po_add_match = re.search(r'(?:加进|加到|添加到|增加到|导入到|add\s*to)\s*p\d{3,}', msg_lower)
         is_batch_po = any(kw in msg_lower for kw in po_keywords) or po_create_regex or po_add_match
 
         if is_batch_po and perms.get("can_write_odoo"):
