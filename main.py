@@ -2612,7 +2612,7 @@ TOOLS = [
     },
     {
         "name": "odoo_batch_add_order_lines",
-        "description": "Add MULTIPLE product lines to an existing purchase.order or sale.order in ONE call. PREFERRED method when adding more than 3 lines (e.g. from an Excel/CSV file). WORKFLOW: (1) extract SKU + quantity from file, (2) look up the PO/SO to get order_id, (3) call THIS tool directly with all lines. Do NOT call odoo_search_products_by_sku or odoo_get_product_vendors first — this tool resolves SKUs to product_ids automatically. Do NOT ask user to confirm — just execute immediately when they say 'add these to PO'. Returns a summary of successes and failures.",
+        "description": "⚡ FAST BATCH — Add MULTIPLE product lines to a PO/SO in ONE call. MANDATORY when user uploads Excel/CSV to add to a PO. Workflow: (1) odoo_search to get order_id, (2) call THIS tool with SKU+qty lines — DONE. This tool auto-resolves SKUs → product_ids internally. NEVER call odoo_search_products_by_sku or odoo_get_product_vendors before this tool — it handles everything. NEVER show a confirmation list — just execute. Supports 500+ lines per call.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -2677,7 +2677,7 @@ TOOLS = [
     },
     {
         "name": "odoo_search_products_by_sku",
-        "description": "Search multiple products by SKU (default_code) in one batch call. Returns product ID, name, SKU, price for each. Use when user provides a list of SKUs to build purchase orders.",
+        "description": "Search multiple products by SKU (default_code) in one batch call. Returns product ID, name, SKU, price for each. ⚠️ Do NOT use this before odoo_batch_add_order_lines — the batch tool resolves SKUs automatically. Only use this for inventory checks, price lookups, or when user explicitly asks 'look up these SKUs' without adding to a PO.",
         "input_schema": {
             "type": "object",
             "properties": {
