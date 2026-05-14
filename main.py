@@ -2612,7 +2612,7 @@ TOOLS = [
     },
     {
         "name": "odoo_batch_add_order_lines",
-        "description": "Add MULTIPLE product lines to an existing purchase.order or sale.order in ONE call. Use this when adding more than 3 lines (e.g. from an Excel/CSV file). Each line needs sku + quantity. The tool resolves SKUs to product_ids automatically — you do NOT need to look up product_ids first. Returns a summary of successes and failures.",
+        "description": "Add MULTIPLE product lines to an existing purchase.order or sale.order in ONE call. PREFERRED method when adding more than 3 lines (e.g. from an Excel/CSV file). WORKFLOW: (1) extract SKU + quantity from file, (2) look up the PO/SO to get order_id, (3) call THIS tool directly with all lines. Do NOT call odoo_search_products_by_sku or odoo_get_product_vendors first — this tool resolves SKUs to product_ids automatically. Do NOT ask user to confirm — just execute immediately when they say 'add these to PO'. Returns a summary of successes and failures.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -4110,6 +4110,27 @@ NEVER fabricate result fields like invoice numbers, PO numbers, IDs, amounts, jo
 PDF URLs, or success messages. If you're tempted to write "INV/2026/01100" — STOP — that
 number must come from an actual tool result, not from a guess based on a previous invoice
 number being 01099.
+
+🔒 HARD RULE FOR EXCEL → PO/SO LINE ADDITION 🔒
+When the user uploads an Excel/CSV and asks to add products to a PO or SO:
+
+CASE A — User specifies an existing PO (e.g. "加进P00491"):
+1. Extract SKU + quantity from the file data
+2. Look up the PO with odoo_search to get order_id (ONE call)
+3. Call odoo_batch_add_order_lines with ALL lines at once
+
+CASE B — User wants a NEW PO (e.g. "帮我建个PO" / "create a new PO for these"):
+1. Extract SKU + quantity from the file data
+2. If vendor is not specified, ask which vendor (ONE question, do NOT list products)
+3. Create PO with odoo_create_record (partner_id = vendor ID)
+4. Call odoo_batch_add_order_lines with the new order_id
+
+CRITICAL — do NOT:
+  ❌ Call odoo_search_products_by_sku first (batch tool resolves SKUs itself)
+  ❌ Call odoo_get_product_vendors (not needed for adding lines)
+  ❌ Show a full product confirmation table and wait for "确认" (just execute)
+  ❌ Call odoo_add_order_line in a loop (use batch tool instead)
+If the file has price info, include price_unit in each line. If quantity is missing, use 1.
 
 🔒 HARD RULE FOR RELEASE/INVOICE INTENT 🔒
 When the user's latest message contains release intent — keywords like:
