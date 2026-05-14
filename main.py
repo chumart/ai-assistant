@@ -9931,6 +9931,12 @@ async def chat(req: ChatRequest, background_tasks: BackgroundTasks):
             continue
         allowed_tools.append(tool)
 
+    # ── Early Excel base64 storage (before any branching) ──
+    if req.file_name and req.file_name.lower().endswith((".xlsx", ".xls")) and _EXTRACT_FILE_LAST_EXCEL.get("_last"):
+        stored_xl = _EXTRACT_FILE_LAST_EXCEL["_last"]
+        _EXTRACT_FILE_LAST_EXCEL["_last"] = None
+        ODOO_BOT_LAST_EXCEL[verified_uid] = stored_xl
+        print(f"[CHAT] Stored Excel base64 for uid={verified_uid}: {stored_xl['filename']}")
     has_file = False
     cached_file = None
     if req.file_id and req.file_id in FILE_CACHE:
@@ -9954,15 +9960,6 @@ async def chat(req: ChatRequest, background_tasks: BackgroundTasks):
             f"=== ATTACHED FILE: {req.file_name} ===\n{req.file_content}\n=== END OF FILE ===\n\nUser question: {req.message}"
         )
         openai_image_content = None
-        # Store Excel base64 for batch PO if available
-        print(f"[CHAT-FILE] file_name='{req.file_name}', is_xlsx={req.file_name.lower().endswith(('.xlsx', '.xls'))}, has_last={_EXTRACT_FILE_LAST_EXCEL.get('_last') is not None}")
-        if req.file_name.lower().endswith(('.xlsx', '.xls')) and _EXTRACT_FILE_LAST_EXCEL.get("_last"):
-            stored = _EXTRACT_FILE_LAST_EXCEL["_last"]
-            _EXTRACT_FILE_LAST_EXCEL["_last"] = None
-            ODOO_BOT_LAST_EXCEL[verified_uid] = stored
-            print(f"[CHAT] Stored Excel base64 for uid={verified_uid}: {stored['filename']}")
-        elif req.file_name.lower().endswith(('.xlsx', '.xls')):
-            print(f"[CHAT-FILE] WARNING: xlsx detected but no base64 in _EXTRACT_FILE_LAST_EXCEL")
     else:
         user_message_content = req.message
         openai_image_content = None
@@ -12800,9 +12797,9 @@ async def odoo_bot_chat(req: OdooBotRequest):
         po_keywords = ["create po", "new po", "make po", "batch po",
                         "批量po", "批量采购"]
         # Smart regex: match Chinese PO creation intent (任何组合的 创建/生成/建/做/开/下 + 任意修饰词 + PO/采购/采购单)
-        po_create_regex = _re.search(r'(创建|生成|建|做|开|下|新建).{0,4}(po|采购单|采购)', msg_lower)
+        po_create_regex = re.search(r'(创建|生成|建|做|开|下|新建).{0,4}(po|采购单|采购)', msg_lower)
         # Match "加进/加到/添加到 P00xxx"
-        po_add_match = _re.search(r'(?:加进|加到|添加到|add\s*to)\s*p\d{3,}', msg_lower)
+        po_add_match = re.search(r'(?:加进|加到|添加到|add\s*to)\s*p\d{3,}', msg_lower)
         is_batch_po = any(kw in msg_lower for kw in po_keywords) or po_create_regex or po_add_match
 
         if is_batch_po and perms.get("can_write_odoo"):
@@ -12813,7 +12810,7 @@ async def odoo_bot_chat(req: OdooBotRequest):
                 cookies = await odoo_get_session()
 
                 # Determine if adding to existing PO or creating new
-                existing_po_match = _re.search(r'p\d{3,}', msg_lower)
+                existing_po_match = re.search(r'p\d{3,}', msg_lower)
                 order_id = None
                 po_name = None
                 if existing_po_match:
