@@ -9592,7 +9592,7 @@ async def extract_file(file: UploadFile = File(...)):
                 b64_data = base64.b64encode(content).decode('utf-8')
                 _EXTRACT_FILE_LAST_EXCEL["_last"] = {"base64": b64_data, "filename": file.filename}
                 print(f"EXTRACT-FILE: {file.filename} (xlsx) → {len(text)} chars, {len(all_text)} rows, base64={len(b64_data)} chars stored")
-                return {"text": text, "name": file.filename}
+                return {"text": text, "name": file.filename, "excel_base64": b64_data}
             except Exception as e:
                 print(f"EXTRACT-FILE xlsx error: {e}")
                 return {"text": f"[Excel parse error: {e}]", "name": file.filename}
@@ -9825,6 +9825,7 @@ class ChatRequest(BaseModel):
     session_title: str = ""
     session_token: str = ""   # Server-side session token for role verification
     user_timezone: str = ""   # e.g. "America/New_York" — from browser Intl API
+    excel_base64: str = ""    # Raw Excel file base64 — passed directly from frontend for batch PO
 
 def resolve_session(req: ChatRequest) -> dict:
     """Resolve uid/role from server-side session token.
@@ -9932,11 +9933,14 @@ async def chat(req: ChatRequest, background_tasks: BackgroundTasks):
         allowed_tools.append(tool)
 
     # ── Early Excel base64 storage (before any branching) ──
-    if req.file_name and req.file_name.lower().endswith((".xlsx", ".xls")) and _EXTRACT_FILE_LAST_EXCEL.get("_last"):
+    if req.excel_base64 and req.file_name:
+        ODOO_BOT_LAST_EXCEL[verified_uid] = {"base64": req.excel_base64, "filename": req.file_name}
+        print(f"[CHAT] Stored Excel base64 for uid={verified_uid}: {req.file_name} (from request)")
+    elif req.file_name and req.file_name.lower().endswith((".xlsx", ".xls")) and _EXTRACT_FILE_LAST_EXCEL.get("_last"):
         stored_xl = _EXTRACT_FILE_LAST_EXCEL["_last"]
         _EXTRACT_FILE_LAST_EXCEL["_last"] = None
         ODOO_BOT_LAST_EXCEL[verified_uid] = stored_xl
-        print(f"[CHAT] Stored Excel base64 for uid={verified_uid}: {stored_xl['filename']}")
+        print(f"[CHAT] Stored Excel base64 for uid={verified_uid}: {stored_xl['filename']} (from global)")
     has_file = False
     cached_file = None
     if req.file_id and req.file_id in FILE_CACHE:
