@@ -9589,7 +9589,7 @@ async def extract_file(file: UploadFile = File(...)):
                 wb.close()
                 text = "\n".join(all_text)
                 # Store base64 for batch PO tool (will be picked up by chat endpoint)
-                _EXTRACT_FILE_LAST_EXCEL[file.filename] = base64.b64encode(content).decode('utf-8')
+                _EXTRACT_FILE_LAST_EXCEL["_last"] = {"base64": base64.b64encode(content).decode('utf-8'), "filename": file.filename}
                 print(f"EXTRACT-FILE: {file.filename} (xlsx) → {len(text)} chars, {len(all_text)} rows")
                 return {"text": text, "name": file.filename}
             except Exception as e:
@@ -9954,9 +9954,10 @@ async def chat(req: ChatRequest, background_tasks: BackgroundTasks):
         )
         openai_image_content = None
         # Store Excel base64 for batch PO if available
-        if req.file_name.lower().endswith(('.xlsx', '.xls')) and req.file_name in _EXTRACT_FILE_LAST_EXCEL:
-            ODOO_BOT_LAST_EXCEL[verified_uid] = {"base64": _EXTRACT_FILE_LAST_EXCEL.pop(req.file_name), "filename": req.file_name}
-            print(f"[CHAT] Stored Excel base64 for uid={verified_uid}: {req.file_name}")
+        if req.file_name.lower().endswith(('.xlsx', '.xls')) and _EXTRACT_FILE_LAST_EXCEL.get("_last"):
+            stored = _EXTRACT_FILE_LAST_EXCEL.pop("_last")
+            ODOO_BOT_LAST_EXCEL[verified_uid] = stored
+            print(f"[CHAT] Stored Excel base64 for uid={verified_uid}: {stored['filename']}")
     else:
         user_message_content = req.message
         openai_image_content = None
@@ -11562,7 +11563,7 @@ class OdooBotRequest(BaseModel):
 # In-memory conversation history per Odoo user (last 10 turns)
 ODOO_BOT_HISTORY: dict = {}  # uid -> list of {role, content}
 ODOO_BOT_LAST_EXCEL: dict = {}  # uid -> {"base64": str, "filename": str} — last uploaded Excel for batch PO tool
-_EXTRACT_FILE_LAST_EXCEL: dict = {}  # filename -> base64 — temporary storage from /extract-file endpoint
+_EXTRACT_FILE_LAST_EXCEL: dict = {"_last": None}  # stores the most recent Excel upload {"base64": str, "filename": str}
 
 
 # Map tool name → friendly progress label (zh + en) shown in Discuss as "正在..."/"Working on..."
