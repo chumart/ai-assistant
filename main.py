@@ -9588,6 +9588,8 @@ async def extract_file(file: UploadFile = File(...)):
                             all_text.append("\t".join(cells))
                 wb.close()
                 text = "\n".join(all_text)
+                # Store base64 for batch PO tool (will be picked up by chat endpoint)
+                _EXTRACT_FILE_LAST_EXCEL[file.filename] = base64.b64encode(content).decode('utf-8')
                 print(f"EXTRACT-FILE: {file.filename} (xlsx) → {len(text)} chars, {len(all_text)} rows")
                 return {"text": text, "name": file.filename}
             except Exception as e:
@@ -9951,12 +9953,119 @@ async def chat(req: ChatRequest, background_tasks: BackgroundTasks):
             f"=== ATTACHED FILE: {req.file_name} ===\n{req.file_content}\n=== END OF FILE ===\n\nUser question: {req.message}"
         )
         openai_image_content = None
+        # Store Excel base64 for batch PO if available
+        if req.file_name.lower().endswith(('.xlsx', '.xls')) and req.file_name in _EXTRACT_FILE_LAST_EXCEL:
+            ODOO_BOT_LAST_EXCEL[verified_uid] = {"base64": _EXTRACT_FILE_LAST_EXCEL.pop(req.file_name), "filename": req.file_name}
+            print(f"[CHAT] Stored Excel base64 for uid={verified_uid}: {req.file_name}")
     else:
         user_message_content = req.message
         openai_image_content = None
 
     messages = rebuild_history_with_files(req.history) + [{"role": "user", "content": user_message_content}]
     headers = {"x-api-key": ANTHROPIC_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json"}
+
+    # ── BATCH PO FASTPATH for frontend/mobile ──
+    # Detect Excel + PO creation intent → bypass AI, call Odoo wizard directly
+    import re as _re
+    msg_lower = (req.message or "").lower().strip()
+    has_stored_excel_chat = verified_uid in ODOO_BOT_LAST_EXCEL
+    po_create_regex_chat = _re.search(r'(创建|生成|建|做|开|下|新建).{0,4}(po|采购单|采购)', msg_lower)
+    po_add_match_chat = _re.search(r'(?:加进|加到|添加到|add\s*to)\s*p\d{3,}', msg_lower)
+    po_kw_chat = any(kw in msg_lower for kw in ["create po", "new po", "make po", "batch po", "批量po"])
+    is_batch_po_chat = po_create_regex_chat or po_add_match_chat or po_kw_chat
+
+    if has_stored_excel_chat and is_batch_po_chat and perms.get("can_write_odoo"):
+        print(f"[FASTPATH-BATCH-PO-CHAT] Detected Excel + PO intent from uid={verified_uid}")
+        stored_excel = ODOO_BOT_LAST_EXCEL.get(verified_uid, {})
+
+        async def batch_po_stream():
+            try:
+                cookies = await odoo_get_session()
+                # Check for existing PO reference
+                existing_po_match = _re.search(r'p\d{3,}', msg_lower)
+                order_id = None
+                po_name = None
+                if existing_po_match and not po_create_regex_chat:
+                    po_ref = existing_po_match.group(0).upper()
+                    po_r = json.loads(await odoo_query("purchase.order",
+                        [["name", "=ilike", po_ref], ["company_id", "=", 1]],
+                        ["id", "name", "state"], limit=1))
+                    if isinstance(po_r, list) and po_r:
+                        order_id = po_r[0]["id"]
+                        po_name = po_r[0]["name"]
+
+                yield f"data: {json.dumps({'type': 'text', 'text': '➕ 正在通过 Odoo 批量工具处理...'})}\n\n"
+
+                # Create wizard
+                wiz_vals = {"input_mode": "file", "upload_file": stored_excel["base64"], "upload_filename": stored_excel["filename"]}
+                wiz_result = await _odoo_call("purchase.batch.po.wizard", "create", [[wiz_vals]], {}, cookies=cookies)
+                wiz_id = wiz_result if isinstance(wiz_result, int) else wiz_result[0] if isinstance(wiz_result, list) else None
+                if not wiz_id:
+                    yield f"data: {json.dumps({'type': 'text', 'text': f'⚠️ Wizard creation failed: {wiz_result}'})}\n\n"
+                    yield f"data: {json.dumps({'type': 'done'})}\n\n"
+                    return
+
+                # Preview
+                await _odoo_call("purchase.batch.po.wizard", "action_preview", [[wiz_id]], {}, cookies=cookies)
+                wiz_data = await _odoo_call("purchase.batch.po.wizard", "read",
+                    [[wiz_id]], {"fields": ["result_count", "not_found_count", "skus_not_found"]}, cookies=cookies)
+                if isinstance(wiz_data, list) and wiz_data:
+                    wiz_data = wiz_data[0]
+
+                result_count = wiz_data.get("result_count", 0)
+                not_found_count = wiz_data.get("not_found_count", 0)
+                skus_not_found = wiz_data.get("skus_not_found", "")
+
+                if result_count == 0:
+                    yield f"data: {json.dumps({'type': 'text', 'text': f'⚠️ No products matched. Not found: {skus_not_found}'})}\n\n"
+                    yield f"data: {json.dumps({'type': 'done'})}\n\n"
+                    return
+
+                if order_id:
+                    # Add to existing PO
+                    line_data = await _odoo_call("purchase.batch.po.line", "search_read",
+                        [[["wizard_id", "=", wiz_id]]],
+                        {"fields": ["product_id", "qty", "unit_price", "default_code"]}, cookies=cookies)
+                    successes = 0
+                    failures = []
+                    for pl in (line_data or []):
+                        pid = pl["product_id"][0] if isinstance(pl.get("product_id"), list) else pl.get("product_id")
+                        if not pid:
+                            continue
+                        vals = {"order_id": order_id, "product_id": pid, "product_qty": pl.get("qty", 1), "price_unit": pl.get("unit_price", 0)}
+                        r = await odoo_create("purchase.order.line", vals, cookies=cookies)
+                        if r.get("error"):
+                            failures.append(pl.get("default_code", "?"))
+                        else:
+                            successes += 1
+                    reply = f"✅ **{po_name} — Added {successes}/{result_count} lines**"
+                    if not_found_count:
+                        reply += f"\n⚠️ SKUs not found: {skus_not_found}"
+                    if failures:
+                        reply += f"\n❌ Failed: {', '.join(failures[:10])}"
+                else:
+                    # Create new POs
+                    await _odoo_call("purchase.batch.po.wizard", "action_create_pos", [[wiz_id]], {}, cookies=cookies)
+                    wiz_final = await _odoo_call("purchase.batch.po.wizard", "read",
+                        [[wiz_id]], {"fields": ["created_po_names"]}, cookies=cookies)
+                    if isinstance(wiz_final, list) and wiz_final:
+                        wiz_final = wiz_final[0]
+                    reply = f"✅ **{wiz_final.get('created_po_names', 'POs created')}**"
+                    if not_found_count:
+                        reply += f"\n⚠️ SKUs not found: {skus_not_found}"
+
+                ODOO_BOT_LAST_EXCEL.pop(verified_uid, None)
+                yield f"data: {json.dumps({'type': 'text', 'text': reply})}\n\n"
+                yield f"data: {json.dumps({'type': 'done'})}\n\n"
+                print(f"[FASTPATH-BATCH-PO-CHAT] Done: {reply[:100]}")
+
+            except Exception as e:
+                import traceback; traceback.print_exc()
+                yield f"data: {json.dumps({'type': 'text', 'text': f'⚠️ Error: {str(e)[:200]}'})}\n\n"
+                yield f"data: {json.dumps({'type': 'done'})}\n\n"
+
+        return StreamingResponse(batch_po_stream(), media_type="text/event-stream")
+
     memories = []
     if verified_uid:
         memories = await db_get_memory(verified_uid)
@@ -11453,6 +11562,7 @@ class OdooBotRequest(BaseModel):
 # In-memory conversation history per Odoo user (last 10 turns)
 ODOO_BOT_HISTORY: dict = {}  # uid -> list of {role, content}
 ODOO_BOT_LAST_EXCEL: dict = {}  # uid -> {"base64": str, "filename": str} — last uploaded Excel for batch PO tool
+_EXTRACT_FILE_LAST_EXCEL: dict = {}  # filename -> base64 — temporary storage from /extract-file endpoint
 
 
 # Map tool name → friendly progress label (zh + en) shown in Discuss as "正在..."/"Working on..."
@@ -12668,13 +12778,13 @@ async def odoo_bot_chat(req: OdooBotRequest):
     has_stored_excel = uid in ODOO_BOT_LAST_EXCEL
     if (has_attachments or has_stored_excel) and has_stored_excel:
         msg_lower = (req.message or "").lower().strip()
-        po_keywords = ["创建po", "创建个po", "生成po", "生成个po", "建个po", "建一个po", "create po",
-                        "创建采购", "生成采购", "加进p0", "加进p00", "加到p0", "加到p00",
-                        "添加到p0", "添加到p00", "batch po", "批量po", "批量采购"]
-        # Also match "加进P00xxx" pattern
-        import re as _re
-        po_add_match = _re.search(r'(?:加进|加到|添加到|add to)\s*p\d{3,}', msg_lower)
-        is_batch_po = any(kw in msg_lower for kw in po_keywords) or po_add_match
+        po_keywords = ["create po", "new po", "make po", "batch po",
+                        "批量po", "批量采购"]
+        # Smart regex: match Chinese PO creation intent (任何组合的 创建/生成/建/做/开/下 + 任意修饰词 + PO/采购/采购单)
+        po_create_regex = _re.search(r'(创建|生成|建|做|开|下|新建).{0,4}(po|采购单|采购)', msg_lower)
+        # Match "加进/加到/添加到 P00xxx"
+        po_add_match = _re.search(r'(?:加进|加到|添加到|add\s*to)\s*p\d{3,}', msg_lower)
+        is_batch_po = any(kw in msg_lower for kw in po_keywords) or po_create_regex or po_add_match
 
         if is_batch_po and perms.get("can_write_odoo"):
             print(f"[FASTPATH-BATCH-PO] Detected Excel + PO intent from uid={uid}")
