@@ -5048,7 +5048,63 @@ async def run_tool(name, inp, context=None):
 
         print(f"[BATCH-ADD] Resolved {len(sku_to_product)}/{len(unique_skus)} SKUs")
 
-        # Step 2: Create order lines
+        # Step 2: Fetch vendor prices from product.supplierinfo
+        # When no price_unit is provided, Odoo's API create may not use the correct vendor price.
+        # We explicitly look up supplierinfo prices for the vendor on this PO.
+        vendor_prices = {}  # product_id -> price
+        try:
+            # Get the vendor (partner_id) from the PO/SO
+            order_model = "purchase.order" if order_type == "purchase" else "sale.order"
+            order_r = json.loads(await odoo_query(order_model,
+                [["id", "=", order_id]], ["partner_id"], limit=1))
+            vendor_id = None
+            if isinstance(order_r, list) and order_r:
+                pid = order_r[0].get("partner_id")
+                vendor_id = pid[0] if isinstance(pid, list) else pid
+
+            if vendor_id and order_type == "purchase":
+                all_product_ids = [p["id"] for p in sku_to_product.values()]
+                # Get product_tmpl_id for each product
+                if all_product_ids:
+                    tmpl_map = {}  # product_id -> product_tmpl_id
+                    for batch_start in range(0, len(all_product_ids), 200):
+                        batch_pids = all_product_ids[batch_start:batch_start+200]
+                        prod_r = json.loads(await odoo_query("product.product",
+                            [["id", "in", batch_pids]],
+                            ["id", "product_tmpl_id"], limit=500))
+                        if isinstance(prod_r, list):
+                            for p in prod_r:
+                                tmpl = p.get("product_tmpl_id")
+                                tmpl_id = tmpl[0] if isinstance(tmpl, list) else tmpl
+                                if tmpl_id:
+                                    tmpl_map[p["id"]] = tmpl_id
+
+                    # Query supplierinfo for this vendor
+                    all_tmpl_ids = list(set(tmpl_map.values()))
+                    if all_tmpl_ids:
+                        for batch_start in range(0, len(all_tmpl_ids), 200):
+                            batch_tmpl = all_tmpl_ids[batch_start:batch_start+200]
+                            si_r = json.loads(await odoo_query("product.supplierinfo",
+                                [["partner_id", "=", vendor_id], ["product_tmpl_id", "in", batch_tmpl]],
+                                ["product_tmpl_id", "price", "min_qty"],
+                                limit=1000, order="min_qty asc"))
+                            if isinstance(si_r, list):
+                                # Build tmpl_id -> price (use the first/lowest min_qty entry)
+                                tmpl_prices = {}
+                                for si in si_r:
+                                    tid = si["product_tmpl_id"][0] if isinstance(si.get("product_tmpl_id"), list) else si.get("product_tmpl_id")
+                                    if tid and tid not in tmpl_prices:
+                                        tmpl_prices[tid] = si.get("price", 0)
+                                # Map back to product_id
+                                for pid, tid in tmpl_map.items():
+                                    if tid in tmpl_prices:
+                                        vendor_prices[pid] = tmpl_prices[tid]
+
+                print(f"[BATCH-ADD] Fetched {len(vendor_prices)} vendor prices from supplierinfo")
+        except Exception as e:
+            print(f"[BATCH-ADD] Vendor price lookup failed (non-fatal): {e}")
+
+        # Step 3: Create order lines
         successes = []
         failures = []
         for line in lines:
@@ -5070,8 +5126,11 @@ async def run_tool(name, inp, context=None):
                 "product_id": product["id"],
                 qty_field: qty,
             }
+            # Price priority: Excel price > vendor supplierinfo price > let Odoo default
             if price:
                 vals["price_unit"] = price
+            elif product["id"] in vendor_prices:
+                vals["price_unit"] = vendor_prices[product["id"]]
 
             try:
                 result = await odoo_create(line_model, vals)
