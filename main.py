@@ -10001,7 +10001,8 @@ async def chat(req: ChatRequest, background_tasks: BackgroundTasks):
                     data = None
 
                 if data and "error" in data:
-                    yield f"data: {json.dumps({'type': 'text', 'text': f'⚠️ Error: {data[\"error\"]}'})}\n\n"
+                    err_msg = data["error"]
+                    yield f"data: {json.dumps({'type': 'text', 'text': f'⚠️ Error: {err_msg}'})}\n\n"
                     yield f"data: {json.dumps({'type': 'done'})}\n\n"
                     return
 
