@@ -9977,10 +9977,78 @@ async def chat(req: ChatRequest, background_tasks: BackgroundTasks):
     messages = rebuild_history_with_files(req.history) + [{"role": "user", "content": user_message_content}]
     headers = {"x-api-key": ANTHROPIC_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json"}
 
-    # ── BATCH PO FASTPATH for frontend/mobile ──
-    # Detect Excel + PO creation intent → bypass AI, call Odoo wizard directly
+    # ── FINANCE REPORT FASTPATH for frontend/mobile ──
     import re as _re
     msg_lower = (req.message or "").lower().strip()
+    finance_fp_chat = _detect_finance_fastpath(msg_lower)
+    if finance_fp_chat and perms.get("can_see_finance"):
+        fp_type = finance_fp_chat["type"]
+        fp_year = finance_fp_chat["year"]
+        fp_month = finance_fp_chat["month"]
+        fp_quarter = finance_fp_chat.get("quarter")
+        fp_salesperson = finance_fp_chat.get("salesperson")
+        print(f"[FASTPATH-FINANCE-CHAT] {fp_type} year={fp_year} month={fp_month} quarter={fp_quarter}")
+
+        async def finance_stream():
+            try:
+                if fp_type == "monthly_tax":
+                    data = await monthly_tax(fp_year, fp_month)
+                elif fp_type == "quarterly_tax":
+                    data = await quarterly_tax(fp_year, fp_quarter)
+                elif fp_type == "commission":
+                    data = await monthly_sales(fp_year, fp_month)
+                else:
+                    data = None
+
+                if data and "error" in data:
+                    yield f"data: {json.dumps({'type': 'text', 'text': f'⚠️ Error: {data[\"error\"]}'})}\n\n"
+                    yield f"data: {json.dumps({'type': 'done'})}\n\n"
+                    return
+
+                if fp_type == "monthly_tax" and data:
+                    inv = data["invoices"]; crd = data["credit_notes"]; net = data["net"]
+                    reply = (
+                        f"📊 **{fp_year}年{fp_month}月 Sales Tax Report**\n\n"
+                        f"**Invoices:** {inv['count']} 笔\n"
+                        f"  Untaxed: ${inv['total_untaxed']:,.2f} | Tax: ${inv['total_tax']:,.2f} | Total: ${inv['total_amount']:,.2f}\n\n"
+                        f"**Credit Notes:** {crd['count']} 笔\n"
+                        f"  Untaxed: ${crd['total_untaxed']:,.2f} | Tax: ${crd['total_tax']:,.2f} | Total: ${crd['total_amount']:,.2f}\n\n"
+                        f"**Net:** Untaxed: ${net['total_untaxed']:,.2f} | **Tax: ${net['total_tax']:,.2f}** | Total: ${net['total_amount']:,.2f}"
+                    )
+                elif fp_type == "quarterly_tax" and data:
+                    net = data["net"]; monthly = data.get("monthly_breakdown", [])
+                    reply = f"📊 **{data['period']} Sales Tax Report**\n\n"
+                    for m in monthly:
+                        reply += f"  {m['month']}: Tax ${m['net_tax']:,.2f} ({m['invoice_count']} inv, {m['credit_note_count']} cn)\n"
+                    reply += f"\n**Quarter Total:** Untaxed: ${net['total_untaxed']:,.2f} | **Tax: ${net['total_tax']:,.2f}** | Total: ${net['total_amount']:,.2f}"
+                elif fp_type == "commission" and data:
+                    cb = data.get("commission_base", {}); net_by = data.get("net_by_salesperson", [])
+                    reply = f"📊 **{fp_year}年{fp_month}月 Sales Commission Report**\n\n"
+                    if fp_salesperson:
+                        matched = [p for p in net_by if fp_salesperson.lower() in p.get("salesperson", "").lower()]
+                        for p in matched:
+                            reply += f"**{p['salesperson']}:** Invoices: {p['invoice_count']} (${p['invoice_amount']:,.2f}) | CN: {p['credit_note_count']} (${p['credit_amount']:,.2f}) | **Net: ${p['net_amount_untaxed']:,.2f}**\n"
+                        if not matched:
+                            reply += f"未找到 {fp_salesperson} 的数据\n"
+                    else:
+                        for p in net_by:
+                            reply += f"  {p['salesperson']}: ${p['net_amount_untaxed']:,.2f} ({p['invoice_count']} inv, {p['credit_note_count']} cn)\n"
+                        reply += f"\n**合计:** Untaxed: ${cb.get('total_untaxed', 0):,.2f} | Tax: ${cb.get('total_tax', 0):,.2f} | Total: ${cb.get('total_amount', 0):,.2f}"
+                else:
+                    reply = "⚠️ 无法生成报告"
+
+                yield f"data: {json.dumps({'type': 'text', 'text': reply})}\n\n"
+                yield f"data: {json.dumps({'type': 'done'})}\n\n"
+                print(f"[FASTPATH-FINANCE-CHAT] Done")
+            except Exception as e:
+                import traceback; traceback.print_exc()
+                yield f"data: {json.dumps({'type': 'text', 'text': f'⚠️ Error: {str(e)[:200]}'})}\n\n"
+                yield f"data: {json.dumps({'type': 'done'})}\n\n"
+
+        return StreamingResponse(finance_stream(), media_type="text/event-stream")
+
+    # ── BATCH PO FASTPATH for frontend/mobile ──
+    # Detect Excel + PO creation intent → bypass AI, call Odoo wizard directly
     has_stored_excel_chat = verified_uid in ODOO_BOT_LAST_EXCEL
     po_create_regex_chat = _re.search(r'(创建|生成|建|做|开|下|新建).{0,4}(po|采购单|采购)', msg_lower)
     po_add_match_chat = _re.search(r'(?:加进|加到|添加到|增加到|导入到|add\s*to)\s*po?0*\d{2,}', msg_lower)
@@ -11668,6 +11736,109 @@ TOOL_PROGRESS_LABELS_EN = {
 }
 
 
+def _detect_finance_fastpath(msg: str) -> dict | None:
+    """Detect tax/commission report intent and extract year/month.
+    Returns dict with type, year, month (and optionally quarter, salesperson) or None.
+    """
+    import re, datetime
+    from zoneinfo import ZoneInfo
+    msg_l = msg.lower().strip()
+    now = datetime.datetime.now(ZoneInfo("America/Los_Angeles"))
+
+    # ── Detect report type ──
+    is_tax = bool(re.search(r'sales?\s*tax|月度税|月税|税报|tax\s*report|算.*税|的税|查.*税|报税', msg_l))
+    is_quarterly_tax = bool(re.search(r'季度税|quarterly.*tax|q[1-4].*tax|tax.*q[1-4]', msg_l))
+    is_commission = bool(re.search(r'commission|提成|佣金|销售提成|销售报|sales\s*report', msg_l))
+
+    if not is_tax and not is_quarterly_tax and not is_commission:
+        return None
+
+    # ── Extract salesperson for commission ──
+    salesperson = None
+    if is_commission:
+        # "Gene的4月commission", "Alex的提成", "查下Jesse的commission"
+        sp_match = re.search(r'(\w+?)(?:的|\'s)\s*(?:\d|commission|提成|佣金)', msg_l)
+        if sp_match:
+            name = sp_match.group(1)
+            if name not in ('这个月', '上个月', '本月', '查下', '帮我', '算下', '看下', '查看'):
+                salesperson = name
+
+    # ── Extract quarter ──
+    if is_quarterly_tax:
+        q_match = re.search(r'q(\d)', msg_l)
+        quarter = int(q_match.group(1)) if q_match else None
+        # Extract year
+        y_match = re.search(r'(20\d{2})', msg_l)
+        year = int(y_match.group(1)) if y_match else now.year
+        if quarter and 1 <= quarter <= 4:
+            return {"type": "quarterly_tax", "year": year, "quarter": quarter, "month": None}
+        return None
+
+    # ── Extract year and month ──
+    year = None
+    month = None
+
+    # Chinese month numbers: 一月..十二月 / 1月..12月
+    cn_month_map = {'一': 1, '二': 2, '三': 3, '四': 4, '五': 5, '六': 6,
+                    '七': 7, '八': 8, '九': 9, '十': 10, '十一': 11, '十二': 12}
+
+    # Pattern: "2026年4月" / "2026四月" / "2026-04"
+    ym_match = re.search(r'(20\d{2})\s*[年\-/]?\s*(\d{1,2})\s*月?', msg_l)
+    if ym_match:
+        year = int(ym_match.group(1))
+        month = int(ym_match.group(2))
+    else:
+        # Pattern: "2026年四月" (Chinese month name)
+        for cn, m in sorted(cn_month_map.items(), key=lambda x: -len(x[0])):
+            ym_cn = re.search(rf'(20\d{{2}})\s*年?\s*{cn}\s*月', msg_l)
+            if ym_cn:
+                year = int(ym_cn.group(1))
+                month = m
+                break
+
+    if not month:
+        # Pattern: "4月" / "四月" (no year → current year)
+        m_match = re.search(r'(\d{1,2})\s*月', msg_l)
+        if m_match:
+            month = int(m_match.group(1))
+        else:
+            for cn, m in sorted(cn_month_map.items(), key=lambda x: -len(x[0])):
+                if f'{cn}月' in msg_l:
+                    month = m
+                    break
+
+    if not month:
+        # "上个月" / "last month"
+        if '上个月' in msg_l or '上月' in msg_l or 'last month' in msg_l:
+            prev = now.replace(day=1) - datetime.timedelta(days=1)
+            year = prev.year
+            month = prev.month
+        # "这个月" / "本月" / "this month"
+        elif '这个月' in msg_l or '本月' in msg_l or 'this month' in msg_l:
+            year = now.year
+            month = now.month
+        # English month names
+        else:
+            en_months = {'jan': 1, 'feb': 2, 'mar': 3, 'apr': 4, 'may': 5, 'jun': 6,
+                         'jul': 7, 'aug': 8, 'sep': 9, 'oct': 10, 'nov': 11, 'dec': 12}
+            for name, m in en_months.items():
+                if name in msg_l:
+                    month = m
+                    break
+
+    if not month:
+        return None  # Can't determine month, let AI handle it
+
+    if not year:
+        year = now.year
+
+    if month < 1 or month > 12:
+        return None
+
+    report_type = "commission" if is_commission else "monthly_tax"
+    return {"type": report_type, "year": year, "month": month, "salesperson": salesperson}
+
+
 def _is_release_intent(text: str) -> bool:
     """Detect if user message is asking to release an order / create an invoice /
     print an invoice / register payment. Used to short-circuit at the endpoint
@@ -12804,6 +12975,100 @@ async def odoo_bot_chat(req: OdooBotRequest):
     # ── BATCH PO FASTPATH: Excel + PO creation intent → direct wizard call ──
     # Triggers when: (A) Excel uploaded in THIS message, or (B) Excel uploaded in a PREVIOUS message
     has_stored_excel = uid in ODOO_BOT_LAST_EXCEL
+
+    # ── FINANCE REPORT FASTPATH: tax / commission → direct code call, zero AI ──
+    msg_lower = (req.message or "").lower().strip()
+    finance_fp = _detect_finance_fastpath(msg_lower)
+    if finance_fp and perms.get("can_see_finance"):
+        fp_type = finance_fp["type"]
+        fp_year = finance_fp["year"]
+        fp_month = finance_fp["month"]
+        fp_quarter = finance_fp.get("quarter")
+        fp_salesperson = finance_fp.get("salesperson")
+        print(f"[FASTPATH-FINANCE] {fp_type} year={fp_year} month={fp_month} quarter={fp_quarter} salesperson={fp_salesperson}")
+
+        try:
+            if fp_type == "monthly_tax":
+                data = await monthly_tax(fp_year, fp_month)
+            elif fp_type == "quarterly_tax":
+                data = await quarterly_tax(fp_year, fp_quarter)
+            elif fp_type == "commission":
+                data = await monthly_sales(fp_year, fp_month)
+            else:
+                data = None
+
+            if data and "error" in data:
+                return {"reply": f"⚠️ Error: {data['error']}"}
+
+            if fp_type == "monthly_tax" and data:
+                inv = data["invoices"]
+                crd = data["credit_notes"]
+                net = data["net"]
+                reply = (
+                    f"📊 **{fp_year}年{fp_month}月 Sales Tax Report**\n\n"
+                    f"**Invoices:** {inv['count']} 笔\n"
+                    f"  Untaxed: ${inv['total_untaxed']:,.2f}\n"
+                    f"  Tax: ${inv['total_tax']:,.2f}\n"
+                    f"  Total: ${inv['total_amount']:,.2f}\n\n"
+                    f"**Credit Notes:** {crd['count']} 笔\n"
+                    f"  Untaxed: ${crd['total_untaxed']:,.2f}\n"
+                    f"  Tax: ${crd['total_tax']:,.2f}\n"
+                    f"  Total: ${crd['total_amount']:,.2f}\n\n"
+                    f"**Net (Invoice - Credit):**\n"
+                    f"  Untaxed: ${net['total_untaxed']:,.2f}\n"
+                    f"  **Tax: ${net['total_tax']:,.2f}**\n"
+                    f"  Total: ${net['total_amount']:,.2f}"
+                )
+
+            elif fp_type == "quarterly_tax" and data:
+                net = data["net"]
+                monthly = data.get("monthly_breakdown", [])
+                reply = f"📊 **{data['period']} Sales Tax Report**\n({data['date_range']})\n\n"
+                for m in monthly:
+                    reply += f"  {m['month']}: Tax ${m['net_tax']:,.2f} ({m['invoice_count']} inv, {m['credit_note_count']} cn)\n"
+                reply += (
+                    f"\n**Quarter Total:**\n"
+                    f"  Untaxed: ${net['total_untaxed']:,.2f}\n"
+                    f"  **Tax: ${net['total_tax']:,.2f}**\n"
+                    f"  Total: ${net['total_amount']:,.2f}"
+                )
+
+            elif fp_type == "commission" and data:
+                cb = data.get("commission_base", {})
+                net_by = data.get("net_by_salesperson", [])
+                reply = f"📊 **{fp_year}年{fp_month}月 Sales Commission Report**\n\n"
+
+                if fp_salesperson:
+                    # Filter to specific salesperson
+                    matched = [p for p in net_by if fp_salesperson.lower() in p.get("salesperson", "").lower()]
+                    if matched:
+                        for p in matched:
+                            reply += (
+                                f"**{p['salesperson']}:**\n"
+                                f"  Invoices: {p['invoice_count']} 笔, ${p['invoice_amount']:,.2f}\n"
+                                f"  Credit Notes: {p['credit_note_count']} 笔, ${p['credit_amount']:,.2f}\n"
+                                f"  **Net: ${p['net_amount_untaxed']:,.2f}**\n\n"
+                            )
+                    else:
+                        reply += f"未找到 {fp_salesperson} 的数据\n"
+                else:
+                    for p in net_by:
+                        reply += f"  {p['salesperson']}: ${p['net_amount_untaxed']:,.2f} ({p['invoice_count']} inv, {p['credit_note_count']} cn)\n"
+                    reply += (
+                        f"\n**合计:**\n"
+                        f"  Untaxed: ${cb.get('total_untaxed', 0):,.2f}\n"
+                        f"  Tax: ${cb.get('total_tax', 0):,.2f}\n"
+                        f"  Total: ${cb.get('total_amount', 0):,.2f}"
+                    )
+            else:
+                reply = f"⚠️ 无法生成报告"
+
+            print(f"[FASTPATH-FINANCE] Done: {reply[:80]}...")
+            return {"reply": reply}
+        except Exception as e:
+            import traceback; traceback.print_exc()
+            return {"reply": f"⚠️ Report error: {str(e)[:200]}"}
+
     if (has_attachments or has_stored_excel) and has_stored_excel:
         msg_lower = (req.message or "").lower().strip()
         po_keywords = ["create po", "new po", "make po", "batch po",
