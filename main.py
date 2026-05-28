@@ -2902,12 +2902,12 @@ TOOLS = [
     },
     {
         "name": "odoo_register_payment",
-        "description": "Register payment on an invoice (marks it as paid). Call AFTER odoo_create_invoice_from_so. Requires the invoice_id returned from that tool. Journal mapping: Cash → 'Cash' journal (ID=7), Amazon → 'Amazon PLAT BUS CHECKING' (ID=45), Shopify (#CMT) → 'Shopify Test' (ID=62), Stripe → 'Stripe Test' (ID=61), Square → 'Square Test' (ID=60), everything else (Zelle/check/ACH) → 'Revenue and COGS' (ID=43). Stripe invoices may already be auto-registered — check payment_state first.",
+        "description": "Register payment on an invoice (marks it as paid). Call AFTER odoo_create_invoice_from_so. Requires the invoice_id returned from that tool. Journal mapping: Cash → 'Cash' journal (ID=7), Amazon → 'Amazon Test' (ID=63), Shopify (#CMT) → 'Shopify Test' (ID=62), Stripe → 'Stripe Test' (ID=61), Square → 'Square Test' (ID=60), everything else (Zelle/check/ACH) → 'Revenue and COGS' (ID=43). Stripe invoices may already be auto-registered — check payment_state first.",
         "input_schema": {
             "type": "object",
             "properties": {
                 "invoice_id": {"type": "integer", "description": "The account.move ID of the invoice to register payment on"},
-                "journal_name": {"type": "string", "description": "Journal name: 'Cash', 'Revenue and COGS', 'Shopify Test', 'Stripe Test', 'Square Test', or 'Amazon PLAT BUS CHECKING'"},
+                "journal_name": {"type": "string", "description": "Journal name: 'Cash', 'Revenue and COGS', 'Shopify Test', 'Stripe Test', 'Square Test', or 'Amazon Test'"},
                 "amount": {"type": "number", "description": "Payment amount. Usually the invoice total. Optional — if omitted, pays the full invoice amount."},
                 "payment_date": {"type": "string", "description": "Payment date YYYY-MM-DD. Optional — defaults to today."}
             },
@@ -3310,6 +3310,10 @@ Bank accounts (account.journal) we use:
 3. **Amazon PLAT BUS CHECKING**
    - Inbound only: Amazon marketplace payouts (~biweekly)
    - 只用于接收 Amazon 打进的货款,大约2周1次
+
+3b. **Amazon Test Journal** — Amazon order payments dedicated journal (ID=63)
+   - Inbound only: Amazon (AMZ) order payments
+   - release AMZ 订单时 register_payment 必须用这个 journal
 
 4. **Shopify Test Journal** — Shopify payments dedicated journal
    - Inbound only: Shopify (#CMT) order payments
@@ -4212,7 +4216,7 @@ SHOPIFY (#CMT) and AMAZON (AMZ) — SEPARATE WORKFLOW (4 steps, fully automated)
   Run all 4 steps in sequence WITHOUT asking the user between steps:
   1. odoo_create_invoice_from_so(so_name="CMT12345", payment_method="Shopify Payment")
      - For #CMT: payment_method="Shopify Payment", journal="Shopify Test"
-     - For AMZ: payment_method="Amazon Payment", journal="Amazon PLAT BUS CHECKING"
+     - For AMZ: payment_method="Amazon Payment", journal="Amazon Test"
   2. odoo_register_payment(invoice_id=XXX, journal_name=...)
   3. odoo_export_invoice_pdf(invoice_id=XXX)
   4. print_invoice(invoice_id=XXX)  ← physically prints via PrintNode
@@ -4220,7 +4224,7 @@ SHOPIFY (#CMT) and AMAZON (AMZ) — SEPARATE WORKFLOW (4 steps, fully automated)
 
 JOURNAL MAPPING (payment channel → journal):
   - Shopify (#CMT orders) → "Shopify Test" (ID=62)
-  - Amazon (AMZ orders)   → "Amazon PLAT BUS CHECKING" (ID=45)
+  - Amazon (AMZ orders)   → "Amazon Test" (ID=63)
   - Stripe                → "Stripe Test" (ID=61)
   - Square                → "Square Test" (ID=60)
   - Cash                  → "Cash" (ID=7)
@@ -8121,13 +8125,14 @@ async def run_tool(name, inp, context=None):
         if not invoice_id:
             return json.dumps({"error": "invoice_id is required"})
         if not journal_name:
-            return json.dumps({"error": "journal_name is required (Cash, Revenue and COGS, Shopify Test, Stripe Test, Square Test, or Amazon PLAT BUS CHECKING)"})
+            return json.dumps({"error": "journal_name is required (Cash, Revenue and COGS, Shopify Test, Stripe Test, Square Test, or Amazon Test)"})
 
         # Journal ID mapping — use ID directly, never rely on name matching
         JOURNAL_ID_MAP = {
             "cash": 7,
             "revenue and cogs": 43,
             "amazon plat bus checking": 45,
+            "amazon test": 63,
             "square test": 60,
             "stripe test": 61,
             "shopify test": 62,
@@ -8138,7 +8143,7 @@ async def run_tool(name, inp, context=None):
             "stripe test journal": 61,
             "square": 60,
             "square test journal": 60,
-            "amazon": 45,
+            "amazon": 63,
         }
 
         journal_id = JOURNAL_ID_MAP.get(journal_name.lower())
@@ -8171,7 +8176,7 @@ async def run_tool(name, inp, context=None):
                     [["name", "ilike", journal_name], ["company_id", "=", 1]],
                     ["id", "name", "type"], limit=5, cookies=cookies))
                 if not isinstance(journal_r, list) or not journal_r:
-                    return json.dumps({"error": f"Journal '{journal_name}' not found. Available: Cash(7), Revenue and COGS(43), Amazon PLAT BUS CHECKING(45), Square Test(60), Stripe Test(61), Shopify Test(62)"})
+                    return json.dumps({"error": f"Journal '{journal_name}' not found. Available: Cash(7), Revenue and COGS(43), Amazon Test(63), Square Test(60), Stripe Test(61), Shopify Test(62)"})
                 exact = [j for j in journal_r if j["name"].lower() == journal_name.lower()]
                 journal = exact[0] if exact else journal_r[0]
                 journal_id = journal["id"]
@@ -12267,7 +12272,7 @@ async def _marketplace_release_fastpath(
     # 根据 marketplace 决定 payment_method label 和 journal
     if mtype == "AMZ":
         payment_method = "Amazon Payment"
-        journal_name = "Amazon PLAT BUS CHECKING"
+        journal_name = "Amazon Test"
     else:  # CMT
         payment_method = "Shopify Payment"
         journal_name = "Shopify Test"
