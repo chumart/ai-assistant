@@ -10132,6 +10132,7 @@ async def chat(req: ChatRequest, background_tasks: BackgroundTasks):
         
         async with httpx.AsyncClient(timeout=300) as c:
             current_messages = list(messages)
+            tools_called_chat = []
             for iteration in range(8):
                 payload = {
                     "model": selected_model,
@@ -10156,6 +10157,7 @@ async def chat(req: ChatRequest, background_tasks: BackgroundTasks):
                     tool_results = []
                     for block in d.get("content", []):
                         if block.get("type") == "tool_use":
+                            tools_called_chat.append(block["name"])
                             result = await run_tool(block["name"], block.get("input", {}), context=tool_context)
                             tool_results.append({"type":"tool_result","tool_use_id":block["id"],"content":result})
                     current_messages.append({"role": "assistant", "content": d["content"]})
@@ -10163,6 +10165,10 @@ async def chat(req: ChatRequest, background_tasks: BackgroundTasks):
                 else:
                     break
             reply = "".join(b.get("text","") for b in d.get("content",[]) if b.get("type")=="text")
+            # ── v20 幻觉拦截 ──
+            halluc = _detect_creation_hallucination(reply, tools_called_chat)
+            if halluc:
+                reply = halluc
 
     reply = reply or "Sorry, no response generated."
 
@@ -10532,6 +10538,7 @@ async def chat_stream(req: ChatRequest, background_tasks: BackgroundTasks):
     async def claude_stream():
         current_messages = list(messages)
         full_reply_text = ""
+        tools_called_stream = []
         try:
             for iteration in range(8):
                 payload = {
@@ -10645,6 +10652,7 @@ async def chat_stream(req: ChatRequest, background_tasks: BackgroundTasks):
                     tool_results = []
                     for block in content_blocks:
                         if block.get("type") == "tool_use":
+                            tools_called_stream.append(block["name"])
                             result = await run_tool(block["name"], block.get("input", {}), context=tool_context)
                             yield f"data: {json.dumps({'type': 'tool_result', 'name': block['name']})}\n\n"
                             tool_results.append({
@@ -10659,6 +10667,13 @@ async def chat_stream(req: ChatRequest, background_tasks: BackgroundTasks):
                 else:
                     # Natural stop — we're done
                     break
+
+            # ── v20 幻觉拦截 (流式): 已推送文本无法撤回，追加醒目警告 ──
+            halluc = _detect_creation_hallucination(full_reply_text, tools_called_stream)
+            if halluc:
+                warning = "\n\n" + halluc
+                full_reply_text += warning
+                yield f"data: {json.dumps({'type': 'text', 'delta': warning})}\n\n"
 
             # Persist session
             if req.session_id and req.user_id:
@@ -12030,6 +12045,113 @@ def _is_live_data_query(text: str) -> bool:
     return False
 
 
+def _detect_creation_hallucination(reply: str, tools_called: list) -> str | None:
+    """幻觉拦截: AI 回复声称创建了记录, 但本会话实际没调过对应的创建工具。
+    返回警告字符串 (替换原 reply) 或 None (没问题)。
+
+    tools_called: 本次请求中实际调用过的工具名列表。
+    """
+    if not reply:
+        return None
+    r = reply.lower()
+
+    # 创建类工具
+    CREATE_TOOLS = {
+        "odoo_create_record", "odoo_create_bulk_po", "odoo_batch_add_order_lines",
+        "odoo_create_invoice_from_so", "release_so", "odoo_add_order_line",
+    }
+    called = set(tools_called or [])
+
+    # PO 创建声明
+    po_claim_patterns = [
+        "po 创建成功", "po创建成功", "采购单创建成功", "采购订单创建成功",
+        "已创建 po", "已创建po", "已生成 po", "已生成po", "已创建采购",
+        "created po p0", "po created", "purchase order created", "created purchase order",
+    ]
+    claims_po = any(p in r for p in po_claim_patterns)
+    if claims_po and not (called & {"odoo_create_record", "odoo_create_bulk_po", "odoo_batch_add_order_lines"}):
+        print(f"[HALLUCINATION-BLOCK] PO creation claimed without tool call. reply={reply[:120]}")
+        return ("⚠️ 系统拦截：检测到回复声称创建了采购单，但实际没有调用创建工具。\n"
+                "为防止误导，这条回复已被拦截。请重新发送创建指令，或检查 Odoo 确认实际状态。")
+
+    # 发票创建声明
+    inv_claim_patterns = [
+        "invoice 创建成功", "发票创建成功", "已创建发票", "已开票",
+        "created invoice inv/", "invoice created", "release complete",
+    ]
+    claims_inv = any(p in r for p in inv_claim_patterns)
+    if claims_inv and not (called & {"odoo_create_invoice_from_so", "release_so"}):
+        print(f"[HALLUCINATION-BLOCK] Invoice creation claimed without tool call. reply={reply[:120]}")
+        return ("⚠️ 系统拦截：检测到回复声称创建了发票/完成了 release，但实际没有调用相应工具。\n"
+                "为防止误导，这条回复已被拦截。请重新发送指令，或检查 Odoo 确认实际状态。")
+
+    return None
+
+
+def _is_po_create_intent(text: str) -> bool:
+    """检测是否是创建 PO / 采购单的意图。
+    用于强制 tool_choice，防止 AI 看到历史里前几次成功的 'PO 创建成功 P00xxx' 模板，
+    直接模式补全编一个递增的 PO 号而不真正调工具。
+    """
+    if not text:
+        return False
+    t = text.lower().strip()
+    if _is_query_intent(text):
+        return False
+    # 排除"更新/修改已有 PO"——那走 odoo_update_record，不是创建
+    # （但仍然是写操作，最终也会 force，只是不归这个函数管）
+    # 中文创建意图: 创建/生成/建/做/开/下/新建 + PO/采购单/采购
+    zh_create = re.search(r'(创建|生成|新建|建立|做个|做一个|开个|开一个|下个|下一个|建个|建一个).{0,6}(po|采购单|采购订单|采购)', t)
+    if zh_create:
+        return True
+    # 英文创建意图
+    en_create = re.search(r'\b(create|make|generate|new|build|add)\s+(a\s+|an\s+|new\s+)?(po|purchase\s*order)\b', t)
+    if en_create:
+        return True
+    return False
+
+
+def _is_po_context_confirm(text: str, recent_messages: list) -> bool:
+    """检测是否是 PO 创建上下文里的确认指令。
+    场景: 上一轮 AI 展示了 PO Plan (PO #1 → Vendor...), 用户回复"确认"/"OK"/"创建吧"。
+    这种短确认必须 force tool，否则 AI 直接套用历史模板编 PO 号。
+    """
+    if not text:
+        return False
+    t = text.lower().strip()
+    if len(t) > 30:
+        return False
+    # 确认词
+    confirm_words = [
+        "确认", "确定", "可以", "好的", "好", "对", "没问题", "就这样", "创建吧", "建吧", "下单", "执行",
+        "ok", "okay", "yes", "confirm", "go", "do it", "create it", "proceed",
+    ]
+    has_confirm = any(w == t or w in t for w in confirm_words)
+    if not has_confirm:
+        return False
+    # 检查最近消息里有没有 PO Plan / PO 创建上下文痕迹
+    if not recent_messages:
+        return False
+    recent = recent_messages[-10:] if len(recent_messages) > 10 else recent_messages
+    for msg in recent:
+        content = msg.get("content", "")
+        if isinstance(content, list):
+            for block in content:
+                if isinstance(block, dict):
+                    if block.get("type") == "tool_use" and block.get("name") in (
+                        "odoo_search_products_by_sku", "odoo_get_product_vendors", "odoo_create_bulk_po", "odoo_create_record"):
+                        return True
+                    if block.get("type") == "text":
+                        bt = block.get("text", "").lower()
+                        if "po plan" in bt or "po #" in bt or "vendor ref" in bt or "采购数量" in bt or "将创建" in bt:
+                            return True
+        elif isinstance(content, str):
+            cl = content.lower()
+            if "po plan" in cl or "po #" in cl or "vendor ref" in cl or "采购数量" in cl or "将创建" in cl or "确认" in cl and "创建" in cl:
+                return True
+    return False
+
+
 def _should_force_write_tool(text: str, recent_messages: list = None) -> bool:
     """统一判断是否应该 force tool_choice (写意图防幻觉)。
     
@@ -12059,7 +12181,15 @@ def _should_force_write_tool(text: str, recent_messages: list = None) -> bool:
     # 但只是修改指令)，只要有 reminder 上下文也应该 force
     if recent_messages and _is_reminder_context_followup(text, recent_messages):
         return True
-    
+
+    # v20: PO 创建意图 → force (防止 AI 编造递增 PO 号)
+    if _is_po_create_intent(text):
+        return True
+
+    # v20: PO 上下文里的确认指令 ("确认"/"OK") → force
+    if recent_messages and _is_po_context_confirm(text, recent_messages):
+        return True
+
     # reminder 命令但信息不全 + 没上下文 → 不 force, AI 走反问流程
     return False
 
@@ -13161,6 +13291,7 @@ This rule has NO exceptions. Even if the user insists, do not continue. Direct t
                 reason = "live data query" if _is_live_data_query(msg) else "write intent"
                 print(f"[FORCE_TOOL] /odoo-bot: detected {reason}, forcing tool_choice=any")
             
+            tools_called_bot = []
             for iteration in range(8):  # max tool iterations
                 payload = {
                     "model": bot_model,
@@ -13186,6 +13317,7 @@ This rule has NO exceptions. Even if the user insists, do not continue. Direct t
                         if block.get("type") == "tool_use":
                             tool_name = block["name"]
                             tool_input = block.get("input", {})
+                            tools_called_bot.append(tool_name)
                             print(f"[ODOO-BOT] tool: {tool_name}")
                             # 发个进度消息让用户知道 bot 在做什么 (使用顶部已检测的 user_lang)
                             progress_label = _get_tool_progress_label(tool_name, user_lang, tool_input)
@@ -13198,6 +13330,10 @@ This rule has NO exceptions. Even if the user insists, do not continue. Direct t
                     break
 
             reply = "".join(b.get("text", "") for b in d.get("content", []) if b.get("type") == "text")
+            # ── v20 幻觉拦截: 声称创建但没调创建工具 → 拦截 ──
+            halluc = _detect_creation_hallucination(reply, tools_called_bot)
+            if halluc:
+                reply = halluc
     except Exception as e:
         print(f"[ODOO-BOT] exception: {e}")
         err_prefix = "AI 请求失败" if user_lang == "zh" else "AI request failed"
