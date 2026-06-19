@@ -2097,6 +2097,29 @@ async def monthly_tax(year: int, month: int):
                    "total_tax":round(inv["total_tax"]+crd["total_tax"],2),
                    "total_amount":round(inv["total_amount"]+crd["total_amount"],2)}}
 
+@app.get("/report/tax-by-date-range")
+async def tax_by_date_range(date_from: str, date_to: str):
+    """Tax report for ANY date range (inclusive). Same logic as monthly_tax,
+    just with custom start/end dates. date_from/date_to format: YYYY-MM-DD."""
+    import re as _re_dr
+    # Validate date format
+    for d in (date_from, date_to):
+        if not _re_dr.match(r'^\d{4}-\d{2}-\d{2}$', d or ""):
+            return {"error": f"Invalid date format '{d}'. Use YYYY-MM-DD."}
+    if date_from > date_to:
+        return {"error": f"date_from ({date_from}) must be <= date_to ({date_to})"}
+    invoices, err1 = await fetch_moves("out_invoice", date_from, date_to)
+    credits,  err2 = await fetch_credits(date_from, date_to)
+    if err1 or err2: return {"error": err1 or err2}
+    inv = summarize_moves(invoices)
+    crd = summarize_moves(credits, is_credit=True)
+    return {"period":f"{date_from} to {date_to}","report_type":"Date Range Tax Report",
+            "date_range":f"{date_from} to {date_to}","invoices":inv,"credit_notes":crd,
+            "net":{"count":inv["count"]-crd["count"],
+                   "total_untaxed":round(inv["total_untaxed"]+crd["total_untaxed"],2),
+                   "total_tax":round(inv["total_tax"]+crd["total_tax"],2),
+                   "total_amount":round(inv["total_amount"]+crd["total_amount"],2)}}
+
 @app.get("/report/quarterly-tax")
 async def quarterly_tax(year: int, quarter: int):
     if quarter not in [1,2,3,4]: return {"error":"Quarter must be 1-4"}
@@ -2546,6 +2569,11 @@ TOOLS = [
         "name": "get_monthly_tax",
         "description": "Get accurate monthly tax report.",
         "input_schema": {"type":"object","properties":{"year":{"type":"integer"},"month":{"type":"integer"}},"required":["year","month"]}
+    },
+    {
+        "name": "get_tax_by_date_range",
+        "description": "Get accurate tax report for ANY custom date range (e.g. '6月1日到6月15日', 'May 1 to June 15'). Use this whenever the user asks for tax over a date span that is NOT a full calendar month or quarter. Uses the exact same calculation as get_monthly_tax. NEVER compute a date-range tax report yourself with odoo_search or by estimating — always call this tool. Dates must be YYYY-MM-DD.",
+        "input_schema": {"type":"object","properties":{"date_from":{"type":"string","description":"Start date inclusive, YYYY-MM-DD"},"date_to":{"type":"string","description":"End date inclusive, YYYY-MM-DD"}},"required":["date_from","date_to"]}
     },
     {
         "name": "get_quarterly_tax",
@@ -3287,11 +3315,13 @@ def get_system_prompt(role: str = "guest", user_name: str = "", user_id: int = 0
     if perms["can_see_finance"]:
         finance_rules = f"""
 FINANCIAL REPORT RULES (you have access):
-- Monthly tax -> get_monthly_tax
+- Monthly tax (full calendar month) -> get_monthly_tax
+- Tax for ANY custom date range (e.g. "6月1日到6月15日", "May 1 - June 15", partial month) -> get_tax_by_date_range(date_from, date_to)
 - Quarterly tax -> get_quarterly_tax
 - Monthly sales / commission base -> get_monthly_sales
 - CA invoices missing tax -> get_missing_tax
 - Can query account.move, account.payment with full access
+- ⚠️ NEVER compute a tax report yourself using odoo_search or by estimating. For tax numbers ALWAYS call the dedicated tool above. If the range isn't a full month, use get_tax_by_date_range — do NOT fall back to manual odoo_search math, and NEVER fabricate numbers.
 
 ═══ CHUMART ACCOUNTING BACKGROUND (银行账户/对账业务背景) ═══
 Bank accounts (account.journal) we use:
@@ -4775,7 +4805,7 @@ async def run_tool(name, inp, context=None):
     _release_tools = {"odoo_create_invoice_from_so", "odoo_register_payment", "odoo_export_invoice_pdf", "release_so", "print_invoice", "check_so_payment_status"}
     _write_tools = {"odoo_create_record", "odoo_add_order_line", "odoo_batch_add_order_lines", "odoo_confirm_order", "odoo_update_record", "odoo_update_vendor_price"}
     _cost_tools = {"odoo_find_recent_purchases_by_skus", "odoo_get_product_vendors", "odoo_create_bulk_po", "get_po_with_so_links", "odoo_restock_analysis", "get_incoming_products"}
-    _finance_tools = {"get_monthly_tax", "get_quarterly_tax", "get_monthly_sales", "get_missing_tax", "odoo_match_payment_to_customer"}
+    _finance_tools = {"get_monthly_tax", "get_tax_by_date_range", "get_quarterly_tax", "get_monthly_sales", "get_missing_tax", "odoo_match_payment_to_customer"}
     # v18.3: admin-only tools (raw DB query / sensitive ops)
     _admin_only_tools = {"db_query_admin"}
     if name in _release_tools and not role_perms.get("can_release_so"):
@@ -4842,6 +4872,8 @@ async def run_tool(name, inp, context=None):
         return await odoo_list_fields(inp["model"])
     if name == "get_monthly_tax":
         return json.dumps(await monthly_tax(inp["year"], inp["month"]), ensure_ascii=False)
+    if name == "get_tax_by_date_range":
+        return json.dumps(await tax_by_date_range(inp["date_from"], inp["date_to"]), ensure_ascii=False)
     if name == "get_quarterly_tax":
         return json.dumps(await quarterly_tax(inp["year"], inp["quarter"]), ensure_ascii=False)
     if name == "get_monthly_sales":
@@ -9920,7 +9952,7 @@ async def chat(req: ChatRequest, background_tasks: BackgroundTasks):
 
     # Filter tools based on permissions
     allowed_tools = []
-    finance_tools = {"get_monthly_tax", "get_quarterly_tax", "get_monthly_sales", "get_missing_tax", "odoo_match_payment_to_customer"}
+    finance_tools = {"get_monthly_tax", "get_tax_by_date_range", "get_quarterly_tax", "get_monthly_sales", "get_missing_tax", "odoo_match_payment_to_customer"}
     # Release-related tools — allowed for can_release_so (admin/finance/sales_manager)
     release_tools = {"odoo_create_invoice_from_so", "odoo_register_payment", "odoo_export_invoice_pdf", "release_so", "print_invoice", "check_so_payment_status"}
     # Other write tools (PO, product/price edits) — admin/finance only (NOT sales_manager)
@@ -10266,7 +10298,7 @@ async def chat_stream(req: ChatRequest, background_tasks: BackgroundTasks):
 
     # Filter tools based on permissions
     allowed_tools = []
-    finance_tools = {"get_monthly_tax", "get_quarterly_tax", "get_monthly_sales", "get_missing_tax", "odoo_match_payment_to_customer"}
+    finance_tools = {"get_monthly_tax", "get_tax_by_date_range", "get_quarterly_tax", "get_monthly_sales", "get_missing_tax", "odoo_match_payment_to_customer"}
     # Release-related tools — allowed for can_release_so (admin/finance/sales_manager)
     release_tools = {"odoo_create_invoice_from_so", "odoo_register_payment", "odoo_export_invoice_pdf", "release_so", "print_invoice", "check_so_payment_status"}
     # Other write tools (PO, product/price edits) — admin/finance only (NOT sales_manager)
@@ -13110,7 +13142,7 @@ async def odoo_bot_chat(req: OdooBotRequest):
 
     # Filter tools by permission (same logic as /chat)
     allowed_tools = []
-    finance_tools = {"get_monthly_tax", "get_quarterly_tax", "get_monthly_sales", "get_missing_tax", "odoo_match_payment_to_customer"}
+    finance_tools = {"get_monthly_tax", "get_tax_by_date_range", "get_quarterly_tax", "get_monthly_sales", "get_missing_tax", "odoo_match_payment_to_customer"}
     # Release-related tools — allowed for can_release_so (admin/finance/sales_manager)
     release_tools = {"odoo_create_invoice_from_so", "odoo_register_payment", "odoo_export_invoice_pdf", "release_so", "print_invoice", "check_so_payment_status"}
     # Other write tools (PO, product/price edits) — admin/finance only (NOT sales_manager)
