@@ -11743,6 +11743,9 @@ def _is_release_intent(text: str) -> bool:
         r"\bregister\s+payment",
         r"\bprint\s+invoice",
         r"\breprint\s+invoice",
+        # print/reprint followed by a marketplace order # or INV number (no "invoice" word needed)
+        r"\b(?:re)?print\s+(?:amz|cmt|#cmt|inv)",
+        r"\b(?:re)?print\s+\d{2,3}-\d{6,7}-\d{6,7}",  # print 112-6836695-4636219 (bare Amazon #)
         r"\bopen\s+invoice",
         # No-space variants: "release" stuck to a digit/#/-/@ that's NOT a letter
         # — this catches "release1234", "releaseAMZ-..." (after lowercase: "releaseamz" needs separate rule)
@@ -11759,10 +11762,14 @@ def _is_release_intent(text: str) -> bool:
             return True
     zh_keywords = ["开票", "开发票", "出发票", "释放订单",
                    "确认收款并开票", "登记收款", "登记付款",
-                   "打印发票", "重新打印发票", "重打发票"]
+                   "打印发票", "重新打印发票", "重打发票",
+                   "打印订单"]
     for kw in zh_keywords:
         if kw in t:
             return True
+    # 中文 "打印/重打/重新打印" + 单号 (AMZ/CMT/INV/裸数字)
+    if re.search(r"(?:打印|重打|重新打印)\s*(?:amz|cmt|#cmt|inv|\d{2,3}-\d{6,7})", t):
+        return True
     return False
 
 
@@ -12117,7 +12124,49 @@ def _detect_creation_hallucination(reply: str, tools_called: list) -> str | None
         return ("⚠️ 系统拦截：检测到回复声称创建了发票/完成了 release，但实际没有调用相应工具。\n"
                 "为防止误导，这条回复已被拦截。请重新发送指令，或检查 Odoo 确认实际状态。")
 
+    # v21: 更新/改价/改状态声明 (覆盖 odoo_update_record / odoo_update_vendor_price)
+    update_claim_patterns = [
+        "已更新", "已修改", "已改成", "已改为", "更新成功", "修改成功", "已设置", "已调整", "已更正",
+        "updated successfully", "successfully updated", "successfully changed", "has been updated",
+        "has been changed", "price updated", "已更新价格", "已更新成本", "成本已", "价格已", "状态已",
+    ]
+    claims_update = any(p in r for p in update_claim_patterns)
+    if claims_update and not (called & {"odoo_update_record", "odoo_update_vendor_price", "odoo_confirm_order", "odoo_add_order_line"}):
+        print(f"[HALLUCINATION-BLOCK] Update claimed without tool call. reply={reply[:120]}")
+        return ("⚠️ 系统拦截：检测到回复声称更新/修改了记录，但实际没有调用更新工具。\n"
+                "为防止误导，这条回复已被拦截。请重新发送指令，或检查 Odoo 确认实际状态。")
+
     return None
+
+
+def _is_update_intent(text: str) -> bool:
+    """检测是否是更新记录 / 改价格 / 改状态 / 改字段的写操作意图。
+    用于强制 tool_choice，防止 AI 编造 '已更新 P00466 状态' 这类假成功消息。
+    覆盖 odoo_update_record 和 odoo_update_vendor_price。
+    """
+    if not text:
+        return False
+    t = text.lower().strip()
+    if _is_query_intent(text):
+        return False
+    # 中文更新意图: 改/修改/更新/设置/调整 + 价格/成本/状态/字段/...
+    # 需要同时出现 (动词) 和 (一个明确的目标对象/记录号/字段名)
+    zh_verb = re.search(r'(修改|更新|改成|改为|设成|设为|调整|设置|更正|把.{0,20}改|将.{0,20}改)', t)
+    en_verb = re.search(r'\b(update|change|modify|set|edit|correct|fix)\b', t)
+    has_verb = bool(zh_verb or en_verb)
+    if not has_verb:
+        return False
+    # 目标对象信号: 记录号 (P00xxx/S0xxx/INV)、价格成本、状态、明确字段
+    target_signals = [
+        r'p\d{3,}', r's\d{4,}', r'inv[/\-]', r'amz\d', r'cmt\d',          # 记录号
+        r'价格|成本|售价|单价|cost|price', r'状态|state|status',             # 价格/状态
+        r'数量|qty|quantity', r'vendor|供应商', r'字段|field',               # 其他字段
+        r'[a-z]{2,4}-?\d{2,}',                                            # SKU 形态
+    ]
+    for sig in target_signals:
+        if re.search(sig, t):
+            return True
+    return False
 
 
 def _is_po_create_intent(text: str) -> bool:
@@ -12222,6 +12271,10 @@ def _should_force_write_tool(text: str, recent_messages: list = None) -> bool:
     if recent_messages and _is_po_context_confirm(text, recent_messages):
         return True
 
+    # v21: 更新记录/改价/改状态意图 → force (防止 AI 编造 "已更新 P00466")
+    if _is_update_intent(text):
+        return True
+
     # reminder 命令但信息不全 + 没上下文 → 不 force, AI 走反问流程
     return False
 
@@ -12255,6 +12308,94 @@ _COMPLEX_MARKERS = [
     # 标点 — 多个分句
     ";", "?", "？",
 ]
+
+def _is_simple_print_request(text: str, has_attachments: bool) -> tuple[bool, str | None, str | None]:
+    """判断消息是不是 "纯粹一句 打印发票" 请求。
+
+    返回 (is_simple, identifier, id_type) 三元组。
+    id_type ∈ {"AMZ", "CMT", "INV"} or None。
+    identifier 是单号 (AMZxxx-... / CMTxxxx) 或发票号 (INV/2026/xxxxx)。
+
+    必须满足:
+    1. 无附件
+    2. 包含 print/打印 意图
+    3. 不含 release/开票 意图 (那个走 release fastpath)
+    4. 正好一个标识符 (marketplace 单号 或 INV 发票号)
+    5. 不含复杂修饰词
+    6. 剩余字符 ≤ 8
+    """
+    if has_attachments:
+        return (False, None, None)
+    if not text or not text.strip():
+        return (False, None, None)
+
+    raw = text.strip()
+    lower = raw.lower()
+
+    # 必须有 print 意图
+    print_kw = ["print", "打印", "reprint", "再打印", "重新打印", "重打"]
+    if not any(kw in lower for kw in print_kw):
+        return (False, None, None)
+
+    # 排除 release 意图 (release fastpath 自己会打印)
+    if _is_release_intent(raw):
+        # 如果同时有 release 和 print，让 release fastpath 处理
+        # 但 "print AMZxxx" 不含 release 词，所以这里只排除真正的 release
+        release_only_kw = ["release", "开票", "出发票", "确认开票"]
+        if any(kw in lower for kw in release_only_kw):
+            return (False, None, None)
+
+    # 排除查询意图
+    if _is_query_intent(raw):
+        return (False, None, None)
+
+    # 复杂修饰词 → 让 AI 处理
+    for marker in _COMPLEX_MARKERS:
+        if marker in lower:
+            return (False, None, None)
+
+    # 检测标识符: 优先 INV 发票号, 然后 marketplace 单号
+    inv_match = re.search(r'inv[/\-]?\d{4}[/\-]?\d{4,5}', raw, re.IGNORECASE)
+    amz_matches = _AMZ_SO_RE.findall(raw)
+    cmt_matches = _CMT_SO_RE.findall(raw)
+
+    identifier = None
+    id_type = None
+
+    if inv_match:
+        # 归一化 INV 号: INV/2026/01669
+        digits = re.findall(r'\d+', inv_match.group(0))
+        if len(digits) >= 2:
+            identifier = f"INV/{digits[0]}/{digits[1].zfill(5)}"
+            id_type = "INV"
+    elif len(amz_matches) + len(cmt_matches) == 1:
+        if amz_matches:
+            raw_so = amz_matches[0].upper()
+            identifier = raw_so if raw_so.startswith("AMZ") else "AMZ" + raw_so
+            id_type = "AMZ"
+        else:
+            identifier = cmt_matches[0].lstrip("#").upper()
+            id_type = "CMT"
+    else:
+        return (False, None, None)
+
+    if not identifier:
+        return (False, None, None)
+
+    # 剩余字符检查
+    remainder = raw
+    if inv_match:
+        remainder = re.sub(re.escape(inv_match.group(0)), "", remainder, flags=re.IGNORECASE)
+    remainder = _AMZ_SO_RE.sub("", remainder)
+    remainder = _CMT_SO_RE.sub("", remainder)
+    for kw in print_kw + ["please", "请", "麻烦", "thanks", "thx", "ty", "invoice", "发票"]:
+        remainder = re.sub(re.escape(kw), "", remainder, flags=re.IGNORECASE)
+    remainder_compact = re.sub(r"[\s,.\-_:;@#/]", "", remainder)
+    if len(remainder_compact) > 8:
+        return (False, None, None)
+
+    return (True, identifier, id_type)
+
 
 def _is_simple_marketplace_release(text: str, has_attachments: bool) -> tuple[bool, str | None, str | None]:
     """判断消息是不是 "纯粹一句 marketplace release"。
@@ -12412,6 +12553,84 @@ def _format_release_report(steps: list, so_name: str, partner: str, lang: str) -
         lines.append("⚠️ Please check in Odoo manually; contact Admin if needed.")
     
     return "\n".join(lines)
+
+
+async def _print_invoice_fastpath(identifier: str, id_type: str, channel_id: int, lang: str, ctx: dict):
+    """纯代码打印发票 fastpath (零 AI)。
+    identifier: AMZxxx-... / CMTxxxx / INV/2026/xxxxx
+    id_type: "AMZ" | "CMT" | "INV"
+    返回 reply 字符串。
+    """
+    is_zh = (lang == "zh")
+    # 1) 解析出 invoice_id
+    invoice_id = None
+    inv_name = None
+    try:
+        cookies = await odoo_get_session()
+        if id_type == "INV":
+            inv_r = json.loads(await odoo_query("account.move",
+                [["name", "=", identifier], ["company_id", "=", 1]],
+                ["id", "name", "partner_id", "amount_total", "payment_state"], limit=1, cookies=cookies))
+        else:
+            # AMZ/CMT: 单号在 invoice_origin 或 ref 里，找对应的 out_invoice
+            inv_r = json.loads(await odoo_query("account.move",
+                [["move_type", "=", "out_invoice"], ["company_id", "=", 1],
+                 "|", ["invoice_origin", "ilike", identifier], ["ref", "ilike", identifier]],
+                ["id", "name", "partner_id", "amount_total", "payment_state"],
+                limit=1, cookies=cookies, order="id desc"))
+
+        if not isinstance(inv_r, list) or not inv_r:
+            if is_zh:
+                return f"⚠️ 找不到 {identifier} 对应的发票。请确认单号是否正确，或该订单是否已 release。"
+            return f"⚠️ No invoice found for {identifier}. Please verify the order number or whether it has been released."
+
+        inv = inv_r[0]
+        invoice_id = inv["id"]
+        inv_name = inv.get("name")
+        partner = (inv.get("partner_id") or [0, ""])[1]
+        amount = inv.get("amount_total", 0)
+        pay_state = inv.get("payment_state", "")
+    except Exception as e:
+        print(f"[PRINT-FASTPATH] lookup error: {e}")
+        return f"⚠️ {'查询发票出错' if is_zh else 'Invoice lookup error'}: {str(e)[:150]}"
+
+    # 2) 进度消息
+    progress_msg = f"🖨 {'正在打印发票' if is_zh else 'Printing invoice'} {inv_name}..."
+    await _odoo_bot_post_progress(channel_id, progress_msg)
+
+    # 3) 直接调 print_invoice 工具 (纯代码, 真实 PrintNode job)
+    title = f"{inv_name} — {partner}"
+    pr_str = await run_tool("print_invoice", {"invoice_id": invoice_id, "title": title}, context=ctx)
+    try:
+        pr = json.loads(pr_str)
+    except Exception:
+        pr = {"error": pr_str}
+
+    if pr.get("error"):
+        print(f"[PRINT-FASTPATH] print failed: {pr['error']}")
+        if is_zh:
+            return f"⚠️ **打印失败**\n\n**发票:** {inv_name}\n**错误:** {pr['error']}"
+        return f"⚠️ **Print Failed**\n\n**Invoice:** {inv_name}\n**Error:** {pr['error']}"
+
+    job_id = pr.get("job_id", "")
+    printer_id = pr.get("printer_id", "")
+    print(f"[PRINT-FASTPATH] {identifier} → {inv_name} job_id={job_id} OK")
+
+    if is_zh:
+        return (f"✅ **打印任务已发送！**\n\n"
+                f"**发票:** {inv_name}\n"
+                f"**客户:** {partner}\n"
+                f"**金额:** ${amount:,.2f}\n"
+                f"**Print Job ID:** {job_id}\n"
+                f"**打印机:** {printer_id}\n\n"
+                f"发票已发送到打印机。")
+    return (f"✅ **Print job sent!**\n\n"
+            f"**Invoice:** {inv_name}\n"
+            f"**Customer:** {partner}\n"
+            f"**Amount:** ${amount:,.2f}\n"
+            f"**Print Job ID:** {job_id}\n"
+            f"**Printer:** {printer_id}\n\n"
+            f"The invoice has been sent to the printer.")
 
 
 async def _marketplace_release_fastpath(
@@ -13137,6 +13356,27 @@ async def odoo_bot_chat(req: OdooBotRequest):
             f"{s['name']}={'OK' if s['ok'] else 'FAIL'}" for s in steps
         )
         print(f"[FASTPATH] {fp_so_name} done: {step_summary}")
+        print(f"[ODOO-BOT] reply to uid={uid}: {reply[:100]}...")
+        return {"reply": reply}
+
+    # ── PRINT FASTPATH: "print AMZxxx" / "打印 INVxxx" → 纯代码打印 (零 AI) ──
+    is_print, print_id, print_id_type = _is_simple_print_request(req.message or "", has_attachments)
+    if is_print and perms.get("can_release_so"):
+        print(f"[PRINT-FASTPATH] {print_id_type} print: id={print_id} uid={uid} role={role}")
+        if uid not in ODOO_BOT_HISTORY:
+            ODOO_BOT_HISTORY[uid] = []
+        conv = ODOO_BOT_HISTORY[uid]
+        conv.append({"role": "user", "content": req.message or ""})
+        tool_context = {"uid": uid, "username": author, "role": role}
+        try:
+            reply = await _print_invoice_fastpath(print_id, print_id_type, req.channel_id, user_lang, tool_context)
+        except Exception as e:
+            print(f"[PRINT-FASTPATH] unexpected error: {e}")
+            import traceback; traceback.print_exc()
+            reply = f"⚠️ {'打印异常' if user_lang == 'zh' else 'Print error'}: {str(e)[:200]}"
+        conv.append({"role": "assistant", "content": reply})
+        if len(conv) > ODOO_BOT_MAX_HISTORY:
+            ODOO_BOT_HISTORY[uid] = conv[-ODOO_BOT_MAX_HISTORY:]
         print(f"[ODOO-BOT] reply to uid={uid}: {reply[:100]}...")
         return {"reply": reply}
 
