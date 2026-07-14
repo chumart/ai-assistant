@@ -2590,6 +2590,100 @@ async def quarterly_tax(year: int, quarter: int):
                    "total_amount":round(inv["total_amount"]+crd["total_amount"],2)},
             "monthly_breakdown":monthly}
 
+
+async def cdtfa_sales_tax(period_type: str, year: int, quarter: int = None, month: int = None):
+    """Run the Odoo 'Sales Tax Summary (CDTFA)' module (sale.tax.report.wizard) via RPC
+    and return the filing-format summary + a downloadable Excel (R2 signed URL).
+
+    Requires the sale_tax_report addon to be installed on Odoo.
+    Steps: create wizard → action_compute → read line_ids → action_export_xlsx → R2."""
+    period_type = (period_type or "").strip().lower()
+    if period_type not in ("quarter", "month"):
+        return {"error": "period_type must be 'quarter' or 'month'"}
+    vals = {"period_type": period_type, "year": str(year), "company_id": 1}
+    if period_type == "quarter":
+        if quarter not in (1, 2, 3, 4):
+            return {"error": "quarter must be 1-4 for a quarterly report"}
+        vals["quarter"] = str(quarter)
+        period_label = f"{year} Q{quarter}"
+    else:
+        if month not in range(1, 13):
+            return {"error": "month must be 1-12 for a monthly report"}
+        vals["month"] = str(month)
+        period_label = f"{calendar.month_name[month]} {year}"
+
+    cookies = await odoo_get_session()
+    try:
+        # 1) create the transient wizard
+        wid = await _odoo_call("sale.tax.report.wizard", "create", [vals], {}, cookies=cookies)
+        wizard_id = wid[0] if isinstance(wid, list) else wid
+        if not wizard_id:
+            return {"error": "Could not create sale.tax.report.wizard — is the 'sale_tax_report' module installed on Odoo?"}
+        # 2) compute the summary (fills line_ids)
+        await _odoo_call("sale.tax.report.wizard", "action_compute", [[wizard_id]], {}, cookies=cookies)
+        # 3) read the summary lines
+        lines = await _odoo_call("sale.tax.report.line", "search_read",
+            [[["wizard_id", "=", wizard_id]]],
+            {"fields": ["name", "category", "out_of_state", "ca_retail",
+                        "ca_wholesale", "sales_tax", "gross"], "order": "sequence"},
+            cookies=cookies) or []
+    except Exception as e:
+        print(f"[CDTFA-TAX] RPC error: {e}")
+        import traceback; traceback.print_exc()
+        return {"error": f"Odoo RPC failed while running the CDTFA tax module: {e}"}
+
+    if not lines:
+        return {"error": f"No CDTFA tax data returned for {period_label}. "
+                         f"Confirm the sale_tax_report module is installed and the period has posted invoices."}
+
+    rows = [{
+        "row": l.get("name"),
+        "out_of_state": round(l.get("out_of_state", 0) or 0, 2),
+        "ca_retail": round(l.get("ca_retail", 0) or 0, 2),
+        "ca_wholesale": round(l.get("ca_wholesale", 0) or 0, 2),
+        "sales_tax": round(l.get("sales_tax", 0) or 0, 2),
+        "gross": round(l.get("gross", 0) or 0, 2),
+    } for l in lines]
+
+    # 4) export Excel → upload to R2 → signed URL (same pattern as commission report)
+    excel_url = ""
+    try:
+        await _odoo_call("sale.tax.report.wizard", "action_export_xlsx", [[wizard_id]], {}, cookies=cookies)
+        rec = await _odoo_call("sale.tax.report.wizard", "search_read",
+            [[["id", "=", wizard_id]]],
+            {"fields": ["xlsx_file", "xlsx_filename"], "limit": 1}, cookies=cookies)
+        if rec and rec[0].get("xlsx_file"):
+            xlsx_bytes = base64.b64decode(rec[0]["xlsx_file"])
+            fname = rec[0].get("xlsx_filename") or f"Sales_Tax_Summary_{period_label.replace(' ', '_')}.xlsx"
+            r2_key = f"tax-reports/{fname}"
+            ok = await r2_upload(xlsx_bytes, r2_key,
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+            if ok:
+                import asyncio
+                loop = asyncio.get_event_loop()
+                client = get_r2_client()
+                if client:
+                    excel_url = await loop.run_in_executor(None, lambda: client.generate_presigned_url(
+                        "get_object", Params={"Bucket": R2_BUCKET, "Key": r2_key}, ExpiresIn=7 * 24 * 3600))
+                print(f"[CDTFA-TAX] Excel uploaded: {r2_key}")
+    except Exception as e:
+        print(f"[CDTFA-TAX] Excel export/upload failed: {e}")
+        import traceback; traceback.print_exc()
+
+    return {
+        "report_type": "Sales Tax Summary (CDTFA)",
+        "period": period_label,
+        "columns": ["Out-of-State Sales", "CA-Retail Sales", "CA-Wholesales",
+                    "Sales Tax Collected", "Gross Sales"],
+        "rows": rows,
+        "excel_url": excel_url,
+        "note": ("Amounts are tax-excluded. Gross = the three sales columns + Sales Tax Collected. "
+                 "Amazon (amz* orders) is reported under Out-of-State Sales. "
+                 "Credit notes are included as negatives. Source: Odoo sale_tax_report module. "
+                 "Excel link (with per-invoice Detail sheet) is valid for 7 days."),
+    }
+
+
 @app.get("/report/monthly-sales")
 async def monthly_sales(year: int, month: int):
     last_day = calendar.monthrange(year, month)[1]
@@ -3020,6 +3114,11 @@ TOOLS = [
         "name": "get_quarterly_tax",
         "description": "Get accurate quarterly tax report with monthly breakdown.",
         "input_schema": {"type":"object","properties":{"year":{"type":"integer"},"quarter":{"type":"integer"}},"required":["year","quarter"]}
+    },
+    {
+        "name": "get_cdtfa_sales_tax",
+        "description": "Official CDTFA Sales Tax Summary for a quarter or month, computed by the Odoo 'Sales Tax Summary (CDTFA)' module. Returns the filing-format breakdown — Out-of-State Sales / CA-Retail Sales / CA-Wholesales / Sales Tax Collected / Gross Sales — split into Regular / Amazon / Online-Other / Total rows, PLUS a downloadable Excel link (with a Detail sheet listing every invoice). ALWAYS use THIS tool (not get_quarterly_tax) when the user asks about quarterly sales tax, or sales tax for filing / CDTFA / 报税 / 季度税. period_type = 'quarter' (with quarter 1-4) or 'month' (with month 1-12).",
+        "input_schema": {"type":"object","properties":{"period_type":{"type":"string","enum":["quarter","month"],"description":"'quarter' or 'month'"},"year":{"type":"integer"},"quarter":{"type":"integer","description":"1-4, required when period_type='quarter'"},"month":{"type":"integer","description":"1-12, required when period_type='month'"}},"required":["period_type","year"]}
     },
     {
         "name": "get_monthly_sales",
@@ -3758,7 +3857,8 @@ def get_system_prompt(role: str = "guest", user_name: str = "", user_id: int = 0
 FINANCIAL REPORT RULES (you have access):
 - Monthly tax (full calendar month) -> get_monthly_tax
 - Tax for ANY custom date range (e.g. "6月1日到6月15日", "May 1 - June 15", partial month) -> get_tax_by_date_range(date_from, date_to)
-- Quarterly tax -> get_quarterly_tax
+- Quarterly SALES TAX / CDTFA filing / 报税 / 季度税 -> get_cdtfa_sales_tax(period_type="quarter", year, quarter). This is the official CDTFA-format summary (Out-of-State / CA-Retail / CA-Wholesale + Amazon breakdown) with a downloadable Excel. Prefer this for any quarterly sales-tax question. Present the returned rows as a table and include the excel_url as a download link.
+- get_quarterly_tax is only the legacy simple quarterly tax figure with month breakdown — use it only if the user explicitly asks for that plain number, not for CDTFA filing.
 - Monthly sales / commission base -> get_monthly_sales
 - CA invoices missing tax -> get_missing_tax
 - Can query account.move, account.payment with full access
@@ -4119,6 +4219,7 @@ ORDER LOOKUP BY ADDRESS/PRODUCT: When customer doesn't know their order number:
 - 涉及产品/规格/价格/维修/故障排除时：先调用 search_knowledge（包含网站内容和上传的文档如service manual）
 - 如果用户想找或下载某个文件：用 search_documents 工具
 - 涉及财务报表：get_monthly_tax / get_quarterly_tax / get_monthly_sales / get_missing_tax
+- 季度销售税 / CDTFA / 报税 / 申报：用 get_cdtfa_sales_tax(period_type="quarter", year, quarter)，返回 CDTFA 格式汇总(Out-of-State/CA-Retail/CA-Wholesale + Amazon)+ Excel 下载链接，把 rows 列成表格并附上 excel_url
 - 涉及库存/客户/订单：用 odoo_search，company_id=1，stock加 location_id.usage=internal
 - 涉及产品搜索：name 和 default_code 都用 ilike，OR 逻辑
 
@@ -5246,7 +5347,7 @@ async def run_tool(name, inp, context=None):
     _release_tools = {"odoo_create_invoice_from_so", "odoo_register_payment", "odoo_export_invoice_pdf", "release_so", "print_invoice", "check_so_payment_status"}
     _write_tools = {"odoo_create_record", "odoo_add_order_line", "odoo_batch_add_order_lines", "odoo_confirm_order", "odoo_update_record", "odoo_update_vendor_price"}
     _cost_tools = {"odoo_find_recent_purchases_by_skus", "odoo_get_product_vendors", "odoo_create_bulk_po", "get_po_with_so_links", "odoo_restock_analysis", "get_incoming_products"}
-    _finance_tools = {"get_monthly_tax", "get_tax_by_date_range", "get_quarterly_tax", "get_monthly_sales", "get_missing_tax", "odoo_match_payment_to_customer"}
+    _finance_tools = {"get_monthly_tax", "get_tax_by_date_range", "get_quarterly_tax", "get_cdtfa_sales_tax", "get_monthly_sales", "get_missing_tax", "odoo_match_payment_to_customer"}
     # v18.3: admin-only tools (raw DB query / sensitive ops)
     _admin_only_tools = {"db_query_admin"}
     if name in _release_tools and not role_perms.get("can_release_so"):
@@ -5317,6 +5418,8 @@ async def run_tool(name, inp, context=None):
         return json.dumps(await tax_by_date_range(inp["date_from"], inp["date_to"]), ensure_ascii=False)
     if name == "get_quarterly_tax":
         return json.dumps(await quarterly_tax(inp["year"], inp["quarter"]), ensure_ascii=False)
+    if name == "get_cdtfa_sales_tax":
+        return json.dumps(await cdtfa_sales_tax(inp["period_type"], inp["year"], inp.get("quarter"), inp.get("month")), ensure_ascii=False)
     if name == "get_monthly_sales":
         return json.dumps(await monthly_sales(inp["year"], inp["month"]), ensure_ascii=False)
     if name == "get_missing_tax":
@@ -10393,7 +10496,7 @@ async def chat(req: ChatRequest, background_tasks: BackgroundTasks):
 
     # Filter tools based on permissions
     allowed_tools = []
-    finance_tools = {"get_monthly_tax", "get_tax_by_date_range", "get_quarterly_tax", "get_monthly_sales", "get_missing_tax", "odoo_match_payment_to_customer"}
+    finance_tools = {"get_monthly_tax", "get_tax_by_date_range", "get_quarterly_tax", "get_cdtfa_sales_tax", "get_monthly_sales", "get_missing_tax", "odoo_match_payment_to_customer"}
     # Release-related tools — allowed for can_release_so (admin/finance/sales_manager)
     release_tools = {"odoo_create_invoice_from_so", "odoo_register_payment", "odoo_export_invoice_pdf", "release_so", "print_invoice", "check_so_payment_status"}
     # Other write tools (PO, product/price edits) — admin/finance only (NOT sales_manager)
@@ -10739,7 +10842,7 @@ async def chat_stream(req: ChatRequest, background_tasks: BackgroundTasks):
 
     # Filter tools based on permissions
     allowed_tools = []
-    finance_tools = {"get_monthly_tax", "get_tax_by_date_range", "get_quarterly_tax", "get_monthly_sales", "get_missing_tax", "odoo_match_payment_to_customer"}
+    finance_tools = {"get_monthly_tax", "get_tax_by_date_range", "get_quarterly_tax", "get_cdtfa_sales_tax", "get_monthly_sales", "get_missing_tax", "odoo_match_payment_to_customer"}
     # Release-related tools — allowed for can_release_so (admin/finance/sales_manager)
     release_tools = {"odoo_create_invoice_from_so", "odoo_register_payment", "odoo_export_invoice_pdf", "release_so", "print_invoice", "check_so_payment_status"}
     # Other write tools (PO, product/price edits) — admin/finance only (NOT sales_manager)
@@ -12332,6 +12435,7 @@ TOOL_PROGRESS_LABELS_ZH = {
     "search_knowledge_base":       "📚 正在搜索知识库...",
     "get_monthly_tax":             "📊 正在生成月度税报表...",
     "get_quarterly_tax":           "📊 正在生成季度税报表...",
+    "get_cdtfa_sales_tax":         "📊 正在生成 CDTFA 销售税报表...",
     "get_monthly_sales":           "📊 正在生成销售提成报表...",
     "find_missing_tax":            "🔍 正在检查缺税订单...",
     "save_user_memory":            "💾 正在保存记忆...",
@@ -12375,6 +12479,7 @@ TOOL_PROGRESS_LABELS_EN = {
     "search_knowledge_base":       "📚 Searching knowledge base...",
     "get_monthly_tax":             "📊 Generating monthly tax report...",
     "get_quarterly_tax":           "📊 Generating quarterly tax report...",
+    "get_cdtfa_sales_tax":         "📊 Generating CDTFA sales tax report...",
     "get_monthly_sales":           "📊 Generating sales commission report...",
     "find_missing_tax":            "🔍 Checking missing tax...",
     "save_user_memory":            "💾 Saving memory...",
@@ -14044,7 +14149,7 @@ async def odoo_bot_chat(req: OdooBotRequest):
 
     # Filter tools by permission (same logic as /chat)
     allowed_tools = []
-    finance_tools = {"get_monthly_tax", "get_tax_by_date_range", "get_quarterly_tax", "get_monthly_sales", "get_missing_tax", "odoo_match_payment_to_customer"}
+    finance_tools = {"get_monthly_tax", "get_tax_by_date_range", "get_quarterly_tax", "get_cdtfa_sales_tax", "get_monthly_sales", "get_missing_tax", "odoo_match_payment_to_customer"}
     # Release-related tools — allowed for can_release_so (admin/finance/sales_manager)
     release_tools = {"odoo_create_invoice_from_so", "odoo_register_payment", "odoo_export_invoice_pdf", "release_so", "print_invoice", "check_so_payment_status"}
     # Other write tools (PO, product/price edits) — admin/finance only (NOT sales_manager)
