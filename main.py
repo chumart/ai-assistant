@@ -453,7 +453,7 @@ async def init_db():
             CREATE TABLE IF NOT EXISTS capture_reminder_schedules (
                 id SERIAL PRIMARY KEY,
                 time_pt VARCHAR(10) NOT NULL,
-                recipients TEXT NOT NULL DEFAULT 'Ashley,Di',
+                recipients TEXT NOT NULL DEFAULT 'Ashley Hou,Di Wu',
                 active BOOLEAN NOT NULL DEFAULT TRUE,
                 frequency VARCHAR(20) NOT NULL DEFAULT 'everyday',
                 last_fired_at TIMESTAMPTZ DEFAULT NULL,
@@ -465,7 +465,7 @@ async def init_db():
         if cap_existing == 0:
             await conn.execute("""
                 INSERT INTO capture_reminder_schedules (time_pt, recipients, active, frequency) VALUES
-                ('09:30', 'Ashley,Di', TRUE, 'everyday')
+                ('09:30', 'Ashley Hou,Di Wu', TRUE, 'everyday')
             """)
             print("Default capture reminder schedule created: 09:30 AM daily → Ashley, Di")
 
@@ -475,7 +475,7 @@ async def init_db():
                 id SERIAL PRIMARY KEY,
                 day_of_month INTEGER NOT NULL DEFAULT 1,
                 time_pt VARCHAR(10) NOT NULL DEFAULT '09:00',
-                recipients TEXT NOT NULL DEFAULT 'Ashley,Di',
+                recipients TEXT NOT NULL DEFAULT 'Ashley Hou,Di Wu',
                 active BOOLEAN NOT NULL DEFAULT TRUE,
                 last_fired_at TIMESTAMPTZ DEFAULT NULL,
                 created_at TIMESTAMPTZ DEFAULT NOW(),
@@ -486,7 +486,7 @@ async def init_db():
         if comm_existing == 0:
             await conn.execute("""
                 INSERT INTO commission_report_schedules (day_of_month, time_pt, recipients, active) VALUES
-                (1, '09:00', 'Ashley,Di', TRUE)
+                (1, '09:00', 'Ashley Hou,Di Wu', TRUE)
             """)
             print("Default commission report schedule created: 1st of month 09:00 AM → Ashley, Di")
 
@@ -1049,7 +1049,7 @@ async def _send_po_reminder_message(target_user: str, msg_body: str, cookies=Non
             cookies=cookies)
         if all_users:
             for u in all_users:
-                await _send_po_reminder_to_user(u["name"], msg_body, cookies)
+                await _send_po_reminder_to_user(u["id"], msg_body, cookies)
             print(f"[PO-REMINDER] Sent to ALL ({len(all_users)} users)")
         return
 
@@ -1060,11 +1060,33 @@ async def _send_po_reminder_to_user(target_user: str, msg_body: str, cookies=Non
     if not cookies:
         cookies = await odoo_get_session()
 
-    # Find target user
-    user_r = await _odoo_call("res.users", "search_read",
-        [[["name", "ilike", target_user], ["active", "=", True]]],
-        {"fields": ["id", "name", "partner_id"], "limit": 5},
-        cookies=cookies)
+    # Resolve target user — prefer exact uid (new schedules store uid), fall back
+    # to name for legacy schedules but NEVER fuzzy-misdeliver financial data.
+    ts = str(target_user).strip()
+    if ts.isdigit():
+        # uid path: exact id lock (no ambiguity possible)
+        user_r = await _odoo_call("res.users", "search_read",
+            [[["id", "=", int(ts)], ["active", "=", True]]],
+            {"fields": ["id", "name", "partner_id"], "limit": 1},
+            cookies=cookies)
+    else:
+        # legacy name token: require EXACT name match first
+        user_r = await _odoo_call("res.users", "search_read",
+            [[["name", "=", ts], ["active", "=", True]]],
+            {"fields": ["id", "name", "partner_id"], "limit": 5},
+            cookies=cookies)
+        if not user_r:
+            # backward-compat fuzzy — but ONLY accept if unambiguous (exactly 1)
+            cand = await _odoo_call("res.users", "search_read",
+                [[["name", "ilike", ts], ["active", "=", True]]],
+                {"fields": ["id", "name", "partner_id"], "limit": 5},
+                cookies=cookies) or []
+            if len(cand) == 1:
+                user_r = cand
+            elif len(cand) > 1:
+                print(f"[PO-REMINDER] Ambiguous recipient '{ts}' matched {len(cand)} users "
+                      f"— refusing to send (set recipient by uid in library).")
+                return
     if not user_r:
         print(f"[PO-REMINDER] Could not find user '{target_user}' in Odoo.")
         return
@@ -1213,9 +1235,9 @@ def _capture_reminder_text(lines: list) -> str:
 
 async def _stripe_capture_reminder_run(recipients: list = None):
     """执行一次 capture 提醒: 查交易 → 以 ChumartAI 身份发 Discuss。
-    recipients: Odoo user name 列表，默认 ['Ashley', 'Di']。"""
+    recipients: Odoo user uid 或全名列表，默认 ['Ashley Hou', 'Di Wu']。"""
     if not recipients:
-        recipients = ["Ashley", "Di"]
+        recipients = ["Ashley Hou", "Di Wu"]
     try:
         cookies = await odoo_get_session()
         txs = await _get_pending_capture_transactions(cookies)
@@ -1268,7 +1290,7 @@ async def _capture_reminder_check():
             for k in list(_capture_reminder_last_fired.keys()):
                 if k.split("_")[-1] < (now_pt - datetime.timedelta(days=3)).strftime("%Y-%m-%d"):
                     del _capture_reminder_last_fired[k]
-            recipients = [r.strip() for r in (row["recipients"] or "Ashley,Di").split(",") if r.strip()]
+            recipients = [r.strip() for r in (row["recipients"] or "Ashley Hou,Di Wu").split(",") if r.strip()]
             print(f"[CAPTURE-REMINDER] Firing schedule {row['id']} at {current_hm} PT → {recipients}")
             await _stripe_capture_reminder_run(recipients)
             await conn.execute(
@@ -1321,7 +1343,7 @@ async def _monthly_commission_report_run(recipients: list = None, year: int = No
     import datetime
     from zoneinfo import ZoneInfo
     if not recipients:
-        recipients = ["Ashley", "Di"]
+        recipients = ["Ashley Hou", "Di Wu"]
     if year is None or month is None:
         now_pt = datetime.datetime.now(ZoneInfo("America/Los_Angeles"))
         first_of_this_month = now_pt.replace(day=1)
@@ -1394,7 +1416,7 @@ async def _monthly_commission_report_check():
             for k in list(_commission_report_last_fired.keys()):
                 if k.split("_")[-1] < (now_pt - datetime.timedelta(days=60)).strftime("%Y-%m"):
                     del _commission_report_last_fired[k]
-            recipients = [r.strip() for r in (row["recipients"] or "Ashley,Di").split(",") if r.strip()]
+            recipients = [r.strip() for r in (row["recipients"] or "Ashley Hou,Di Wu").split(",") if r.strip()]
             print(f"[COMMISSION-REPORT] Firing schedule {row['id']} day {current_day} {current_hm} PT → {recipients}")
             await _monthly_commission_report_run(recipients)
             await conn.execute(
@@ -11594,7 +11616,7 @@ async def list_capture_reminders(admin_key: str = ""):
 
 
 @app.post("/admin/capture-reminders")
-async def create_capture_reminder(admin_key: str = "", time_pt: str = "", recipients: str = "Ashley,Di", frequency: str = "everyday"):
+async def create_capture_reminder(admin_key: str = "", time_pt: str = "", recipients: str = "Ashley Hou,Di Wu", frequency: str = "everyday"):
     """Create a capture reminder schedule."""
     if admin_key != os.getenv("ADMIN_KEY", "chumart2024"):
         return {"error": "Invalid admin key"}
@@ -11672,7 +11694,7 @@ async def delete_capture_reminder(schedule_id: int, admin_key: str = ""):
 
 
 @app.post("/admin/capture-reminders/test")
-async def test_capture_reminder(admin_key: str = "", recipients: str = "Ashley,Di"):
+async def test_capture_reminder(admin_key: str = "", recipients: str = "Ashley Hou,Di Wu"):
     """Test-fire capture reminder immediately."""
     if admin_key != os.getenv("ADMIN_KEY", "chumart2024"):
         return {"error": "Invalid admin key"}
@@ -11715,7 +11737,7 @@ async def list_commission_reports(admin_key: str = ""):
 
 
 @app.post("/admin/commission-reports")
-async def create_commission_report(admin_key: str = "", day_of_month: int = 1, time_pt: str = "09:00", recipients: str = "Ashley,Di"):
+async def create_commission_report(admin_key: str = "", day_of_month: int = 1, time_pt: str = "09:00", recipients: str = "Ashley Hou,Di Wu"):
     if admin_key != os.getenv("ADMIN_KEY", "chumart2024"):
         return {"error": "Invalid admin key"}
     if not (1 <= day_of_month <= 28):
@@ -11785,7 +11807,7 @@ async def delete_commission_report(schedule_id: int, admin_key: str = ""):
 
 
 @app.post("/admin/commission-reports/test")
-async def test_commission_report(admin_key: str = "", recipients: str = "Ashley,Di", year: int = None, month: int = None):
+async def test_commission_report(admin_key: str = "", recipients: str = "Ashley Hou,Di Wu", year: int = None, month: int = None):
     """立即发一次 commission 报告 (默认上月)。可指定 year/month 测试。"""
     if admin_key != os.getenv("ADMIN_KEY", "chumart2024"):
         return {"error": "Invalid admin key"}
