@@ -469,6 +469,27 @@ async def init_db():
             """)
             print("Default capture reminder schedule created: 09:30 AM daily → Ashley, Di")
 
+        # ── Monthly Commission Report schedules ──
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS commission_report_schedules (
+                id SERIAL PRIMARY KEY,
+                day_of_month INTEGER NOT NULL DEFAULT 1,
+                time_pt VARCHAR(10) NOT NULL DEFAULT '09:00',
+                recipients TEXT NOT NULL DEFAULT 'Ashley,Di',
+                active BOOLEAN NOT NULL DEFAULT TRUE,
+                last_fired_at TIMESTAMPTZ DEFAULT NULL,
+                created_at TIMESTAMPTZ DEFAULT NOW(),
+                updated_at TIMESTAMPTZ DEFAULT NOW()
+            )
+        """)
+        comm_existing = await conn.fetchval("SELECT COUNT(*) FROM commission_report_schedules")
+        if comm_existing == 0:
+            await conn.execute("""
+                INSERT INTO commission_report_schedules (day_of_month, time_pt, recipients, active) VALUES
+                (1, '09:00', 'Ashley,Di', TRUE)
+            """)
+            print("Default commission report schedule created: 1st of month 09:00 AM → Ashley, Di")
+
         print("DB initialized OK")
     except Exception as e:
         print(f"DB init error: {e}")
@@ -569,6 +590,19 @@ async def startup():
             print("Capture reminder checker started (60s interval, reads schedules from DB)")
         except Exception as e:
             print(f"WARNING: Failed to schedule capture reminder checker: {e}")
+
+        # Monthly commission report — reads schedules from DB (adjustable in library)
+        try:
+            scheduler.add_job(
+                _monthly_commission_report_check,
+                "interval",
+                seconds=60,
+                id="commission_report_checker",
+                replace_existing=True,
+            )
+            print("Commission report checker started (60s interval, reads schedules from DB)")
+        except Exception as e:
+            print(f"WARNING: Failed to schedule commission report checker: {e}")
     except ImportError:
         print("WARNING: apscheduler not installed — reminders will not fire automatically")
     except Exception as e:
@@ -1241,6 +1275,132 @@ async def _capture_reminder_check():
                 "UPDATE capture_reminder_schedules SET last_fired_at=NOW(), updated_at=NOW() WHERE id=$1", row["id"])
     except Exception as e:
         print(f"[CAPTURE-REMINDER] check error: {e}")
+    finally:
+        await conn.close()
+
+
+# ─────────────────────────────────────────────
+# Monthly Commission Report (每月1号发上月 commission 给 Ashley/Di)
+# 只发表 B (Commission Base 汇总) + 完整 Excel 下载链接。
+# ─────────────────────────────────────────────
+_commission_report_last_fired = {}
+
+
+def _commission_report_text(data: dict, year: int, month: int, download_url: str = "") -> str:
+    """只生成表 B (Commission Base 汇总) 纯文本 + Excel 下载链接。"""
+    cb = data.get("commission_base", {})
+    lines = [f"📊 {year}年{month}月销售提成报告", ""]
+    lines.append("Commission Base 汇总")
+    lines.append("─────────────────")
+    lines.append(f"净销售额(税前): ${cb.get('net_sales_excl_tax', 0):,.2f}")
+    lines.append(f"销售税: ${cb.get('net_tax', 0):,.2f}")
+    lines.append(f"净销售额(税后): ${cb.get('net_sales_incl_tax', 0):,.2f}")
+    lines.append(f"发票总数: {cb.get('invoice_count', 0)} 张")
+    lines.append(f"退款单总数: {cb.get('credit_note_count', 0)} 张")
+    if download_url:
+        lines.append("")
+        lines.append("📥 完整 Excel 报告 (每个销售员一个 sheet):")
+        lines.append(download_url)
+        lines.append("(复制链接到浏览器打开下载，链接 7 天内有效)")
+    return "\n".join(lines)
+
+
+async def _generate_commission_excel_bytes(year: int, month: int, salesperson: str = "") -> bytes:
+    """生成 commission Excel 并返回 bytes (调用 export_commission 拿 body)。"""
+    resp = await export_commission(year, month, salesperson)
+    if hasattr(resp, "body_iterator"):
+        chunks = []
+        async for chunk in resp.body_iterator:
+            chunks.append(chunk if isinstance(chunk, bytes) else chunk.encode())
+        return b"".join(chunks)
+    return b""
+
+
+async def _monthly_commission_report_run(recipients: list = None, year: int = None, month: int = None):
+    """生成上月 commission 报告 (表B) → 上传 Excel 到 R2 → 以 ChumartAI 身份发 Discuss。"""
+    import datetime
+    from zoneinfo import ZoneInfo
+    if not recipients:
+        recipients = ["Ashley", "Di"]
+    if year is None or month is None:
+        now_pt = datetime.datetime.now(ZoneInfo("America/Los_Angeles"))
+        first_of_this_month = now_pt.replace(day=1)
+        last_month = first_of_this_month - datetime.timedelta(days=1)
+        year = last_month.year
+        month = last_month.month
+    try:
+        data = await monthly_sales(year, month)
+        if isinstance(data, dict) and "error" in data:
+            print(f"[COMMISSION-REPORT] data error: {data['error']}")
+            return
+        # Excel → R2 → signed URL
+        download_url = ""
+        try:
+            xlsx_bytes = await _generate_commission_excel_bytes(year, month)
+            if xlsx_bytes:
+                r2_key = f"commission-reports/Commission_{year}_{month:02d}.xlsx"
+                ok = await r2_upload(xlsx_bytes, r2_key,
+                    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+                if ok:
+                    import asyncio
+                    loop = asyncio.get_event_loop()
+                    client = get_r2_client()
+                    if client:
+                        download_url = await loop.run_in_executor(None, lambda: client.generate_presigned_url(
+                            "get_object",
+                            Params={"Bucket": R2_BUCKET, "Key": r2_key},
+                            ExpiresIn=7 * 24 * 3600,
+                        ))
+                    print(f"[COMMISSION-REPORT] Excel uploaded: {r2_key}")
+        except Exception as e:
+            print(f"[COMMISSION-REPORT] Excel failed: {e}")
+            import traceback; traceback.print_exc()
+        body = _commission_report_text(data, year, month, download_url)
+        cookies = await odoo_get_session()
+        print(f"[COMMISSION-REPORT] {year}-{month:02d} → sending to {recipients}")
+        for name in recipients:
+            try:
+                await _send_po_reminder_to_user(name.strip(), body, cookies)
+                print(f"[COMMISSION-REPORT] Discuss sent to {name}")
+            except Exception as e:
+                print(f"[COMMISSION-REPORT] Discuss failed for {name}: {e}")
+    except Exception as e:
+        import traceback
+        print(f"[COMMISSION-REPORT] Error: {e}")
+        traceback.print_exc()
+
+
+async def _monthly_commission_report_check():
+    """每分钟检查 DB schedule。到达设定日期+时间触发上月报告 (每月只发一次)。"""
+    import datetime
+    from zoneinfo import ZoneInfo
+    conn = await get_db_conn()
+    if not conn:
+        return
+    try:
+        pt = ZoneInfo("America/Los_Angeles")
+        now_pt = datetime.datetime.now(pt)
+        current_hm = now_pt.strftime("%H:%M")
+        current_day = now_pt.day
+        rows = await conn.fetch(
+            "SELECT id, day_of_month, time_pt, recipients, last_fired_at FROM commission_report_schedules WHERE active = TRUE")
+        for row in rows:
+            if row["day_of_month"] != current_day or row["time_pt"] != current_hm:
+                continue
+            fire_key = f"{row['id']}_{now_pt.strftime('%Y-%m')}"
+            if fire_key in _commission_report_last_fired:
+                continue
+            _commission_report_last_fired[fire_key] = True
+            for k in list(_commission_report_last_fired.keys()):
+                if k.split("_")[-1] < (now_pt - datetime.timedelta(days=60)).strftime("%Y-%m"):
+                    del _commission_report_last_fired[k]
+            recipients = [r.strip() for r in (row["recipients"] or "Ashley,Di").split(",") if r.strip()]
+            print(f"[COMMISSION-REPORT] Firing schedule {row['id']} day {current_day} {current_hm} PT → {recipients}")
+            await _monthly_commission_report_run(recipients)
+            await conn.execute(
+                "UPDATE commission_report_schedules SET last_fired_at=NOW(), updated_at=NOW() WHERE id=$1", row["id"])
+    except Exception as e:
+        print(f"[COMMISSION-REPORT] check error: {e}")
     finally:
         await conn.close()
 
@@ -11537,6 +11697,105 @@ async def capture_reminder_preview(admin_key: str = ""):
     await _capture_reminder_resolve_docs(lines, cookies)
     lines.sort(key=lambda x: x["days_left"])
     return {"pending": len(lines), "preview_text": _capture_reminder_text(lines), "lines": lines}
+
+
+# ── Monthly Commission Report schedule management (library 可调) ──
+@app.get("/admin/commission-reports")
+async def list_commission_reports(admin_key: str = ""):
+    if admin_key != os.getenv("ADMIN_KEY", "chumart2024"):
+        return {"error": "Invalid admin key"}
+    conn = await get_db_conn()
+    if not conn:
+        return {"error": "DB not connected"}
+    try:
+        rows = await conn.fetch("SELECT * FROM commission_report_schedules ORDER BY day_of_month ASC")
+        return {"schedules": [dict(r) for r in rows]}
+    finally:
+        await conn.close()
+
+
+@app.post("/admin/commission-reports")
+async def create_commission_report(admin_key: str = "", day_of_month: int = 1, time_pt: str = "09:00", recipients: str = "Ashley,Di"):
+    if admin_key != os.getenv("ADMIN_KEY", "chumart2024"):
+        return {"error": "Invalid admin key"}
+    if not (1 <= day_of_month <= 28):
+        return {"error": "day_of_month must be 1-28"}
+    try:
+        h, m = time_pt.strip().split(":"); h, m = int(h), int(m)
+        if not (0 <= h <= 23 and 0 <= m <= 59): raise ValueError
+        time_pt = f"{h:02d}:{m:02d}"
+    except:
+        return {"error": "Invalid time. Use HH:MM (24h)"}
+    conn = await get_db_conn()
+    if not conn:
+        return {"error": "DB not connected"}
+    try:
+        row = await conn.fetchrow(
+            "INSERT INTO commission_report_schedules (day_of_month, time_pt, recipients, active) VALUES ($1, $2, $3, TRUE) RETURNING *",
+            day_of_month, time_pt, recipients.strip())
+        return {"success": True, "schedule": dict(row)}
+    finally:
+        await conn.close()
+
+
+@app.put("/admin/commission-reports/{schedule_id}")
+async def update_commission_report(schedule_id: int, admin_key: str = "", day_of_month: int = None, time_pt: str = "", recipients: str = None, active: bool = None):
+    if admin_key != os.getenv("ADMIN_KEY", "chumart2024"):
+        return {"error": "Invalid admin key"}
+    conn = await get_db_conn()
+    if not conn:
+        return {"error": "DB not connected"}
+    try:
+        existing = await conn.fetchrow("SELECT * FROM commission_report_schedules WHERE id=$1", schedule_id)
+        if not existing:
+            return {"error": f"Schedule {schedule_id} not found"}
+        new_day = existing["day_of_month"]
+        if day_of_month is not None and 1 <= day_of_month <= 28:
+            new_day = day_of_month
+        new_time = existing["time_pt"]
+        if time_pt and ":" in time_pt:
+            try:
+                h, m = time_pt.strip().split(":"); h, m = int(h), int(m)
+                if 0 <= h <= 23 and 0 <= m <= 59: new_time = f"{h:02d}:{m:02d}"
+            except: pass
+        new_recip = recipients.strip() if recipients is not None else existing["recipients"]
+        new_active = active if active is not None else existing["active"]
+        await conn.execute(
+            "UPDATE commission_report_schedules SET day_of_month=$1, time_pt=$2, recipients=$3, active=$4, updated_at=NOW() WHERE id=$5",
+            new_day, new_time, new_recip, new_active, schedule_id)
+        return {"success": True, "id": schedule_id}
+    finally:
+        await conn.close()
+
+
+@app.delete("/admin/commission-reports/{schedule_id}")
+async def delete_commission_report(schedule_id: int, admin_key: str = ""):
+    if admin_key != os.getenv("ADMIN_KEY", "chumart2024"):
+        return {"error": "Invalid admin key"}
+    conn = await get_db_conn()
+    if not conn:
+        return {"error": "DB not connected"}
+    try:
+        result = await conn.execute("DELETE FROM commission_report_schedules WHERE id=$1", schedule_id)
+        if result.endswith(" 1"):
+            return {"status": "deleted", "id": schedule_id}
+        return {"error": f"Schedule {schedule_id} not found"}
+    finally:
+        await conn.close()
+
+
+@app.post("/admin/commission-reports/test")
+async def test_commission_report(admin_key: str = "", recipients: str = "Ashley,Di", year: int = None, month: int = None):
+    """立即发一次 commission 报告 (默认上月)。可指定 year/month 测试。"""
+    if admin_key != os.getenv("ADMIN_KEY", "chumart2024"):
+        return {"error": "Invalid admin key"}
+    try:
+        recip_list = [r.strip() for r in recipients.split(",") if r.strip()]
+        await _monthly_commission_report_run(recip_list, year, month)
+        return {"success": True, "message": f"Commission report sent to {recip_list}" + (f" for {year}-{month:02d}" if year and month else " (last month)")}
+    except Exception as e:
+        import traceback; traceback.print_exc()
+        return {"error": str(e)}
 
 @app.get("/admin/odoo-users")
 async def admin_list_odoo_users(admin_key: str = ""):
