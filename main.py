@@ -680,8 +680,9 @@ async def _get_user_contact(uid: int) -> dict:
     
     return {"email": email, "phone": phone}
 
-async def _send_email(to_email: str, subject: str, body_text: str) -> tuple:
-    """Send email via SendGrid."""
+async def _send_email(to_email: str, subject: str, body_text: str, attachments: list = None) -> tuple:
+    """Send email via SendGrid.
+    attachments: optional list of {'filename', 'content_bytes' (raw bytes), 'type'}."""
     if not SENDGRID_API_KEY:
         return False, "SENDGRID_API_KEY not configured"
     if not to_email:
@@ -693,6 +694,21 @@ async def _send_email(to_email: str, subject: str, body_text: str) -> tuple:
         "subject": subject,
         "content": [{"type": "text/plain", "value": body_text}, {"type": "text/html", "value": body_html}],
     }
+    if attachments:
+        import base64
+        att_list = []
+        for a in attachments:
+            cb = a.get("content_bytes")
+            if not cb:
+                continue
+            att_list.append({
+                "content": base64.b64encode(cb).decode("ascii"),
+                "filename": a.get("filename", "attachment"),
+                "type": a.get("type", "application/octet-stream"),
+                "disposition": "attachment",
+            })
+        if att_list:
+            payload["attachments"] = att_list
     try:
         async with httpx.AsyncClient(timeout=15) as c:
             r = await c.post("https://api.sendgrid.com/v3/mail/send",
@@ -1365,6 +1381,7 @@ async def _monthly_commission_report_run(recipients: list = None, year: int = No
             return
         # Excel → R2 → signed URL
         download_url = ""
+        xlsx_bytes = b""
         try:
             xlsx_bytes = await _generate_commission_excel_bytes(year, month)
             if xlsx_bytes:
@@ -1385,7 +1402,18 @@ async def _monthly_commission_report_run(recipients: list = None, year: int = No
         except Exception as e:
             print(f"[COMMISSION-REPORT] Excel failed: {e}")
             import traceback; traceback.print_exc()
+        # Discuss keeps the R2 link; email attaches the Excel file directly instead.
         body = _commission_report_text(data, year, month, download_url)
+        if xlsx_bytes:
+            email_body = _commission_report_text(data, year, month, "") + \
+                "\n\n📎 完整 Excel 报告见附件 (每个销售员一个 sheet)。"
+            email_atts = [{
+                "filename": f"Commission_{year}_{month:02d}.xlsx",
+                "content_bytes": xlsx_bytes,
+                "type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            }]
+        else:
+            email_body, email_atts = body, None
         subject = f"📊 {year}年{month}月销售提成报告 (Commission Report)"
         cookies = await odoo_get_session()
         print(f"[COMMISSION-REPORT] {year}-{month:02d} → sending to {recipients} (Discuss + Email)")
@@ -1405,7 +1433,7 @@ async def _monthly_commission_report_run(recipients: list = None, year: int = No
             try:
                 email = (u.get("email") or u.get("login")) if u else None
                 if email:
-                    ok, err = await _send_email(email, subject, body)
+                    ok, err = await _send_email(email, subject, email_body, email_atts)
                     print(f"[COMMISSION-REPORT] Email {'sent' if ok else 'FAILED'} to {email}: {err or 'ok'}")
                 else:
                     print(f"[COMMISSION-REPORT] No email on record for '{recip}' — email skipped.")
