@@ -447,6 +447,28 @@ async def init_db():
         if not has_col:
             await conn.execute("ALTER TABLE po_reminder_schedules ADD COLUMN last_fired_at TIMESTAMPTZ DEFAULT NULL")
             print("Migrated po_reminder_schedules: added last_fired_at column")
+
+        # ── Stripe Capture Reminder schedules ──
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS capture_reminder_schedules (
+                id SERIAL PRIMARY KEY,
+                time_pt VARCHAR(10) NOT NULL,
+                recipients TEXT NOT NULL DEFAULT 'Ashley,Di',
+                active BOOLEAN NOT NULL DEFAULT TRUE,
+                frequency VARCHAR(20) NOT NULL DEFAULT 'everyday',
+                last_fired_at TIMESTAMPTZ DEFAULT NULL,
+                created_at TIMESTAMPTZ DEFAULT NOW(),
+                updated_at TIMESTAMPTZ DEFAULT NOW()
+            )
+        """)
+        cap_existing = await conn.fetchval("SELECT COUNT(*) FROM capture_reminder_schedules")
+        if cap_existing == 0:
+            await conn.execute("""
+                INSERT INTO capture_reminder_schedules (time_pt, recipients, active, frequency) VALUES
+                ('09:30', 'Ashley,Di', TRUE, 'everyday')
+            """)
+            print("Default capture reminder schedule created: 09:30 AM daily → Ashley, Di")
+
         print("DB initialized OK")
     except Exception as e:
         print(f"DB init error: {e}")
@@ -534,6 +556,19 @@ async def startup():
             print("PO reminder checker started (60s interval, reads schedules from DB)")
         except Exception as e:
             print(f"WARNING: Failed to schedule PO reminder checker: {e}")
+
+        # Stripe capture reminder — reads schedules from DB (adjustable in library)
+        try:
+            scheduler.add_job(
+                _capture_reminder_check,
+                "interval",
+                seconds=60,
+                id="capture_reminder_checker",
+                replace_existing=True,
+            )
+            print("Capture reminder checker started (60s interval, reads schedules from DB)")
+        except Exception as e:
+            print(f"WARNING: Failed to schedule capture reminder checker: {e}")
     except ImportError:
         print("WARNING: apscheduler not installed — reminders will not fire automatically")
     except Exception as e:
@@ -1038,6 +1073,176 @@ async def _send_po_reminder_to_user(target_user: str, msg_body: str, cookies=Non
             return
 
     await _odoo_bot_post_progress(channel_id, msg_body)
+
+
+# ─────────────────────────────────────────────
+# Stripe Capture Reminder (每日提醒 authorized 但未 capture 的交易)
+# ─────────────────────────────────────────────
+# Stripe manual-capture 授权 7 天后过期。每天以 CHUMART AI 身份发到
+# 收件人的 Discuss 私聊频道，提醒 capture。时间/收件人在 library 里可调 (DB 驱动)。
+
+STRIPE_AUTH_VALIDITY_DAYS = 7
+_capture_reminder_last_fired = {}
+
+
+async def _get_pending_capture_transactions(cookies=None):
+    """查 authorized 但未 capture 的 Stripe 交易。
+    分两步避免两级关联 domain (Odoo 17 不支持 provider_id.capture_manually 过滤)。"""
+    if not cookies:
+        cookies = await odoo_get_session()
+    prov_r = await _odoo_call("payment.provider", "search_read",
+        [[["capture_manually", "=", True]]],
+        {"fields": ["id", "name"]}, cookies=cookies)
+    if not prov_r:
+        return []
+    provider_ids = [p["id"] for p in prov_r]
+    tx_r = await _odoo_call("payment.transaction", "search_read",
+        [[["state", "=", "authorized"], ["provider_id", "in", provider_ids]]],
+        {"fields": ["id", "reference", "partner_id", "amount", "currency_id",
+                    "last_state_change", "create_date", "sale_order_ids", "invoice_ids"],
+         "order": "create_date asc"}, cookies=cookies)
+    return tx_r or []
+
+
+def _capture_reminder_line(tx: dict) -> dict:
+    """算一笔待 capture 交易的已授权天数 / 剩余天数。"""
+    import datetime
+    from zoneinfo import ZoneInfo
+    now = datetime.datetime.now(ZoneInfo("UTC"))
+    raw_dt = tx.get("last_state_change") or tx.get("create_date")
+    authorized_since = now
+    if raw_dt:
+        try:
+            authorized_since = datetime.datetime.strptime(
+                raw_dt.split(".")[0], "%Y-%m-%d %H:%M:%S").replace(tzinfo=ZoneInfo("UTC"))
+        except Exception:
+            authorized_since = now
+    days_authorized = (now - authorized_since).days
+    expiry = authorized_since + datetime.timedelta(days=STRIPE_AUTH_VALIDITY_DAYS)
+    days_left = max((expiry - now).days, 0)
+    partner = tx.get("partner_id")
+    partner_name = partner[1] if isinstance(partner, list) and len(partner) > 1 else "-"
+    currency = tx.get("currency_id")
+    currency_name = currency[1] if isinstance(currency, list) and len(currency) > 1 else ""
+    return {
+        "reference": tx.get("reference") or "-", "partner": partner_name,
+        "amount": tx.get("amount", 0), "currency": currency_name,
+        "days_authorized": days_authorized, "days_left": days_left,
+        "expiry_date": expiry.strftime("%Y-%m-%d"),
+        "so_ids": tx.get("sale_order_ids", []), "inv_ids": tx.get("invoice_ids", []),
+    }
+
+
+async def _capture_reminder_resolve_docs(lines: list, cookies=None):
+    """把 SO/INV 的 id 批量换成名字。"""
+    if not cookies:
+        cookies = await odoo_get_session()
+    all_so_ids = list({sid for l in lines for sid in l["so_ids"]})
+    all_inv_ids = list({iid for l in lines for iid in l["inv_ids"]})
+    so_map = {}; inv_map = {}
+    if all_so_ids:
+        so_r = await _odoo_call("sale.order", "read", [all_so_ids],
+            {"fields": ["id", "name"]}, cookies=cookies)
+        so_map = {s["id"]: s["name"] for s in (so_r or [])}
+    if all_inv_ids:
+        inv_r = await _odoo_call("account.move", "read", [all_inv_ids],
+            {"fields": ["id", "name"]}, cookies=cookies)
+        inv_map = {i["id"]: i["name"] for i in (inv_r or [])}
+    for l in lines:
+        docs = [so_map.get(sid) for sid in l["so_ids"] if so_map.get(sid)]
+        docs += [inv_map.get(iid) for iid in l["inv_ids"] if inv_map.get(iid)]
+        l["documents"] = ", ".join(docs) if docs else "-"
+
+
+def _capture_reminder_text(lines: list) -> str:
+    """卡片式纯文本 (Discuss 窄频道不支持表格，用卡片避免乱码)。"""
+    n = len(lines)
+    out = [f"⚠️ Stripe 待 Capture 提醒 — {n} 笔授权即将过期", ""]
+    out.append("以下 Stripe 付款已授权但未 capture，请在到期前 capture")
+    out.append("(授权在创建 7 天后过期，过期后客户需重新付款)。")
+    out.append("")
+    for l in lines:
+        urgent = "🔴 " if l["days_left"] <= 1 else ""
+        out.append("━━━━━━━━━━━━━━━━━━")
+        out.append(f"{urgent}{l['partner']}")
+        out.append(f"参考号: {l['reference']}")
+        out.append(f"金额: {l['currency']} {l['amount']:,.2f}")
+        left_mark = " ⚠️" if l["days_left"] <= 1 else ""
+        out.append(f"已授权: {l['days_authorized']} 天 | 剩余: {l['days_left']} 天{left_mark}")
+        out.append(f"到期: {l['expiry_date']}")
+        out.append(f"单据: {l.get('documents', '-')}")
+    out.append("━━━━━━━━━━━━━━━━━━")
+    out.append("")
+    out.append("🔴 = 24 小时内到期，请优先处理")
+    return "\n".join(out)
+
+
+async def _stripe_capture_reminder_run(recipients: list = None):
+    """执行一次 capture 提醒: 查交易 → 以 ChumartAI 身份发 Discuss。
+    recipients: Odoo user name 列表，默认 ['Ashley', 'Di']。"""
+    if not recipients:
+        recipients = ["Ashley", "Di"]
+    try:
+        cookies = await odoo_get_session()
+        txs = await _get_pending_capture_transactions(cookies)
+        if not txs:
+            print("[CAPTURE-REMINDER] Nothing pending — skip.")
+            return
+        lines = [_capture_reminder_line(tx) for tx in txs]
+        await _capture_reminder_resolve_docs(lines, cookies)
+        lines.sort(key=lambda x: x["days_left"])
+        body = _capture_reminder_text(lines)
+        print(f"[CAPTURE-REMINDER] {len(lines)} pending → sending to {recipients} via Discuss")
+        for name in recipients:
+            try:
+                await _send_po_reminder_to_user(name.strip(), body, cookies)
+                print(f"[CAPTURE-REMINDER] Discuss sent to {name}")
+            except Exception as e:
+                print(f"[CAPTURE-REMINDER] Discuss failed for {name}: {e}")
+    except Exception as e:
+        import traceback
+        print(f"[CAPTURE-REMINDER] Error: {e}")
+        traceback.print_exc()
+
+
+async def _capture_reminder_check():
+    """每分钟检查 DB schedule，到点触发 (跟 PO reminder 同一模式)。"""
+    import datetime
+    from zoneinfo import ZoneInfo
+    conn = await get_db_conn()
+    if not conn:
+        return
+    try:
+        pt = ZoneInfo("America/Los_Angeles")
+        now_pt = datetime.datetime.now(pt)
+        current_hm = now_pt.strftime("%H:%M")
+        weekday = now_pt.weekday()  # 0=Mon .. 6=Sun
+
+        rows = await conn.fetch(
+            "SELECT id, time_pt, recipients, frequency, last_fired_at FROM capture_reminder_schedules WHERE active = TRUE")
+        for row in rows:
+            if row["time_pt"] != current_hm:
+                continue
+            freq = row["frequency"]
+            if freq == "weekday" and weekday >= 5:
+                continue  # 跳过周末
+            fire_key = f"{row['id']}_{now_pt.strftime('%Y-%m-%d')}"
+            if fire_key in _capture_reminder_last_fired:
+                continue
+            _capture_reminder_last_fired[fire_key] = True
+            # 清理旧 key
+            for k in list(_capture_reminder_last_fired.keys()):
+                if k.split("_")[-1] < (now_pt - datetime.timedelta(days=3)).strftime("%Y-%m-%d"):
+                    del _capture_reminder_last_fired[k]
+            recipients = [r.strip() for r in (row["recipients"] or "Ashley,Di").split(",") if r.strip()]
+            print(f"[CAPTURE-REMINDER] Firing schedule {row['id']} at {current_hm} PT → {recipients}")
+            await _stripe_capture_reminder_run(recipients)
+            await conn.execute(
+                "UPDATE capture_reminder_schedules SET last_fired_at=NOW(), updated_at=NOW() WHERE id=$1", row["id"])
+    except Exception as e:
+        print(f"[CAPTURE-REMINDER] check error: {e}")
+    finally:
+        await conn.close()
 
 
 # ─────────────────────────────────────────────
@@ -11210,6 +11415,128 @@ async def test_po_reminder(admin_key: str = "", target_user: str = "Ashley", mes
         return {"success": True, "message": f"Test message sent to {target_user}"}
     except Exception as e:
         return {"error": str(e)}
+
+
+# ── Capture Reminder schedule management (library 可调) ──
+@app.get("/admin/capture-reminders")
+async def list_capture_reminders(admin_key: str = ""):
+    """List all capture reminder schedules."""
+    if admin_key != os.getenv("ADMIN_KEY", "chumart2024"):
+        return {"error": "Invalid admin key"}
+    conn = await get_db_conn()
+    if not conn:
+        return {"error": "DB not connected"}
+    try:
+        rows = await conn.fetch("SELECT * FROM capture_reminder_schedules ORDER BY time_pt ASC")
+        return {"schedules": [dict(r) for r in rows]}
+    finally:
+        await conn.close()
+
+
+@app.post("/admin/capture-reminders")
+async def create_capture_reminder(admin_key: str = "", time_pt: str = "", recipients: str = "Ashley,Di", frequency: str = "everyday"):
+    """Create a capture reminder schedule."""
+    if admin_key != os.getenv("ADMIN_KEY", "chumart2024"):
+        return {"error": "Invalid admin key"}
+    if not time_pt or ":" not in time_pt:
+        return {"error": "time_pt required in HH:MM (24h), e.g. '09:30'"}
+    try:
+        h, m = time_pt.strip().split(":")
+        h, m = int(h), int(m)
+        if not (0 <= h <= 23 and 0 <= m <= 59):
+            raise ValueError
+        time_pt = f"{h:02d}:{m:02d}"
+    except:
+        return {"error": "Invalid time. Use HH:MM (24h), e.g. '09:30'"}
+    if frequency not in ("everyday", "weekday"):
+        frequency = "everyday"
+    conn = await get_db_conn()
+    if not conn:
+        return {"error": "DB not connected"}
+    try:
+        row = await conn.fetchrow(
+            "INSERT INTO capture_reminder_schedules (time_pt, recipients, active, frequency) VALUES ($1, $2, TRUE, $3) RETURNING *",
+            time_pt, recipients.strip(), frequency)
+        return {"success": True, "schedule": dict(row)}
+    finally:
+        await conn.close()
+
+
+@app.put("/admin/capture-reminders/{schedule_id}")
+async def update_capture_reminder(schedule_id: int, admin_key: str = "", time_pt: str = "", recipients: str = None, active: bool = None, frequency: str = None):
+    """Update a capture reminder schedule."""
+    if admin_key != os.getenv("ADMIN_KEY", "chumart2024"):
+        return {"error": "Invalid admin key"}
+    conn = await get_db_conn()
+    if not conn:
+        return {"error": "DB not connected"}
+    try:
+        existing = await conn.fetchrow("SELECT * FROM capture_reminder_schedules WHERE id=$1", schedule_id)
+        if not existing:
+            return {"error": f"Schedule {schedule_id} not found"}
+        new_time = existing["time_pt"]
+        if time_pt and ":" in time_pt:
+            try:
+                h, m = time_pt.strip().split(":")
+                h, m = int(h), int(m)
+                if 0 <= h <= 23 and 0 <= m <= 59:
+                    new_time = f"{h:02d}:{m:02d}"
+            except:
+                pass
+        new_recip = recipients.strip() if recipients is not None else existing["recipients"]
+        new_active = active if active is not None else existing["active"]
+        new_freq = frequency if frequency in ("everyday", "weekday") else existing["frequency"]
+        await conn.execute(
+            "UPDATE capture_reminder_schedules SET time_pt=$1, recipients=$2, active=$3, frequency=$4, updated_at=NOW() WHERE id=$5",
+            new_time, new_recip, new_active, new_freq, schedule_id)
+        return {"success": True, "id": schedule_id}
+    finally:
+        await conn.close()
+
+
+@app.delete("/admin/capture-reminders/{schedule_id}")
+async def delete_capture_reminder(schedule_id: int, admin_key: str = ""):
+    """Delete a capture reminder schedule."""
+    if admin_key != os.getenv("ADMIN_KEY", "chumart2024"):
+        return {"error": "Invalid admin key"}
+    conn = await get_db_conn()
+    if not conn:
+        return {"error": "DB not connected"}
+    try:
+        result = await conn.execute("DELETE FROM capture_reminder_schedules WHERE id=$1", schedule_id)
+        if result.endswith(" 1"):
+            return {"status": "deleted", "id": schedule_id}
+        return {"error": f"Schedule {schedule_id} not found"}
+    finally:
+        await conn.close()
+
+
+@app.post("/admin/capture-reminders/test")
+async def test_capture_reminder(admin_key: str = "", recipients: str = "Ashley,Di"):
+    """Test-fire capture reminder immediately."""
+    if admin_key != os.getenv("ADMIN_KEY", "chumart2024"):
+        return {"error": "Invalid admin key"}
+    try:
+        recip_list = [r.strip() for r in recipients.split(",") if r.strip()]
+        await _stripe_capture_reminder_run(recip_list)
+        return {"success": True, "message": f"Test capture reminder sent to {recip_list}"}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@app.get("/admin/capture-reminder-preview")
+async def capture_reminder_preview(admin_key: str = ""):
+    """预览待 capture 交易 (不发送)。"""
+    if admin_key != os.getenv("ADMIN_KEY", "chumart2024"):
+        return {"error": "Invalid admin key"}
+    cookies = await odoo_get_session()
+    txs = await _get_pending_capture_transactions(cookies)
+    if not txs:
+        return {"pending": 0, "message": "No pending capture transactions"}
+    lines = [_capture_reminder_line(tx) for tx in txs]
+    await _capture_reminder_resolve_docs(lines, cookies)
+    lines.sort(key=lambda x: x["days_left"])
+    return {"pending": len(lines), "preview_text": _capture_reminder_text(lines), "lines": lines}
 
 @app.get("/admin/odoo-users")
 async def admin_list_odoo_users(admin_key: str = ""):
