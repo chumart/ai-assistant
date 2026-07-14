@@ -1056,42 +1056,50 @@ async def _send_po_reminder_message(target_user: str, msg_body: str, cookies=Non
     await _send_po_reminder_to_user(target_user, msg_body, cookies)
 
 
-async def _send_po_reminder_to_user(target_user: str, msg_body: str, cookies=None):
+async def _resolve_reminder_user(target_user, cookies=None):
+    """Resolve a reminder recipient token to ONE Odoo user dict, or None.
+    Shared by all reminder senders. Never fuzzy-misdelivers financial data:
+      • numeric token  → exact uid lock
+      • name token     → exact name match, else ilike ONLY if unambiguous (1 hit)
+    Returns fields: id, name, partner_id, email, login."""
     if not cookies:
         cookies = await odoo_get_session()
-
-    # Resolve target user — prefer exact uid (new schedules store uid), fall back
-    # to name for legacy schedules but NEVER fuzzy-misdeliver financial data.
+    fields = ["id", "name", "partner_id", "email", "login"]
     ts = str(target_user).strip()
     if ts.isdigit():
         # uid path: exact id lock (no ambiguity possible)
         user_r = await _odoo_call("res.users", "search_read",
             [[["id", "=", int(ts)], ["active", "=", True]]],
-            {"fields": ["id", "name", "partner_id"], "limit": 1},
-            cookies=cookies)
+            {"fields": fields, "limit": 1}, cookies=cookies)
     else:
         # legacy name token: require EXACT name match first
         user_r = await _odoo_call("res.users", "search_read",
             [[["name", "=", ts], ["active", "=", True]]],
-            {"fields": ["id", "name", "partner_id"], "limit": 5},
-            cookies=cookies)
+            {"fields": fields, "limit": 5}, cookies=cookies)
         if not user_r:
             # backward-compat fuzzy — but ONLY accept if unambiguous (exactly 1)
             cand = await _odoo_call("res.users", "search_read",
                 [[["name", "ilike", ts], ["active", "=", True]]],
-                {"fields": ["id", "name", "partner_id"], "limit": 5},
-                cookies=cookies) or []
+                {"fields": fields, "limit": 5}, cookies=cookies) or []
             if len(cand) == 1:
                 user_r = cand
             elif len(cand) > 1:
-                print(f"[PO-REMINDER] Ambiguous recipient '{ts}' matched {len(cand)} users "
+                print(f"[REMINDER] Ambiguous recipient '{ts}' matched {len(cand)} users "
                       f"— refusing to send (set recipient by uid in library).")
-                return
+                return None
     if not user_r:
-        print(f"[PO-REMINDER] Could not find user '{target_user}' in Odoo.")
-        return
+        print(f"[REMINDER] Could not find user '{target_user}' in Odoo.")
+        return None
+    return user_r[0]
 
-    target = user_r[0]
+
+async def _send_po_reminder_to_user(target_user: str, msg_body: str, cookies=None):
+    if not cookies:
+        cookies = await odoo_get_session()
+
+    target = await _resolve_reminder_user(target_user, cookies)
+    if not target:
+        return
     target_partner_id = target["partner_id"][0] if isinstance(target.get("partner_id"), list) else target.get("partner_id")
 
     # Find bot partner
@@ -1378,14 +1386,31 @@ async def _monthly_commission_report_run(recipients: list = None, year: int = No
             print(f"[COMMISSION-REPORT] Excel failed: {e}")
             import traceback; traceback.print_exc()
         body = _commission_report_text(data, year, month, download_url)
+        subject = f"📊 {year}年{month}月销售提成报告 (Commission Report)"
         cookies = await odoo_get_session()
-        print(f"[COMMISSION-REPORT] {year}-{month:02d} → sending to {recipients}")
+        print(f"[COMMISSION-REPORT] {year}-{month:02d} → sending to {recipients} (Discuss + Email)")
         for name in recipients:
+            recip = str(name).strip()
+            if not recip:
+                continue
+            # Resolve once — reused for both channels; None = unfound/ambiguous (skip safely)
+            u = await _resolve_reminder_user(recip, cookies)
+            # 1) Discuss (unchanged behavior)
             try:
-                await _send_po_reminder_to_user(name.strip(), body, cookies)
-                print(f"[COMMISSION-REPORT] Discuss sent to {name}")
+                await _send_po_reminder_to_user(recip, body, cookies)
+                print(f"[COMMISSION-REPORT] Discuss sent to {recip}")
             except Exception as e:
-                print(f"[COMMISSION-REPORT] Discuss failed for {name}: {e}")
+                print(f"[COMMISSION-REPORT] Discuss failed for {recip}: {e}")
+            # 2) Email (commission report only) — via existing SendGrid helper
+            try:
+                email = (u.get("email") or u.get("login")) if u else None
+                if email:
+                    ok, err = await _send_email(email, subject, body)
+                    print(f"[COMMISSION-REPORT] Email {'sent' if ok else 'FAILED'} to {email}: {err or 'ok'}")
+                else:
+                    print(f"[COMMISSION-REPORT] No email on record for '{recip}' — email skipped.")
+            except Exception as e:
+                print(f"[COMMISSION-REPORT] Email exception for {recip}: {e}")
     except Exception as e:
         import traceback
         print(f"[COMMISSION-REPORT] Error: {e}")
