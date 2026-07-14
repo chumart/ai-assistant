@@ -1237,24 +1237,16 @@ async def _capture_reminder_resolve_docs(lines: list, cookies=None):
 def _capture_reminder_text(lines: list) -> str:
     """卡片式纯文本 (Discuss 窄频道不支持表格，用卡片避免乱码)。"""
     n = len(lines)
-    out = [f"⚠️ Stripe Capture Reminder — {n} authorization(s) expiring soon", ""]
-    out.append("The following Stripe payments are authorized but not yet captured.")
-    out.append("Please capture before they expire (authorizations expire 7 days")
-    out.append("after creation; after that the customer must pay again).")
-    out.append("")
+    cur = lines[0]["currency"] if lines else ""
+    total = sum(l["amount"] for l in lines)
+    out = [f"⚠️ Stripe Capture — {n} pending · {cur} {total:,.2f} to capture", ""]
     for l in lines:
-        urgent = "🔴 " if l["days_left"] <= 1 else ""
-        out.append("━━━━━━━━━━━━━━━━━━")
-        out.append(f"{urgent}{l['partner']}")
-        out.append(f"Reference: {l['reference']}")
-        out.append(f"Amount: {l['currency']} {l['amount']:,.2f}")
-        left_mark = " ⚠️" if l["days_left"] <= 1 else ""
-        out.append(f"Authorized: {l['days_authorized']} day(s) | Left: {l['days_left']} day(s){left_mark}")
-        out.append(f"Expires: {l['expiry_date']}")
-        out.append(f"Documents: {l.get('documents', '-')}")
-    out.append("━━━━━━━━━━━━━━━━━━")
+        dot = "🔴" if l["days_left"] <= 1 else "•"
+        ref = l.get("documents") or l["reference"]
+        out.append(f"{dot} {ref} — {l['partner']} · {l['currency']} {l['amount']:,.2f}")
+        out.append(f"    {l['days_left']}d left · exp {l['expiry_date']}")
     out.append("")
-    out.append("🔴 = expiring within 24 hours, please prioritize")
+    out.append("🔴 = ≤24h left, capture first. Expired = customer must re-pay.")
     return "\n".join(out)
 
 
