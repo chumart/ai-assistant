@@ -1237,23 +1237,24 @@ async def _capture_reminder_resolve_docs(lines: list, cookies=None):
 def _capture_reminder_text(lines: list) -> str:
     """卡片式纯文本 (Discuss 窄频道不支持表格，用卡片避免乱码)。"""
     n = len(lines)
-    out = [f"⚠️ Stripe 待 Capture 提醒 — {n} 笔授权即将过期", ""]
-    out.append("以下 Stripe 付款已授权但未 capture，请在到期前 capture")
-    out.append("(授权在创建 7 天后过期，过期后客户需重新付款)。")
+    out = [f"⚠️ Stripe Capture Reminder — {n} authorization(s) expiring soon", ""]
+    out.append("The following Stripe payments are authorized but not yet captured.")
+    out.append("Please capture before they expire (authorizations expire 7 days")
+    out.append("after creation; after that the customer must pay again).")
     out.append("")
     for l in lines:
         urgent = "🔴 " if l["days_left"] <= 1 else ""
         out.append("━━━━━━━━━━━━━━━━━━")
         out.append(f"{urgent}{l['partner']}")
-        out.append(f"参考号: {l['reference']}")
-        out.append(f"金额: {l['currency']} {l['amount']:,.2f}")
+        out.append(f"Reference: {l['reference']}")
+        out.append(f"Amount: {l['currency']} {l['amount']:,.2f}")
         left_mark = " ⚠️" if l["days_left"] <= 1 else ""
-        out.append(f"已授权: {l['days_authorized']} 天 | 剩余: {l['days_left']} 天{left_mark}")
-        out.append(f"到期: {l['expiry_date']}")
-        out.append(f"单据: {l.get('documents', '-')}")
+        out.append(f"Authorized: {l['days_authorized']} day(s) | Left: {l['days_left']} day(s){left_mark}")
+        out.append(f"Expires: {l['expiry_date']}")
+        out.append(f"Documents: {l.get('documents', '-')}")
     out.append("━━━━━━━━━━━━━━━━━━")
     out.append("")
-    out.append("🔴 = 24 小时内到期，请优先处理")
+    out.append("🔴 = expiring within 24 hours, please prioritize")
     return "\n".join(out)
 
 
@@ -1335,19 +1336,19 @@ _commission_report_last_fired = {}
 def _commission_report_text(data: dict, year: int, month: int, download_url: str = "") -> str:
     """只生成表 B (Commission Base 汇总) 纯文本 + Excel 下载链接。"""
     cb = data.get("commission_base", {})
-    lines = [f"📊 {year}年{month}月销售提成报告", ""]
-    lines.append("Commission Base 汇总")
+    lines = [f"📊 Sales Commission Report — {year}-{month:02d}", ""]
+    lines.append("Commission Base Summary")
     lines.append("─────────────────")
-    lines.append(f"净销售额(税前): ${cb.get('net_sales_excl_tax', 0):,.2f}")
-    lines.append(f"销售税: ${cb.get('net_tax', 0):,.2f}")
-    lines.append(f"净销售额(税后): ${cb.get('net_sales_incl_tax', 0):,.2f}")
-    lines.append(f"发票总数: {cb.get('invoice_count', 0)} 张")
-    lines.append(f"退款单总数: {cb.get('credit_note_count', 0)} 张")
+    lines.append(f"Net Sales (excl. tax): ${cb.get('net_sales_excl_tax', 0):,.2f}")
+    lines.append(f"Sales Tax: ${cb.get('net_tax', 0):,.2f}")
+    lines.append(f"Net Sales (incl. tax): ${cb.get('net_sales_incl_tax', 0):,.2f}")
+    lines.append(f"Total Invoices: {cb.get('invoice_count', 0)}")
+    lines.append(f"Total Credit Notes: {cb.get('credit_note_count', 0)}")
     if download_url:
         lines.append("")
-        lines.append("📥 完整 Excel 报告 (每个销售员一个 sheet):")
+        lines.append("📥 Full Excel report (one sheet per salesperson):")
         lines.append(download_url)
-        lines.append("(复制链接到浏览器打开下载，链接 7 天内有效)")
+        lines.append("(Copy the link into a browser to download; valid for 7 days.)")
     return "\n".join(lines)
 
 
@@ -1406,7 +1407,7 @@ async def _monthly_commission_report_run(recipients: list = None, year: int = No
         body = _commission_report_text(data, year, month, download_url)
         if xlsx_bytes:
             email_body = _commission_report_text(data, year, month, "") + \
-                "\n\n📎 完整 Excel 报告见附件 (每个销售员一个 sheet)。"
+                "\n\n📎 Full Excel report attached (one sheet per salesperson)."
             email_atts = [{
                 "filename": f"Commission_{year}_{month:02d}.xlsx",
                 "content_bytes": xlsx_bytes,
@@ -1414,7 +1415,7 @@ async def _monthly_commission_report_run(recipients: list = None, year: int = No
             }]
         else:
             email_body, email_atts = body, None
-        subject = f"📊 {year}年{month}月销售提成报告 (Commission Report)"
+        subject = f"📊 Sales Commission Report — {year}-{month:02d}"
         cookies = await odoo_get_session()
         print(f"[COMMISSION-REPORT] {year}-{month:02d} → sending to {recipients} (Discuss + Email)")
         for name in recipients:
