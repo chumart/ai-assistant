@@ -1239,14 +1239,15 @@ def _capture_reminder_text(lines: list) -> str:
     n = len(lines)
     cur = lines[0]["currency"] if lines else ""
     total = sum(l["amount"] for l in lines)
-    out = [f"⚠️ Stripe Capture — {n} pending · {cur} {total:,.2f} to capture", ""]
+    out = [f"⚠️ **Stripe Capture — {n} pending**",
+           f"**Total to capture:** {cur} {total:,.2f}", ""]
     for l in lines:
-        dot = "🔴" if l["days_left"] <= 1 else "•"
+        dot = "🔴 " if l["days_left"] <= 1 else ""
         ref = l.get("documents") or l["reference"]
-        out.append(f"{dot} {ref} — {l['partner']} · {l['currency']} {l['amount']:,.2f}")
-        out.append(f"    {l['days_left']}d left · exp {l['expiry_date']}")
-    out.append("")
-    out.append("🔴 = ≤24h left, capture first. Expired = customer must re-pay.")
+        out.append(f"{dot}**{ref}** · {l['partner']}")
+        out.append(f"{l['currency']} {l['amount']:,.2f} · {l['days_left']}d left · exp {l['expiry_date']}")
+        out.append("")
+    out.append("🔴 = ≤24h left · expired = customer must re-pay")
     return "\n".join(out)
 
 
@@ -13852,6 +13853,12 @@ async def _odoo_bot_post_progress(channel_id: int, text: str):
         bot_partner_name = (exact[0] if exact else bot_partner_r[0])["name"]
         print(f"[ODOO-BOT] post_progress → channel_id={channel_id}, bot_partner='{bot_partner_name}' (id={bot_partner_id}), text={text[:40]}")
 
+        # Discuss message_post treats body as HTML → plain "\n" collapses and "**md**"
+        # shows literally. Convert to HTML so cards render neatly (bold + line breaks).
+        import re as _re
+        body_html = _re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", text)
+        body_html = body_html.replace("\n", "<br>")
+
         # Post the progress message as the bot
         async with httpx.AsyncClient(timeout=15, follow_redirects=True) as c:
             r = await c.post(f"{ODOO_URL}/web/dataset/call_kw", json={
@@ -13861,7 +13868,7 @@ async def _odoo_bot_post_progress(channel_id: int, text: str):
                     "method": "message_post",
                     "args": [[channel_id]],
                     "kwargs": {
-                        "body": text,
+                        "body": body_html,
                         "message_type": "comment",
                         "subtype_xmlid": "mail.mt_comment",
                         "author_id": bot_partner_id,
