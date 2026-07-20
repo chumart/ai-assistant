@@ -13853,13 +13853,24 @@ async def _odoo_bot_post_progress(channel_id: int, text: str):
         bot_partner_name = (exact[0] if exact else bot_partner_r[0])["name"]
         print(f"[ODOO-BOT] post_progress → channel_id={channel_id}, bot_partner='{bot_partner_name}' (id={bot_partner_id}), text={text[:40]}")
 
-        # Discuss message_post treats body as HTML → plain "\n" collapses and "**md**"
-        # shows literally. Convert to HTML so cards render neatly (bold + line breaks).
-        import re as _re
-        body_html = _re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", text)
-        body_html = body_html.replace("\n", "<br>")
+        # Preferred path: let the Odoo chumart_ai_bot module render the Markdown to
+        # HTML with Markup() — the SAME pipeline as bot replies — so cards show
+        # bold + line breaks instead of raw <b>/<br> tags. (External RPC can't pass
+        # a Markup object, so the rendering MUST happen inside Odoo.)
+        try:
+            card_res = await _odoo_call(
+                "discuss.channel", "chumart_post_card",
+                [channel_id, text, bot_partner_id], {}, cookies=cookies)
+            if card_res:
+                print(f"[ODOO-BOT] post_progress OK via chumart_post_card")
+                return
+            # card_res falsy → method exists but channel missing, or (None) module
+            # not yet updated. Fall through to the raw post below as a safety net.
+        except Exception as e:
+            print(f"[ODOO-BOT] chumart_post_card unavailable ({e}) — falling back to raw post")
 
-        # Post the progress message as the bot
+        # Fallback: raw message_post (renders without formatting — used only until
+        # the Odoo module with chumart_post_card is deployed).
         async with httpx.AsyncClient(timeout=15, follow_redirects=True) as c:
             r = await c.post(f"{ODOO_URL}/web/dataset/call_kw", json={
                 "jsonrpc": "2.0", "method": "call", "id": 1,
@@ -13868,7 +13879,7 @@ async def _odoo_bot_post_progress(channel_id: int, text: str):
                     "method": "message_post",
                     "args": [[channel_id]],
                     "kwargs": {
-                        "body": body_html,
+                        "body": text.replace("**", ""),
                         "message_type": "comment",
                         "subtype_xmlid": "mail.mt_comment",
                         "author_id": bot_partner_id,
@@ -13879,7 +13890,7 @@ async def _odoo_bot_post_progress(channel_id: int, text: str):
             if "error" in d:
                 print(f"[ODOO-BOT] post_progress Odoo error: {d['error']}")
             elif "result" in d:
-                print(f"[ODOO-BOT] post_progress OK: msg_id={d.get('result')}")
+                print(f"[ODOO-BOT] post_progress OK (raw): msg_id={d.get('result')}")
     except Exception as e:
         import traceback
         print(f"[ODOO-BOT] post_progress exception: {e}")
